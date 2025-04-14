@@ -56,10 +56,20 @@ function certlcworkflow {
     }
 
     $SubjectName = $cert.Certificate.Subject
-    $IssuerName = $cert.Certificate.Issuer
-
     write-output "SubjectName = $SubjectName"
+
+    $IssuerName = $cert.Certificate.Issuer
     write-output "IssuerName = $IssuerName"
+
+    # get the DNS names from the certificate
+    $dnsNames = $null
+    $san = $cert.Certificate.Extensions | Where-Object { $_.Oid.FriendlyName -eq "Subject Alternative Name" }
+    if ($null -ne $san) {
+        # $DNS.Format(0) returns a string like: DNS Name=server01.contoso.com, DNS Name=server01.litware.com.
+        # Transform it into an array of DNS names using regex; remove the "DNS Name=" prefix and split by comma
+        $dnsNames = ($san.Format(0) -replace 'DNS Name=', '').Split(',').Trim() | Where-Object { $_ -ne "" }
+        Write-Output "DNS Names: $($dnsNames -join ', ')"
+    }
 
     # get the OID of the Certificate Template
     $oid = $cert.Certificate.Extensions | Where-Object { $_.Oid.FriendlyName -eq "Certificate Template Information" }
@@ -67,7 +77,6 @@ function certlcworkflow {
         Write-Error "Error getting OID from certificate: Certificate Template Information not found"
         return
     }
-
     # convert in a string like:
     # Template=Flab-ShortWebServer(1.3.6.1.4.1.311.21.8.15431357.2613787.6440092.16459852.14380503.11.12399345.16691736), Major Version Number=100, Minor Version Number=5
     $oid = $oid.Format(0)
@@ -75,9 +84,11 @@ function certlcworkflow {
     # extract the template name and the ASN.1 values using regex
     $templateName = $oid -replace '.*Template=(.*)\(.*\).*', '$1'
     $templateASN = $oid -replace '.*\((.*)\).*', '$1'
-    
+
+    Write-Output "Template Name: $templateName"
+
     # check if an existing CSR is present in the vault
-    $op = Get-AzKeyVaultCertificateOperation -VaultName $VaultName -Name $ObjectName | Where-Object {$_.Status -eq "inProgress"}
+    $op = Get-AzKeyVaultCertificateOperation -VaultName $VaultName -Name $ObjectName | Where-Object { $_.Status -eq "inProgress" }
     if ($null -ne $op) {
         Write-Output "Certificate request is already in progress for this certificate: $ObjectName; reusing the existing request."
         $csr = $op.CertificateSigningRequest
@@ -85,7 +96,14 @@ function certlcworkflow {
     else {
         try {
             Write-Output "Creating a new CSR for the certificate: $ObjectName"
-            $Policy = New-AzKeyVaultCertificatePolicy -SecretContentType "application/x-pkcs12" -SubjectName $SubjectName -IssuerName "Unknown"
+            if ($null -ne $dnsNames) {
+                # create a new CSR with the DNS names
+                $Policy = New-AzKeyVaultCertificatePolicy -SecretContentType "application/x-pkcs12" -SubjectName $SubjectName -IssuerName "Unknown" -DnsName $dnsNames
+            }
+            else {
+                # create a new CSR without DNS names
+                $Policy = New-AzKeyVaultCertificatePolicy -SecretContentType "application/x-pkcs12" -SubjectName $SubjectName -IssuerName "Unknown"
+            }
             $result = Add-AzKeyVaultCertificate -VaultName $VaultName -Name $ObjectName -CertificatePolicy $Policy
             $csr = $result.CertificateSigningRequest
         }

@@ -1,21 +1,29 @@
-$ErrorActionPreference = "stop"
+#
+# create a certificate request, send it to the CA, retrieve the signed certificate, upload the pfx to Azure Key Vault
+#
+
+
+# force the script to stop also on a non-terminating error
+$ErrorActionPreference = 'Stop'
+# ensure that all variables are set
+Set-StrictMode -Version 1.0
 
 # ================================
 # Parameters
 # ================================
-$CertTemplate       	= "Flab-ShortWebServer"
-$CertSubject        	= "CN=server01.contoso.com"
-$CertDNS 		= "server01.contoso.com"
-$CertFriendlyName   	= "Flab Web Server Cert"
-$KeyExportable      	= $true
-$CA 			= "formicalab.casa\SubCA"
-$password 		= "Password.123"
+$CertTemplate = "Flab-ShortWebServer"
+$CertSubject = "CN=server01.contoso.com"
+$CertDNS = "server01.contoso.com"
+$CertFriendlyName = "Flab Web Server Cert"
+$KeyExportable = $true
+$CA = "formicalab.casa\SubCA"
+$password = "Password.123"
 
 # Azure Key Vault Parameters
-$KeyVaultName       = "flazkv-shared-neu-001"
-$SecretName         = "flab-shortwebserver-cert"
+$KeyVaultName = "flazkv-shared-neu-001"
+$SecretName = "flab-shortwebserver-cert"
 $AzureResourceGroup = "rg-shared-neu-001"
-$AzureLocation      = "northeurope"
+$AzureLocation = "northeurope"
 
 # ================================
 # 1. Request Certificate using Certeq
@@ -81,9 +89,9 @@ Import-Certificate -FilePath "C:\temp\cert_installer.cer" -CertStoreLocation "Ce
 # ================================
 write-host "Exporting the certificate to pfx..."
 $Cert = Get-ChildItem -Path "Cert:\LocalMachine\My" |
-        Where-Object { $_.Subject -eq "$CertSubject" } |
-        Sort-Object NotBefore -Descending |
-        Select-Object -First 1
+Where-Object { $_.Subject -eq "$CertSubject" } |
+Sort-Object NotBefore -Descending |
+Select-Object -First 1
 
 # Set Friendly Name
 $Cert.FriendlyName = $CertFriendlyName
