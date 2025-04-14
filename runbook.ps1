@@ -77,7 +77,7 @@ function certlcworkflow {
     $templateASN = $oid -replace '.*\((.*)\).*', '$1'
     
     # check if an existing CSR is present in the vault
-    $op = Get-AzKeyVaultCertificateOperation -VaultName $VaultName -Name $ObjectName | where {$_.Status -eq "inProgress"}
+    $op = Get-AzKeyVaultCertificateOperation -VaultName $VaultName -Name $ObjectName | Where-Object {$_.Status -eq "inProgress"}
     if ($null -ne $op) {
         Write-Output "Certificate request is already in progress for this certificate: $ObjectName; reusing the existing request."
         $csr = $op.CertificateSigningRequest
@@ -114,13 +114,13 @@ function certlcworkflow {
         return
     }
 
-    # write the certificate to a temporary file
+    # write the returned signed certificate to a temporary file
     $certFile = [System.IO.Path]::GetTempFileName()
     $certFile = [System.IO.Path]::ChangeExtension($certFile, ".p7b")
     Export-Certificate -Cert $certificate -FilePath $certFile -Type P7B
     Write-Output "Certificate file created: $certFile"
 
-    # use certutil -encode to convert the certificate to base64
+    # use certutil -encode to convert the certificate to base64 - this is required to import a p7b file into the key vault
     # (https://learn.microsoft.com/en-us/azure/key-vault/certificates/certificate-scenarios#formats-of-merge-csr-we-support)
     Write-Output "Converting the certificate to base64..."
     $certFileBase64 = [System.IO.Path]::ChangeExtension($certFile, ".b64")
