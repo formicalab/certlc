@@ -3,7 +3,7 @@ param (
     [Parameter(Mandatory = $false, HelpMessage = "Certificate Subject Name")]
     [string]$SubjectName = "CN=server01.contoso.com",
     [Parameter(Mandatory = $false, HelpMessage = "Certificate DNS Names")]
-    [string[]]$DnsNames = @("server01.contoso.com","server01.litware.com"),
+    [string[]]$DnsNames = @("server01.contoso.com", "server01.litware.com"),
     [Parameter(Mandatory = $false, HelpMessage = "Certificate Template Name")]
     [string]$TemplateName = "Flab-ShortWebServer"
 )
@@ -21,8 +21,10 @@ Set-StrictMode -Version 1.0
 ############## 
 
 $VaultName = "flazkv-shared-neu-001" # name of the Key Vault
-$ObjectName = "flab-shortwebserver-cert4" # name of the certificate object in Key Vault
+$CertName = "flab-shortwebserver-cert5" # name of the certificate object in Key Vault
+$CertPassword = "Password.123" # password for the PFX file
 $certificationAuthority = "flazdc03.formicalab.casa" # CA server to send the request to
+$pfxFolder = "C:\temp" # folder to store the pfx files
 
 # see if Az module is installed
 Write-Output "Checking if Az module is installed..."
@@ -53,16 +55,16 @@ if ($null -eq $ca) {
 }
 
 # create certificate - if a previous request is in progress, reuse it
-$op = Get-AzKeyVaultCertificateOperation -VaultName $VaultName -Name $ObjectName | Where-Object { $_.Status -eq "inProgress" }
+$op = Get-AzKeyVaultCertificateOperation -VaultName $VaultName -Name $CertName | Where-Object { $_.Status -eq "inProgress" }
 if ($null -ne $op) {
-    Write-Output "Certificate request is already in progress for this certificate: $ObjectName; reusing it."
+    Write-Output "Certificate request is already in progress for this certificate: $CertName; reusing it."
     $csr = $op.CertificateSigningRequest
 }
 else {
     try {
         Write-Output "Creating a new certificate in KV..."
         $Policy = New-AzKeyVaultCertificatePolicy -SecretContentType "application/x-pkcs12" -SubjectName $SubjectName -IssuerName "Unknown" -DnsName $DnsNames
-        $result = Add-AzKeyVaultCertificate -VaultName $VaultName -Name $ObjectName -CertificatePolicy $Policy
+        $result = Add-AzKeyVaultCertificate -VaultName $VaultName -Name $CertName -CertificatePolicy $Policy
         $csr = $result.CertificateSigningRequest
     }
     catch {
@@ -106,13 +108,28 @@ Start-Process -FilePath "certutil.exe" -ArgumentList "-encode", $certFile, $cert
 # import the certificate into the key vault
 Write-Output "Importing the certificate into the key vault..."
 try {
-    $newCert = Import-AzKeyVaultCertificate -VaultName $VaultName -Name $ObjectName -FilePath $certFileBase64 
+    $newCert = Import-AzKeyVaultCertificate -VaultName $VaultName -Name $CertName -FilePath $certFileBase64 
 }
 catch {
     Write-Error "Error importing certificate into the key vault: $_"
     exit 1
 }
 Write-Output "Certificate imported into the key vault: $($newCert.Name)"
+
+# download the certificate to a local file in the pfx folder
+$pfxFile = Join-Path -Path $pfxFolder -ChildPath "$($CertName).pfx"
+Write-Output "Exporting the certificate to PFX file: $pfxFile"
+try {
+    $CertBase64 = Get-AzKeyVaultSecret -VaultName $vaultName -Name $CertName -AsPlainText
+    $CertBytes = [Convert]::FromBase64String($CertBase64)
+    $x509Cert = New-Object Security.Cryptography.X509Certificates.X509Certificate2($certBytes, $null, [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
+    $pfxFileByte = $x509Cert.Export([Security.Cryptography.X509Certificates.X509ContentType]::Pkcs12, $CertPassword)
+    [IO.File]::WriteAllBytes($pfxFile, $pfxFileByte)
+}
+catch {
+    Write-Error "Error exporting certificate to PFX: $_"
+    exit 1
+}
 
 # cleanup temporary files
 Remove-Item -Path $csrFile -Force -ErrorAction SilentlyContinue
