@@ -1,3 +1,6 @@
+# Generates a CSR for a certificate in Azure Key Vault, sends it to a CA, and imports the signed certificate back into the Key Vault.
+# This script is designed to be run as an Azure Automation Runbook on a hybrid worker.
+
 param
 (
     [Parameter(Mandatory = $false)]
@@ -8,6 +11,10 @@ param
 $ErrorActionPreference = 'Stop'
 # ensure that all variables are set
 Set-StrictMode -Version 1.0
+
+#################
+# CONFIGURATION #
+#################
 
 $automationAccountName = "aa-shared-neu-001"
 $automationAccountRG = "rg-shared-neu-001"
@@ -24,7 +31,7 @@ function certlcworkflow {
         [Parameter(Mandatory = $true)]
         [string] $jsonMessage,
         [Parameter(Mandatory = $true)]
-        [object] $certificationAuthority
+        [object] $ca
     )
 
     # decode the message from JSON
@@ -35,15 +42,15 @@ function certlcworkflow {
     }
 
     $vaultName = $message.data.VaultName
-    $ObjectName = $message.data.ObjectName
+    $CertName = $message.data.ObjectName
 
     Write-Output "VaultName = $VaultName"
-    Write-Output "ObjectName = $ObjectName"
+    Write-Output "ObjectName = $CertName"
 
     # get the certificate from the vault
     $cert = $null
     try {
-        $cert = Get-AzKeyVaultCertificate -VaultName $vaultName -Name $ObjectName
+        $cert = Get-AzKeyVaultCertificate -VaultName $vaultName -Name $CertName
     }
     catch {
         Write-Error "Error getting certificate from vault: $_"
@@ -51,15 +58,15 @@ function certlcworkflow {
     }
 
     if ($null -eq $cert) {
-        Write-Error "Error getting certificate from vault: $ObjectName not found!"
+        Write-Error "Error getting certificate from vault: $CertName not found!"
         return
     }
 
     $SubjectName = $cert.Certificate.Subject
-    write-output "SubjectName = $SubjectName"
+    Write-Output "SubjectName = $SubjectName"
 
     $IssuerName = $cert.Certificate.Issuer
-    write-output "IssuerName = $IssuerName"
+    Write-Output "IssuerName = $IssuerName"
 
     # get the DNS names from the certificate
     $dnsNames = $null
@@ -87,15 +94,16 @@ function certlcworkflow {
 
     Write-Output "Template Name: $templateName"
 
-    # check if an existing CSR is present in the vault
-    $op = Get-AzKeyVaultCertificateOperation -VaultName $VaultName -Name $ObjectName | Where-Object { $_.Status -eq "inProgress" }
-    if ($null -ne $op) {
-        Write-Output "Certificate request is already in progress for this certificate: $ObjectName; reusing the existing request."
-        $csr = $op.CertificateSigningRequest
-    }
-    else {
-        try {
-            Write-Output "Creating a new CSR for the certificate: $ObjectName"
+    # create certificate - if a previous request is in progress, reuse it
+    $csr = $null
+    try {
+        $op = Get-AzKeyVaultCertificateOperation -VaultName $VaultName -Name $CertName | Where-Object { $_.Status -eq "inProgress" }
+        if ($null -ne $op) {
+            Write-Output "Certificate request is already in progress for this certificate: $CertName; reusing the existing request."
+            $csr = $op.CertificateSigningRequest
+        }
+        else {
+            Write-Output "Creating a new CSR for certificate $CertName in key vault $VaultName..."
             if ($null -ne $dnsNames) {
                 # create a new CSR with the DNS names
                 $Policy = New-AzKeyVaultCertificatePolicy -SecretContentType "application/x-pkcs12" -SubjectName $SubjectName -IssuerName "Unknown" -DnsName $dnsNames
@@ -104,28 +112,30 @@ function certlcworkflow {
                 # create a new CSR without DNS names
                 $Policy = New-AzKeyVaultCertificatePolicy -SecretContentType "application/x-pkcs12" -SubjectName $SubjectName -IssuerName "Unknown"
             }
-            $result = Add-AzKeyVaultCertificate -VaultName $VaultName -Name $ObjectName -CertificatePolicy $Policy
+            $result = Add-AzKeyVaultCertificate -VaultName $VaultName -Name $CertName -CertificatePolicy $Policy
             $csr = $result.CertificateSigningRequest
         }
-        catch {
-            Write-Error "Error generating CSR in Key Vault: $_"
-            return
-        }
     }
+    catch {
+        Write-Error "Error generating CSR in Key Vault: $_"
+        return
+    }
+    
 
     # Write the CSR content to a temporary file
-    $csrFile = [System.IO.Path]::GetTempFileName()
-    $csrFile = [System.IO.Path]::ChangeExtension($csrFile, ".csr")
+    $csrFile = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "$CertName.csr"
     Set-Content -Path $csrFile -Value $csr
     Write-Output "CSR file created: $csrFile"
 
     # Send request to the CA
     Write-Output "Sending request to the CA..."
-    $certificateRequest = Submit-CertificateRequest -CA $certificationAuthority -Path $csrFile -Attribute "CertificateTemplate:$($templateName)"
+    $certificateRequest = Submit-CertificateRequest -CA $ca -Path $csrFile -Attribute "CertificateTemplate:$($templateName)"
+    Remove-Item -Path $csrFile -Force -ErrorAction SilentlyContinue
     if ($null -eq $certificateRequest) {
         Write-Error "Error sending request to the CA."
         return
     }
+    Write-Output "Retrieving signed certificate from the CA..."
     $certificate = $certificateRequest.Certificate
     if ($null -eq $certificate) {
         Write-Error "Error getting certificate from the CA."
@@ -133,33 +143,40 @@ function certlcworkflow {
     }
 
     # write the returned signed certificate to a temporary file
-    $certFile = [System.IO.Path]::GetTempFileName()
-    $certFile = [System.IO.Path]::ChangeExtension($certFile, ".p7b")
-    Export-Certificate -Cert $certificate -FilePath $certFile -Type P7B
+    $certFile = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "$CertName.p7b"
+    try {
+        Export-Certificate -Cert $certificate -FilePath $certFile -Type P7B | Out-Null    
+    }
+    catch {
+        Write-Error "Error exporting certificate to file: $_"
+        return
+    }
     Write-Output "Certificate file created: $certFile"
 
     # use certutil -encode to convert the certificate to base64 - this is required to import a p7b file into the key vault
     # (https://learn.microsoft.com/en-us/azure/key-vault/certificates/certificate-scenarios#formats-of-merge-csr-we-support)
     Write-Output "Converting the certificate to base64..."
-    $certFileBase64 = [System.IO.Path]::ChangeExtension($certFile, ".b64")
-    Start-Process -FilePath "certutil.exe" -ArgumentList "-encode", $certFile, $certFileBase64 -NoNewWindow -Wait
+    $certFileBase64 = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "$CertName.b64"
+    $process = Start-Process -FilePath "certutil.exe" -ArgumentList "-encode", $certFile, $certFileBase64 -NoNewWindow -Wait -PassThru
+    Remove-Item -Path $certFile -Force -ErrorAction SilentlyContinue
+    if ($process.ExitCode -ne 0) {
+        Write-Error "certutil.exe failed with exit code $($process.ExitCode)"
+        return
+    }
 
     # import the certificate into the key vault
-    Write-Output "Importing the certificate into the key vault..."
+    Write-Output "Importing the certificate $CertName into the key vault $VaultName..."
     try {
-        $newCert = Import-AzKeyVaultCertificate -VaultName $VaultName -Name $ObjectName -FilePath $certFileBase64 
+        $newCert = Import-AzKeyVaultCertificate -VaultName $VaultName -Name $CertName -FilePath $certFileBase64 
     }
     catch {
         Write-Error "Error importing certificate into the key vault: $_"
         return
     }
-    Write-Output "Certificate imported into the key vault: $($newCert.Name)"
-
-    # cleanup temporary files
-    Remove-Item -Path $csrFile -Force -ErrorAction SilentlyContinue
-    Remove-Item -Path $certFile -Force -ErrorAction SilentlyContinue
-    Remove-Item -Path $certFileBase64 -Force -ErrorAction SilentlyContinue
-    Write-Output "Temporary files deleted."
+    finally {
+        Remove-Item -Path $certFileBase64 -Force -ErrorAction SilentlyContinue
+    }
+    Write-Output "Certificate imported into the key vault."
 }
 
 ############
@@ -171,105 +188,139 @@ $envVars = Get-ChildItem env:
 $HybridWorker = ($envVars | Where-Object { $_.name -like 'Fabric_*' } ).count -eq 0
 if (-not $HybridWorker) {
     Write-Error "This workbook must be executed by a hybrid worker!"
-    #Write-Output $envVars
-    exit 1
+    return
 }
-
-$worker = $env:COMPUTERNAME
-Write-Output "Runbook started at $(Get-Date), running on hybrid worker $worker"
-
-# Connect to azure
-
-# Ensures you do not inherit an AzContext in your runbook
-$null = Disable-AzContextAutosave -Scope Process
-
-# Connect using a Managed Service Identity
-Write-output "Connecting to Azure..."
-try {
-    $AzureConnection = (Connect-AzAccount -Identity).context
-}
-catch {
-    Write-Output "There is no system-assigned user identity. Aborting." 
-    exit 1
-}
-
-# import other modules if needed
-import-module PSPKI
-
-# set and store context
-$AzureContext = Set-AzContext -SubscriptionName $AzureConnection.Subscription -DefaultProfile $AzureConnection
-Write-Output "Connection done."
 
 # get the automation variables
 $storageAccountName = (Get-AzAutomationVariable -ResourceGroupName $automationAccountRG -AutomationAccountName $automationAccountName -name "certlc-storageaccount").Value
 $queueName = (Get-AzAutomationVariable -ResourceGroupName $automationAccountRG -AutomationAccountName $automationAccountName -name "certlc-queue").Value
-$certificationAuthority = (Get-AzAutomationVariable -ResourceGroupName $automationAccountRG -AutomationAccountName $automationAccountName -name "certlc-ca").Value
+$CAServer = (Get-AzAutomationVariable -ResourceGroupName $automationAccountRG -AutomationAccountName $automationAccountName -name "certlc-ca").Value
 
 # check that all variables are set
 if ($null -eq $storageAccountName) {
     Write-Error "Storage account name is not set. Exiting."
-    exit 1
+    return
 }
 if ($null -eq $queueName) {
     Write-Error "Queue name is not set. Exiting."
-    exit 1
+    return
 }
-if ($null -eq $certificationAuthority) {
+if ($null -eq $CAServer) {
     Write-Error "Certification authority is not set. Exiting."
-    exit 1
-}
-
-write-output "Storage account is: $storageAccountName"
-write-output "Queue name is: $queueName"
-write-output "Certification authority is: $certificationAuthority"
-
-Write-Output "Getting the CA details for $certificationAuthority..."
-$ca = Get-CertificationAuthority -ComputerName $certificationAuthority
-if ($null -eq $ca) {
-    Write-Error "Error getting CA details: $certificationAuthority not found"
     return
 }
 
-write-output "Creating context to work with storage account..."
+$worker = $env:COMPUTERNAME
+Write-Output "Script started at $(Get-Date), running on $worker"
+Write-Output "Storage account is: $storageAccountName"
+Write-Output "Queue name is: $queueName"
+Write-Output "Certification authority is: $CAServer"
+Write-Output ""
+
+# see if Az module is installed
+Write-Output "Checking if Az module is installed..."
+if (-not (Get-InstalledModule -Name Az)) {
+    Write-Error "Az module not installed!"
+    return
+}
+
+# see if PSPKI module is installed
+Write-Output "Checking if PSPKI module is installed..."
+if (-not (Get-InstalledModule -Name PSPKI)) {
+    Write-Error "PSPKI module not installed!"
+    return
+}
+
+# Connect to azure
+
+# Ensures you do not inherit an AzContext, snce we are using a system-assigned identity for login
+$null = Disable-AzContextAutosave -Scope Process
+
+# Connect using a Managed Service Identity
+Write-Output "Connecting to Azure using default identity..."
+try {
+    $AzureConnection = (Connect-AzAccount -Identity).context
+}
+catch {
+    Write-Error "There is no system-assigned user identity. Aborting." 
+    return
+}
+
+# set and store context
+$AzureContext = Set-AzContext -SubscriptionName $AzureConnection.Subscription -DefaultProfile $AzureConnection
+
+# import other modules if needed
+import-module PSPKI
+
+# get CA details
+Write-Output "Getting the CA details for $CAServer..."
+$ca = Get-CertificationAuthority -ComputerName $CAServer
+if ($null -eq $ca) {
+    Write-Error "Error getting CA details: $CAServer not found"
+    return
+}
+
+Write-Output "Creating context to work with storage account..."
 $ctx = New-AzStorageContext -StorageAccountName $storageAccountName -UseConnectedAccount
 
-
 # check the queue for messages for a maximum of $queueAttempts times
-for ($i = 0; $i -lt $queueAttempts; $i++) {
-    write-output "Checking the queue..."
-    $queue = Get-AzStorageQueue -Name $queueName -Context $ctx
-    write-output ("Queued messages " + $queue.ApproximateMessageCount)
-
-    if ($queue.ApproximateMessageCount -gt 0) {
-        break
+try {
+    for ($i = 0; $i -lt $queueAttempts; $i++) {
+        Write-Output "Checking the queue (attempt $($i+1) of $queueAttempts)..."
+        $queue = Get-AzStorageQueue -Name $queueName -Context $ctx
+        Write-Output ("Queued messages " + $queue.ApproximateMessageCount)
+    
+        if ($queue.ApproximateMessageCount -gt 0) {
+            break
+        }
+        else {
+            Write-Output "Queue is empty: going to sleep for $queueWait seconds before checking again..."
+            Start-Sleep -Seconds $queueWait
+        }
     }
-    else {
-        write-output "Sleeping for $queueWait seconds..."
-        Start-Sleep -Seconds $queueWait
-    }
+    if ($i -eq $queueAttempts) {
+        Write-Error "No messages in the queue after $queueAttempts attempts. Exiting."
+        return
+    }        
 }
-if ($i -eq $queueAttempts) {
-    Write-Error "No messages in the queue after $queueAttempts attempts. Exiting."
-    exit 1
+catch {
+    Write-Error "Error getting the queue: $_"
+    return
 }
 
 # process the messages in the queue
 for ($i = 1; $i -le $queue.ApproximateMessageCount; $i++ ) {
-    write-output "Processing message $i of $($queue.ApproximateMessageCount)..."
+    Write-Output "Processing message $i of $($queue.ApproximateMessageCount)..."
     # get the message from the queue
-    $queueMessage = $queue.QueueClient.ReceiveMessage($queueInvisibilityTimeout)
-    if ($null -eq $queueMessage.Value) {
-        write-output "No message value found, skipping."
-        continue
+
+    try {
+        $queueMessage = $queue.QueueClient.ReceiveMessage($queueInvisibilityTimeout)
+        if ($null -eq $queueMessage.Value) {
+            Write-Output "No message value found, skipping."
+            continue
+        }            
     }
+    catch {
+        Write-Error "Error getting message from the queue: $_"
+        return
+    }
+
     # decode body of the message from base64
     $jsonMessage = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($queueMessage.value.MessageText))
+    
     # process the message
-    write-output "JSON Message: $($jsonMessage)"
-    certlcworkflow -jsonMessage $jsonMessage -certificationAuthority $ca
+    Write-Output "JSON Message: $($jsonMessage)"
+    certlcworkflow -jsonMessage $jsonMessage -ca $ca
+    
     # delete the message from the queue
-    write-output "Deleting message from the queue..."
-    $queue.QueueClient.DeleteMessage($queueMessage.value.MessageId, $queueMessage.value.PopReceipt)
+    Write-Output "Deleting message from the queue..."
+    try {
+        $queue.QueueClient.DeleteMessage($queueMessage.value.MessageId, $queueMessage.value.PopReceipt) | Out-Null        
+    }
+    catch {
+        Write-Error "Error deleting message from the queue: $_"
+        return
+    }
 }
 
-write-output "DONE."
+Write-Output "All done - $(get-date)."
