@@ -1,20 +1,24 @@
 [
     {
+      "CorrelationId": "e7b8c9d2-3f4a-4a6b-8d9e-2f3c7a1e5b6f",
       "Status": "Info",
       "Progress": 0,
       "Description": "Initialization started."
     },
     {
+      "CorrelationId": "e7b8c9d2-3f4a-4a6b-8d9e-2f3c7a1e5b6f",
       "Status": "Warning",
       "Progress": 40,
       "Description": "Network latency detected, continuing with reduced throughput."
     },
     {
-      "Status": "Error",
+      "CorrelationId": "e7b8c9d2-3f4a-4a6b-8d9e-2f3c7a1e5b6f",
+      "Status": "Warning",
       "Progress": 60,
       "Description": "Temporary failure accessing remote storage."
     },
     {
+      "CorrelationId": "e7b8c9d2-3f4a-4a6b-8d9e-2f3c7a1e5b6f",
       "Status": "Success",
       "Progress": 100,
       "Description": "Process completed successfully."

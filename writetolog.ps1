@@ -10,11 +10,8 @@ Set-StrictMode -Version 1.0
 ############
 
 $ingestionUrl = "https://dce-certlc-itn-001-ws3i.italynorth-1.ingest.monitor.azure.com"
-$DcrImmutableId = "dcr-40e21e19fe5e46a4b57cdf34a7fcb383"
+$DcrImmutableId = "dcr-0af8254b18bf4c06a6d2952f9f040938"
 $table = "certlc_CL"  # the name of the custom log table, including "_CL" suffix
-$clientId = "7ffb1a85-7351-4b58-911d-3c8f1cf03546"
-$tenantId = "2b41bfe4-ee81-4fc6-ae54-f9e48fefb244"
-$secret = "ld98Q~3XP1BqgeCfVEwkYN28yKVVTbxl8iU5SbkE"   # TODO: move to key vault instead of hardcoding it
 
 # Ensures you do not inherit an AzContext, snce we are using a system-assigned identity for login
 $null = Disable-AzContextAutosave -Scope Process
@@ -32,15 +29,13 @@ catch {
 # set and store context
 $AzureContext = Set-AzContext -SubscriptionName $AzureConnection.Subscription -DefaultProfile $AzureConnection
 
-# obtain a token for scope https://monitor.azure.com//.default" using the specific client id
-$scope = [System.Web.HttpUtility]::UrlEncode("https://monitor.azure.com//.default")   
-$body = "client_id=$clientId&scope=$scope&client_secret=$secret&grant_type=client_credentials";
-$headers = @{"Content-Type" = "application/x-www-form-urlencoded" };
-$uri = "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token"
-$token = (Invoke-RestMethod -Uri $uri -Method "Post" -Body $body -Headers $headers).access_token
+# get a token for the ingestion endpoint
+$secureToken = (Get-AzAccessToken -ResourceUrl "https://monitor.azure.com//.default"-AsSecureString ).Token
+$token = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureToken))
 
 $log_entry = @{
     # Define the structure of log entry, as it will be sent
+    CorrelationId = [guid]::NewGuid().ToString()
     Status      = "Information"
     Progress    = 20
     Description = "This is a test log entry."
@@ -52,8 +47,19 @@ $body ="[$body]"
 
 $headers = @{"Authorization" = "Bearer $Token"; "Content-Type" = "application/json" };
 $uri = "$ingestionUrl/dataCollectionRules/$DcrImmutableId/streams/Custom-$table" + "?api-version=2023-01-01";
-Write-Output "Sending log entry to $uri..."
+Write-Output "Sending log entry..."
 
-$uploadResponse = Invoke-RestMethod -Uri $uri -Method "Post" -Body $body -Headers $headers
+try {
+    Invoke-RestMethod -Uri $uri -Method "Post" -Body $body -Headers $headers
+    Write-Output "Log entry sent successfully."
+}
+catch {
 
-Write-Output "Response: $uploadResponse"
+    # code required with old powershell 5.1, to obtain the response body from the exception
+    $result = $_.Exception.Response.GetResponseStream()
+    $reader = New-Object System.IO.StreamReader($result)
+    $reader.BaseStream.Position = 0
+    $reader.DiscardBufferedData()
+    $responseBody = $reader.ReadToEnd();
+    Write-Error $responseBody
+}
