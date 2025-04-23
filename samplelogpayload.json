@@ -1,0 +1,22 @@
+[
+    {
+      "Status": "Info",
+      "Progress": 0,
+      "Description": "Initialization started."
+    },
+    {
+      "Status": "Warning",
+      "Progress": 40,
+      "Description": "Network latency detected, continuing with reduced throughput."
+    },
+    {
+      "Status": "Error",
+      "Progress": 60,
+      "Description": "Temporary failure accessing remote storage."
+    },
+    {
+      "Status": "Success",
+      "Progress": 100,
+      "Description": "Process completed successfully."
+    }
+  ]
