@@ -16,9 +16,12 @@ Set-StrictMode -Version 1.0
 # STATIC SETTINGS #
 ###################
 
+# TODO: can be automation variables instead (see renewcertviakv.ps1)
+
 $PFXFolder = "C:\Temp"                  # folder where the PFX file will be downloaded
 $CAServer = "flazdc03.formicalab.casa"  # CA server name
 $VaultName = "flazkv-shared-neu-001"    # Key Vault name
+
 $IngestionUrl = "https://dce-certlc-itn-001-ws3i.italynorth-1.ingest.monitor.azure.com"
 $DcrImmutableId = "dcr-0af8254b18bf4c06a6d2952f9f040938"
 $Table = "certlc_CL"  # the name of the custom log table, including "_CL" suffix
