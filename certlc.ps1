@@ -301,18 +301,6 @@ function New-CertificateRequest {
 # MAIN - 00-19 #
 ################
 
-# Check if the script is running on Azure or on hybrid worker
-Write-Log "Script started, checking worker..."
-$envVars = Get-ChildItem env:
-$HybridWorker = ($envVars | Where-Object { $_.name -like 'Fabric_*' } ).count -eq 0
-if (-not $HybridWorker) {
-    Write-Log "This workbook must be executed by a hybrid worker!" -Level "Error"
-    return
-}
-$worker = $env:COMPUTERNAME
-Write-Log "Running on $worker"
-$Progress++
-
 # see if Az module is installed
 Write-Log "Checking if Az module is installed..."
 if (-not (Get-InstalledModule -Name Az)) {
@@ -344,6 +332,18 @@ $AzureContext = Set-AzContext -SubscriptionName $AzureConnection.Subscription -D
 Write-Log "Getting token for ingestion endpoint..."
 $secureToken = (Get-AzAccessToken -ResourceUrl "https://monitor.azure.com//.default"-AsSecureString ).Token
 $LAToken = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureToken))
+$Progress++
+
+# Check if the script is running on Azure or on hybrid worker
+Write-Log "Script started, checking worker..."
+$envVars = Get-ChildItem env:
+$HybridWorker = ($envVars | Where-Object { $_.name -like 'Fabric_*' } ).count -eq 0
+if (-not $HybridWorker) {
+    Write-Log "This workbook must be executed by a hybrid worker!" -Level "Error"
+    return
+}
+$worker = $env:COMPUTERNAME
+Write-Log "Running on $worker"
 $Progress++
 
 # see if PSPKI module is installed
@@ -563,57 +563,60 @@ if ($Action -eq "autorenew") {
         # before processing the request, we need to obtain the other certificate details, such as template, subject, and DNS names
         Write-Log "Getting remaining certificate details from the key vault..."
 
-        Write-Log "Getting certificate $CertificateName from vault $VaultName..."
+        Write-Log "Getting certificate details for $CertificateName from vault $VaultName..."
         $cert = $null
         try {
             $cert = Get-AzKeyVaultCertificate -VaultName $vaultName -Name $CertificateName
         }
         catch {
-            Write-Log "Error getting certificate from vault: $_" -Level "Error"
+            Write-Log "Error getting certificate details for $CertificateName from vault: $_" -Level "Error"
             return
         }
         if ($null -eq $cert) {
-            Write-Log "Error getting certificate $CertificateName from vault: empty response!" -Level "Error"
-            return
+            Write-Log "Cannot get certificate details for $CertificateName from vault: empty response! It is possible that the certificate was deleted before the renewal process started. This request will be ignored and removed from the queue" -Level "Warning"
         }
-        $Progress++
-        
-        $CertificateSubject = $cert.Certificate.Subject
-        Write-Log "Certificate Subject: $SubjectName"
 
-        # get the DNS names from the certificate
-        $CertificateDnsNames = $null
-        $san = $cert.Certificate.Extensions | Where-Object { $_.Oid.FriendlyName -eq "Subject Alternative Name" }
-        if ($null -ne $san) {
-            # $DNS.Format(0) returns a string like: DNS Name=server01.contoso.com, DNS Name=server01.litware.com.
-            # Transform it into an array of DNS names using regex; remove the "DNS Name=" prefix and split by comma
-            $CertificateDnsNames = ($san.Format(0) -replace 'DNS Name=', '').Split(',').Trim() | Where-Object { $_ -ne "" }
-            Write-Log "Certificate DNS Names: $($CertificateDnsNames -join ', ')"
-        }
         else {
-            Write-Log "Certificate DNS Names: N/A"
+            Write-Log "Certificate $CertificateName found in vault $VaultName."
+            $Progress++
+        
+            $CertificateSubject = $cert.Certificate.Subject
+            Write-Log "Certificate Subject: $SubjectName"
+
+            # get the DNS names from the certificate
+            $CertificateDnsNames = $null
+            $san = $cert.Certificate.Extensions | Where-Object { $_.Oid.FriendlyName -eq "Subject Alternative Name" }
+            if ($null -ne $san) {
+                # $DNS.Format(0) returns a string like: DNS Name=server01.contoso.com, DNS Name=server01.litware.com.
+                # Transform it into an array of DNS names using regex; remove the "DNS Name=" prefix and split by comma
+                $CertificateDnsNames = ($san.Format(0) -replace 'DNS Name=', '').Split(',').Trim() | Where-Object { $_ -ne "" }
+                Write-Log "Certificate DNS Names: $($CertificateDnsNames -join ', ')"
+            }
+            else {
+                Write-Log "Certificate DNS Names: N/A"
+            }
+            $Progress++
+
+            # get the OID of the Certificate Template
+            $oid = $cert.Certificate.Extensions | Where-Object { $_.Oid.FriendlyName -eq "Certificate Template Information" }
+            if ($null -eq $oid) {
+                Write-Log "Error getting OID from certificate: Certificate Template Information not found" -Level "Error"
+                return
+            }
+            # convert in a string like:
+            # Template=Flab-ShortWebServer(1.3.6.1.4.1.311.21.8.15431357.2613787.6440092.16459852.14380503.11.12399345.16691736), Major Version Number=100, Minor Version Number=5
+            $oid = $oid.Format(0)
+
+            # extract the template name and the ASN.1 values using regex
+            $CertificateTemplate = $oid -replace '.*Template=(.*)\(.*\).*', '$1'
+            $CertificateTemplateASN = $oid -replace '.*\((.*)\).*', '$1'
+            Write-Log "Certificate Template: $CertificateTemplate ($CertificateTemplateASN)"
+            $Progress++
+
+            # Now we have all the details to create the new certificate request.
+            # We can use the same code as for new certificates
+            New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDNSNames $CertificateDnsNames -CAServer $CAServer -PfxFolder $PFXFolder 
         }
-        $Progress++
-
-        # get the OID of the Certificate Template
-        $oid = $cert.Certificate.Extensions | Where-Object { $_.Oid.FriendlyName -eq "Certificate Template Information" }
-        if ($null -eq $oid) {
-            Write-Log "Error getting OID from certificate: Certificate Template Information not found" -Level "Error"
-            return
-        }
-        # convert in a string like:
-        # Template=Flab-ShortWebServer(1.3.6.1.4.1.311.21.8.15431357.2613787.6440092.16459852.14380503.11.12399345.16691736), Major Version Number=100, Minor Version Number=5
-        $oid = $oid.Format(0)
-
-        # extract the template name and the ASN.1 values using regex
-        $CertificateTemplate = $oid -replace '.*Template=(.*)\(.*\).*', '$1'
-        $CertificateTemplateASN = $oid -replace '.*\((.*)\).*', '$1'
-        Write-Log "Certificate Template: $CertificateTemplate ($CertificateTemplateASN)"
-        $Progress++
-
-        # Now we have all the details to create the new certificate request.
-        # We can use the same code as for new certificates
-        New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDNSNames $CertificateDnsNames -CAServer $CAServer -PfxFolder $PFXFolder 
 
         # delete the message from the queue
         Write-Log "Deleting message from the queue..."
@@ -649,7 +652,7 @@ elseif ($Action -eq "renew" ) {
         return
     }
     if ($null -eq $cert) {
-        Write-Log "Error getting certificate $CertificateName from vault: empty response!" -Level "Error"
+        Write-Log "Error getting certificate $CertificateName from vault: empty response! It is possible that the certificate was deleted before the renewal process started." -Level "Error"
         return
     }
     $Progress++
