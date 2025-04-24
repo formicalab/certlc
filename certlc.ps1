@@ -89,7 +89,7 @@ $PFXFolder = "C:\Temp"                  # folder where the PFX file will be down
 # GLOBAL VARIABLES #
 ####################
 
-$Progress = 0                                   # progress of the script
+$script:Progress = 0                                   # progress of the script
 $LAToken = $null                                # token using to send logs to Log Analytics
 $CorrelationId = [guid]::NewGuid().ToString()   # correlation ID for the log entry
 
@@ -111,7 +111,7 @@ function Write-Log {
         $log_entry = @{
             CorrelationId = $CorrelationId
             Status        = $Level
-            Progress      = $Progress
+            Progress      = $script:Progress
             Description   = $Description
         }
         $body = $log_entry | ConvertTo-Json -Depth 10
@@ -124,13 +124,13 @@ function Write-Log {
 
     # write to output
     if ($Level -eq "Error") {
-        Write-Error "$(get-date): $($Level): [$(('{0:D3}' -f $Progress))] $Description"
+        Write-Error "$(get-date): $($Level): [$(('{0:D3}' -f $script:Progress))] $Description"
     }
     elseif ($Level -eq "Warning") {
-        Write-Warning "$(get-date): $($Level): [$(('{0:D3}' -f $Progress))] $Description"
+        Write-Warning "$(get-date): $($Level): [$(('{0:D3}' -f $script:Progress))] $Description"
     }
     else {
-        Write-Output "$(get-date): $($Level): [$(('{0:D3}' -f $Progress))] $Description"
+        Write-Output "$(get-date): $($Level): [$(('{0:D3}' -f $script:Progress))] $Description"
     }
 }
 
@@ -184,13 +184,13 @@ function New-CertificateRequest {
         Write-Log "Error generating CSR in Key Vault: $_" -Level "Error"
         return
     }
-    $Progress++
+    $script:Progress++
 
     # Write the CSR content to a temporary file
     $csrFile = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "$CertificateName.csr"
     Set-Content -Path $csrFile -Value $csr
     Write-Log "CSR file created: $csrFile"
-    $Progress++
+    $script:Progress++
 
     # Send request to the CA and remove the CSR file
     Write-Log "Sending request to the CA..."
@@ -214,7 +214,7 @@ function New-CertificateRequest {
         Write-Log "Error getting certificate from the CA: no X.509 certificate returned!" -Level "Error"
         return
     }
-    $Progress++
+    $script:Progress++
 
     # write the returned signed certificate to a temporary file
     Write-Log "Exporting the signed certificate to a temporary file..."
@@ -227,7 +227,7 @@ function New-CertificateRequest {
         return
     }
     Write-Log "Certificate file created: $certFile"
-    $Progress++
+    $script:Progress++
 
     # use certutil -encode to convert the certificate to base64 - this is required to import a p7b file into the key vault
     # (https://learn.microsoft.com/en-us/azure/key-vault/certificates/certificate-scenarios#formats-of-merge-csr-we-support)
@@ -239,7 +239,7 @@ function New-CertificateRequest {
         Write-Log "certutil.exe failed with exit code $($process.ExitCode)" -Level "Error"
         return
     }
-    $Progress++
+    $script:Progress++
 
     # import the certificate into the key vault
     Write-Log "Importing the certificate $CertificateName into the key vault $VaultName..."
@@ -254,7 +254,7 @@ function New-CertificateRequest {
         Remove-Item -Path $certFileBase64 -Force -ErrorAction SilentlyContinue
     }
     Write-Log "Certificate imported into the key vault."
-    $Progress++
+    $script:Progress++
 
     # if required, download the certificate to a local file in the pfx folder
     if ($null -ne $pfxFolder) {
@@ -268,7 +268,7 @@ function New-CertificateRequest {
             Write-Log "Failed to retrieve certificate password from Key Vault: $_" -Level "Error"
             return
         }
-        $Progress++
+        $script:Progress++
 
         # create the folder if it does not exist
         if (-not (Test-Path -Path $pfxFolder)) {
@@ -276,7 +276,7 @@ function New-CertificateRequest {
             New-Item -Path $pfxFolder -ItemType Directory -Force | Out-Null
         }
         Write-Log "PFX folder verified: $pfxFolder"
-        $Progress++
+        $script:Progress++
 
         # download the certificate to a local file in the pfx folder
         $pfxFile = Join-Path -Path $pfxFolder -ChildPath "$($CertificateName).pfx"
@@ -293,7 +293,7 @@ function New-CertificateRequest {
             return
         }
         Write-Log "Certificate exported to PFX file: $pfxFile"
-        $Progress++
+        $script:Progress++
     }
 }
 
@@ -307,7 +307,7 @@ if (-not (Get-InstalledModule -Name Az)) {
     Write-Log "Az module not installed!" -Level "Error"
     return
 }
-$Progress++
+$script:Progress++
 
 # Connect to azure
 
@@ -323,7 +323,7 @@ catch {
     Write-Log "There is no system-assigned user identity." -Level "Error"
     return
 }
-$Progress++
+$script:Progress++
 
 # set and store context
 $AzureContext = Set-AzContext -SubscriptionName $AzureConnection.Subscription -DefaultProfile $AzureConnection
@@ -332,7 +332,7 @@ $AzureContext = Set-AzContext -SubscriptionName $AzureConnection.Subscription -D
 Write-Log "Getting token for ingestion endpoint..."
 $secureToken = (Get-AzAccessToken -ResourceUrl "https://monitor.azure.com//.default"-AsSecureString ).Token
 $LAToken = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureToken))
-$Progress++
+$script:Progress++
 
 # Check if the script is running on Azure or on hybrid worker
 Write-Log "Script started, checking worker..."
@@ -344,7 +344,7 @@ if (-not $HybridWorker) {
 }
 $worker = $env:COMPUTERNAME
 Write-Log "Running on $worker"
-$Progress++
+$script:Progress++
 
 # see if PSPKI module is installed
 Write-Log "Check if PSPKI module is installed..."
@@ -353,7 +353,7 @@ if (-not (Get-InstalledModule -Name PSPKI)) {
     return
 }
 import-module PSPKI
-$Progress++
+$script:Progress++
 
 # get CA details
 Write-Log "Getting the CA details for $CAServer..."
@@ -362,7 +362,7 @@ if ($null -eq $ca) {
     Write-Log "Error getting CA details: $CAServer not found" -Level "Error"
     return
 }
-$Progress++
+$script:Progress++
 
 # Parse the webhook data
 Write-Log "Parsing webhook data..."
@@ -377,7 +377,7 @@ catch {
     Write-Log "Failed to parse WebhookData.RequestBody as JSON. Error: $_" -Level "Error"
     return
 }
-$Progress++
+$script:Progress++
 
 $CertLCVersion = $requestBody.CertLCVersion
 $Action = $requestBody.Action
@@ -447,7 +447,7 @@ else {
             Write-Log "Template $($CertificateTemplate) not found in AD! Check its name." -Level "Error"
             return
         }
-        $Progress++
+        $script:Progress++
 
         if ([string]::IsNullOrWhiteSpace($CertificateSubject)) {
             Write-Log "Missing or empty mandatory parameter: 'CertificateSubject'" -Level "Error"
@@ -492,12 +492,12 @@ Write-Log "Runbook parameters parsed successfully."
 
 if ($Action -eq "autorenew") {
 
-    $Progress = 20
+    $script:Progress = 20
     Write-Log "Starting autorenewal process..."
 
     Write-Log "Creating context to work with storage account..."
     $ctx = New-AzStorageContext -StorageAccountName $QueueStorageAccountName -UseConnectedAccount
-    $Progress++
+    $script:Progress++
 
     # check the queue for messages for a maximum of $queueAttempts times
     try {
@@ -523,7 +523,7 @@ if ($Action -eq "autorenew") {
         Write-Log "Error getting the queue: $_" -Level "Error"
         return
     }
-    $Progress++
+    $script:Progress++
 
     # process the messages in the queue
     for ($i = 1; $i -le $queue.ApproximateMessageCount; $i++ ) {
@@ -541,7 +541,7 @@ if ($Action -eq "autorenew") {
             Write-Log "Error getting message from the queue: $_" -Level "Error"
             return
         }
-        $Progress++
+        $script:Progress++
 
         # decode body of the message from base64
         $messageText = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($queueMessage.value.MessageText))   
@@ -555,7 +555,7 @@ if ($Action -eq "autorenew") {
             Write-Log "Failed to parse message body as JSON. Error: $_" -Level "Error"
             return
         }
-        $Progress++
+        $script:Progress++
 
         $VaultName = $message.data.VaultName
         $CertificateName = $message.data.ObjectName
@@ -578,7 +578,7 @@ if ($Action -eq "autorenew") {
 
         else {
             Write-Log "Certificate $CertificateName found in vault $VaultName."
-            $Progress++
+            $script:Progress++
         
             $CertificateSubject = $cert.Certificate.Subject
             Write-Log "Certificate Subject: $SubjectName"
@@ -595,7 +595,7 @@ if ($Action -eq "autorenew") {
             else {
                 Write-Log "Certificate DNS Names: N/A"
             }
-            $Progress++
+            $script:Progress++
 
             # get the OID of the Certificate Template
             $oid = $cert.Certificate.Extensions | Where-Object { $_.Oid.FriendlyName -eq "Certificate Template Information" }
@@ -611,7 +611,7 @@ if ($Action -eq "autorenew") {
             $CertificateTemplate = $oid -replace '.*Template=(.*)\(.*\).*', '$1'
             $CertificateTemplateASN = $oid -replace '.*\((.*)\).*', '$1'
             Write-Log "Certificate Template: $CertificateTemplate ($CertificateTemplateASN)"
-            $Progress++
+            $script:Progress++
 
             # Now we have all the details to create the new certificate request.
             # We can use the same code as for new certificates
@@ -636,7 +636,7 @@ if ($Action -eq "autorenew") {
 
 elseif ($Action -eq "renew" ) {
 
-    $Progress = 40
+    $script:Progress = 40
     Write-Log "Starting the '$Action' process..."
 
     # before processing the request, we need to obtain the other certificate details, such as template, subject, and DNS names
@@ -655,7 +655,7 @@ elseif ($Action -eq "renew" ) {
         Write-Log "Error getting certificate $CertificateName from vault: empty response! It is possible that the certificate was deleted before the renewal process started." -Level "Error"
         return
     }
-    $Progress++
+    $script:Progress++
         
     $CertificateSubject = $cert.Certificate.Subject
     Write-Log "Certificate Subject: $SubjectName"
@@ -672,7 +672,7 @@ elseif ($Action -eq "renew" ) {
     else {
         Write-Log "Certificate DNS Names: N/A"
     }
-    $Progress++
+    $script:Progress++
 
     # get the OID of the Certificate Template
     $oid = $cert.Certificate.Extensions | Where-Object { $_.Oid.FriendlyName -eq "Certificate Template Information" }
@@ -688,7 +688,7 @@ elseif ($Action -eq "renew" ) {
     $CertificateTemplate = $oid -replace '.*Template=(.*)\(.*\).*', '$1'
     $CertificateTemplateASN = $oid -replace '.*\((.*)\).*', '$1'
     Write-Log "Certificate Template: $CertificateTemplate ($CertificateTemplateASN)"
-    $Progress++
+    $script:Progress++
 
     New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDNSNames $CertificateDnsNames -CAServer $CAServer -PfxFolder $PFXFolder 
 }
@@ -699,7 +699,7 @@ elseif ($Action -eq "renew" ) {
 
 else {
 
-    $Progress = 60
+    $script:Progress = 60
     Write-Log "Starting the '$Action' process..."
 
     # check if a certificate with the same name already exists in the key vault
@@ -715,7 +715,7 @@ else {
         Write-Log "Error checking for existing certificate: $_" -Level "Error"
         return
     }
-    $Progress++
+    $script:Progress++
 
     # we already have all the parameters from the webhook body, so we can create the new certificate request
     New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDNSNames $CertificateDNSNames -CAServer $CAServer -PfxFolder $PFXFolder
@@ -725,6 +725,6 @@ else {
 # MAIN - end #
 ##############
 
-$Progress = 100
+$script:Progress = 100
 Write-Log "Runbook completed successfully."
 
