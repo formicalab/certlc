@@ -1,5 +1,9 @@
-#Requires -Version 5.1
-#Requires -Modules Az.Accounts, Az.Storage, Az.Resources, Az.Automation, Az.KeyVault, PSPKI
+#Requires -PSEdition Core
+using module Az.Accounts
+using module Az.KeyVault
+using module Az.Storage
+using module Az.Resources
+using module PSPKI
 
 ##########
 # CERTLC #
@@ -8,13 +12,12 @@
 # CERTLC is a PowerShell runbook that automates the process of obtaining or renewing certificates from an AD CA, integrated with Azure Key Vault.
 # The key vault is used to generate all requests, storing the private keys safely.
 
-# The script is designed to be run using PowerShell 5.1 in an Azure Automation hybrid worker environment.
+# The script is designed to be run using PowerShell 7.x in an Azure Automation hybrid worker environment.
 # Requires the following modules:
 # - Az
 # - PSPKI
 
 # Based on certlc solution https://learn.microsoft.com/en-us/azure/architecture/example-scenario/certificate-lifecycle/
-
 
 param
 (
@@ -113,9 +116,7 @@ function Write-Log {
             Status        = $Level
             Message       = $Message
         }
-        $body = $log_entry | ConvertTo-Json -Depth 10
-        # put the json body into an array [] - PowerShell 5.1 does support the -AsArray switch for ConvertTo-Json
-        $body = "[$body]"
+        $body = $log_entry | ConvertTo-Json -AsArray
         $headers = @{"Authorization" = "Bearer $LAToken"; "Content-Type" = "application/json" };
         $uri = "$LAIngestionUrl/dataCollectionRules/$LADCRImmutableId/streams/Custom-$LATable" + "?api-version=2023-01-01";
         Invoke-RestMethod -Uri $uri -Method "Post" -Body $body -Headers $headers | Out-Null
@@ -312,7 +313,7 @@ function New-CertificateRequest {
     }
     
     # Write the CSR content to a temporary file
-    $csrFile = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "$CertificateName.csr"
+    $csrFile       = New-TemporaryFile
     Set-Content -Path $csrFile -Value $csr
     Write-Log "CSR file created: $csrFile"
     
@@ -343,13 +344,11 @@ function New-CertificateRequest {
     $certCollection = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
     $certCollection.Add($certificate)
 
-    # Export the certificate in Pkcs#7 format and convert it to base64 with line breaks
+    # Export the certificate in Pkcs#7 format and convert it to base64 with line breaks and wrapped in PEM headers and footers
     $certP7B = $certCollection.Export($certFormat)
     $certP7BEncoded = [Convert]::ToBase64String($certP7B, [System.Base64FormattingOptions]::InsertLineBreaks)
-
-    # Wrap in PEM headers and footers
     $certP7BEncoded = "-----BEGIN CERTIFICATE-----`n$certP7BEncoded`n-----END CERTIFICATE-----"
-    $certP7BEncodedFile = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "$CertificateName.p7b.encoded"
+    $certP7BEncodedFile   = New-TemporaryFile
     Set-Content -Path $certP7BEncodedFile -Value $certP7BEncoded
 
     # import the certificate into the key vault
@@ -396,9 +395,7 @@ function New-CertificateRequest {
             $x509Cert = New-Object Security.Cryptography.X509Certificates.X509Certificate2($certBytes, $null, [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
 
             # get clear text password from the secure string and clear it as soon as possible
-            $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecCertPassword)
-            try { $CertPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto($ptr) }
-            finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
+            $CertPassword = ConvertFrom-SecureString -SecureString $SecCertPassword -AsPlainText
 
             # export the certificate to a PFX file
             $pfxFileByte = $x509Cert.Export([Security.Cryptography.X509Certificates.X509ContentType]::Pkcs12, $CertPassword)
@@ -413,9 +410,6 @@ function New-CertificateRequest {
             $pfxFileByte = $null
             $x509Cert = $null
             $SecCertPassword = $null
-            # force garbage collection to free the memory used by above sensitive variables
-            [GC]::Collect()
-            [GC]::WaitForPendingFinalizers()
         }
         Write-Log "Certificate exported to PFX file: $pfxFile"
     }
@@ -446,9 +440,7 @@ $AzureContext = Set-AzContext -SubscriptionName $AzureConnection.Subscription -D
 if ($LAEnabled) {
     Write-Log "Getting token for ingestion endpoint..."
     $secureToken = (Get-AzAccessToken -ResourceUrl "https://monitor.azure.com//.default"-AsSecureString ).Token
-    $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureToken)
-    try { $LAToken = [Runtime.InteropServices.Marshal]::PtrToStringAuto($ptr) }
-    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
+    $LAToken = ConvertFrom-SecureString -SecureString $secureToken -AsPlainText
     $secureToken = $null
 }
 
