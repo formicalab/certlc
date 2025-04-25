@@ -1,3 +1,6 @@
+#Requires -Version 5.1
+#Requires -Modules Az.Accounts, Az.Storage, Az.Resources, Az.Automation, Az.KeyVault, PSPKI
+
 ##########
 # CERTLC #
 ##########
@@ -31,11 +34,11 @@ param
 # {
 #   "CertLCVersion": "1.0",                     # version tag
 #   "Action": "New"                             # action to perform
-#   "VautName": "string"                        # key vault name
+#   "VaultName": "string"                       # key vault name
 #   "CertificateName": "string",                # name of the certificate to create or renew
 #   "CertificateTemplate": "string",            # name of the certificate template to use
 #   "CertificateSubject": "string",             # subject of the certificate to create or renew
-#   "CertificateDNSNames": array of strings     # optional, certificate DNS names
+#   "CertificateDnsNames": array of strings     # optional, certificate DNS names
 # }
 
 # for RENEWALS:
@@ -50,38 +53,35 @@ param
 # In this case, the webhook body will not contain the above structure.
 # A missing 'CertLCVersion' field will be used to identify the webhook as an autorenewal. CertificateName and VaultName will be fetched from the queue message.
 
-
-# force the runbook to stop also on a non-terminating error
-$ErrorActionPreference = 'Stop'
-# ensure that all variables are set
+# Prohibits references to uninitialized variables
 Set-StrictMode -Version 1.0
 
 ###################
 # STATIC SETTINGS #
 ###################
 
-# TODO: can be automation variables instead (see renewcertviakv.ps1)
-
 $Version = "1.0"                        # version of the script - must match the version in the webhook body
 
-$IngestionUrl = "https://dce-certlc-itn-001-ws3i.italynorth-1.ingest.monitor.azure.com"     # Log Analytics Ingestion: ingestion URL
-$DcrImmutableId = "dcr-0af8254b18bf4c06a6d2952f9f040938"                                    # Log Analytics Ingestion: Data Collection Rule (DCR) immutable ID
-$Table = "certlc_CL"                                                                        # Log Analytics Ingestion: custom table name (must include also the _CL suffix)
+$LAEnabled = $true                                                                                  # enable Log Analytics ingestion
+$LAIngestionUrl = "https://dce-certlc-shared-itn-001-luwu.italynorth-1.ingest.monitor.azure.com"    # Log Analytics Ingestion: ingestion URL
+$LADCRImmutableId = "dcr-748535390f2943c683e85e12dbda98a1"                                          # Log Analytics Ingestion: Data Collection Rule (DCR) immutable ID
+$LATable = "certlc_CL"                                                                              # Log Analytics Ingestion: custom table name (must include also the _CL suffix)
 
-$AutomationAccountName = "aa-shared-neu-001"
-$AutomationAccountRG = "rg-shared-neu-001"
+$AutomationAccountName = "aa-shared-neu-001"        # automation account used to run the script and to store the variables
+$AutomationAccountRG = "rg-shared-neu-001"          # resource group of the automation account
 
-$QueueStorageAccountName = "flazstsharedneu001"     # name of the storage account where the queue is located
+$QueueStorageAccount = "flazstsharedneu001"         # name of the storage account where the queue is located
 $QueueName = "certlc"                               # name of the queue to use for autorenewals
 $QueueAttempts = 10                                 # number of attempts to check the queue
 $QueueWait = 5                                      # seconds to wait between attempts
 $QueueInvisibilityTimeout = [System.TimeSpan]::FromSeconds(30) # seconds to wait for the message to be invisible in the queue when it is being processed
 
 $CAServer = "flazdc03.formicalab.casa"  # CA server name
-$PFXFolder = "C:\Temp"                  # folder where the PFX file will be downloaded
+$PfxFolder = "C:\Temp"                  # folder where the PFX file will be downloaded
+$CertPswSecretName = "CertPassword"    # name of the secret in the key vault that contains the password for the PFX file
 
-# Note: some settings might be set in the Automation Account variables instead. Fetch as follows:
-#$QueueStorageAccountName = (Get-AzAutomationVariable -ResourceGroupName $automationAccountRG -AutomationAccountName $automationAccountName -name "certlc-storageaccount").Value
+# TODO: where possible, use automation variables instead (see renewcertviakv.ps1). Sample usage:
+#$QueueStorageAccount = (Get-AzAutomationVariable -ResourceGroupName $automationAccountRG -AutomationAccountName $automationAccountName -name "certlc-storageaccount").Value
 #$QueueName = (Get-AzAutomationVariable -ResourceGroupName $automationAccountRG -AutomationAccountName $automationAccountName -name "certlc-queue").Value
 #$CAServer = (Get-AzAutomationVariable -ResourceGroupName $automationAccountRG -AutomationAccountName $automationAccountName -name "certlc-ca").Value
 
@@ -89,7 +89,6 @@ $PFXFolder = "C:\Temp"                  # folder where the PFX file will be down
 # GLOBAL VARIABLES #
 ####################
 
-$script:Progress = 0                                   # progress of the script
 $LAToken = $null                                # token using to send logs to Log Analytics
 $CorrelationId = [guid]::NewGuid().ToString()   # correlation ID for the log entry
 
@@ -101,37 +100,123 @@ $CorrelationId = [guid]::NewGuid().ToString()   # correlation ID for the log ent
 function Write-Log {
     param (
         [Parameter()]
-        [string]$Description,
+        [string]$Message,
         [Parameter()]
         [string]$Level = "Information"
     )
 
-    # send log to Log Analytics workspace (if token is available)
-    if ($null -ne $LAToken) {
+    # send log to Log Analytics workspace (if token is available and output to LA is enabled)
+    if ($LAEnabled -and ($null -ne $LAToken)) {
         $log_entry = @{
+            TimeGenerated = (Get-Date).ToUniversalTime()
             CorrelationId = $CorrelationId
             Status        = $Level
-            Progress      = $script:Progress
-            Description   = $Description
+            Message       = $Message
         }
         $body = $log_entry | ConvertTo-Json -Depth 10
         # put the json body into an array [] - PowerShell 5.1 does support the -AsArray switch for ConvertTo-Json
         $body = "[$body]"
         $headers = @{"Authorization" = "Bearer $LAToken"; "Content-Type" = "application/json" };
-        $uri = "$IngestionUrl/dataCollectionRules/$DcrImmutableId/streams/Custom-$Table" + "?api-version=2023-01-01";
+        $uri = "$LAIngestionUrl/dataCollectionRules/$LADCRImmutableId/streams/Custom-$LATable" + "?api-version=2023-01-01";
         Invoke-RestMethod -Uri $uri -Method "Post" -Body $body -Headers $headers | Out-Null
     }
 
     # write to output
-    if ($Level -eq "Error") {
-        Write-Error "$(get-date): $($Level): [$(('{0:D3}' -f $script:Progress))] $Description"
+    switch ($Level) {
+        "Error" {
+            Write-Output "$(get-date): $($Level): $Message"
+        }
+        "Warning" {
+            Write-Warning "$(get-date): $($Level): $Message"
+        }
+        default {
+            Write-Output "$(get-date): $($Level): $Message"
+        }
     }
-    elseif ($Level -eq "Warning") {
-        Write-Warning "$(get-date): $($Level): [$(('{0:D3}' -f $script:Progress))] $Description"
+}
+
+##############################
+# FUNCTIONS - Invoke-Renewal #
+##############################
+
+function Invoke-QueueItemRenewal {
+    param (
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$VaultName,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$CertificateName,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$CAServer,
+
+        [Parameter(Mandatory = $false)]
+        [string]$PfxFolder,
+
+        [Parameter(Mandatory = $false)]
+        [string]$CertPswSecretName
+    )
+
+    # before processing the request, we need to obtain the other certificate details, such as template, subject, and DNS names
+    Write-Log "Getting certificate details for $CertificateName from key vault $VaultName..."
+    $cert = $null
+    try {
+        $cert = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName
+    }
+    catch {
+        throw "Error getting certificate details for $CertificateName from vault: $_"
+    }
+
+    if ($null -eq $cert) {
+        throw "Error getting certificate details for $CertificateName from vault: empty response! It is possible that the certificate was deleted before the renewal process started."
+    }
+
+    # get the certificate subject
+    $CertificateSubject = $cert.Certificate.Subject
+
+    # get the DNS names from the certificate
+    $CertificateDnsNames = $null
+    $san = $cert.Certificate.Extensions | Where-Object { $_.Oid.FriendlyName -eq "Subject Alternative Name" }
+    if ($null -ne $san) {
+        # $DNS.Format(0) returns a string like: DNS Name=server01.contoso.com, DNS Name=server01.litware.com.
+        # Transform it into an array of DNS names using regex; remove the "DNS Name=" prefix and split by comma
+        $CertificateDnsNames = ($san.Format(0) -replace 'DNS Name=', '').Split(',').Trim() | Where-Object { $_ -ne "" }
+    }
+        
+    # get the OID of the Certificate Template
+    $oid = $cert.Certificate.Extensions | Where-Object { $_.Oid.FriendlyName -eq "Certificate Template Information" }
+    if ($null -eq $oid) {
+        throw "Error getting OID from certificate: Certificate Template Information not found"
+    }
+    # convert in a string like:
+    # Template=Flab-ShortWebServer(1.3.6.1.4.1.311.21.8.15431357.2613787.6440092.16459852.14380503.11.12399345.16691736), Major Version Number=100, Minor Version Number=5
+    $oid = $oid.Format(0)
+    
+    # extract the template name and the ASN.1 values using regex
+    $CertificateTemplate = $oid -replace '.*Template=(.*)\(.*\).*', '$1'
+    $CertificateTemplateASN = $oid -replace '.*\((.*)\).*', '$1'
+
+    Write-Log "Certificate $CertificateName found in vault $($VaultName): Subject: $CertificateSubject, Template: $CertificateTemplate ($CertificateTemplateASN)"
+    if ($null -eq $CertificateDnsNames) {
+        Write-Log "Certificate DNS Names: N/A"
     }
     else {
-        Write-Output "$(get-date): $($Level): [$(('{0:D3}' -f $script:Progress))] $Description"
+        Write-Log "Certificate DNS Names: $($CertificateDnsNames -join ', ')"
     }
+    
+    # Now we have all the details to create the new certificate request.
+    # We can use the same code as for new certificates
+    
+    try {
+        New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CAServer $CAServer -PfxFolder $PfxFolder -CertPswSecretName $CertPswSecretName            
+    }
+    catch {
+        throw "Error creating certificate request: $_"
+    }   
 }
 
 ######################################
@@ -143,27 +228,80 @@ function Write-Log {
 function New-CertificateRequest {
     param (
         [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [string]$VaultName,
+
         [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [string]$CertificateName,
+
         [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [string]$CertificateTemplate,
+
         [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [string]$CertificateSubject,
+
         [Parameter(Mandatory = $false)]
-        [array]$CertificateDNSNames,
-        [Parameter(Mandatory = $false)]
+        [array]$CertificateDnsNames,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
         [string]$CAServer,
+
         [Parameter(Mandatory = $false)]
-        [string]$PfxFolder
+        [string]$PfxFolder,
+
+        [Parameter(Mandatory = $false)]
+        [string]$CertPswSecretName
+
     )
+
+    # check if the template exists in AD
+    Write-Log "Checking if the template $CertificateTemplate exists in AD..."
+    $tmpl = Get-CertificateTemplate -Name $CertificateTemplate -ErrorAction SilentlyContinue
+    if ($null -eq $tmpl) {
+        throw "Template $($CertificateTemplate) not found in AD! Check its name."
+    }
+
+    # get CA details
+    Write-Log "Getting the CA details for $CAServer..."
+    $ca = Get-CertificationAuthority -ComputerName $CAServer
+    if ($null -eq $ca) {
+        throw "Error getting CA details: $CAServer not found"
+    }
+    
+    # check if there is a deleted certificate with the same name in the key vault
+    Write-Log "Checking if there is a deleted certificate with the same name in the key vault..."
+    try {
+        $deletedCert = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -InRemovedState
+    }
+    catch {
+        throw "Error checking for deleted certificate: $_"
+    }  
+    if (($null -ne $deletedCert) -and ($null -ne $deletedCert.DeletedDate)) {
+        throw "Certificate $CertificateName is already in the key vault and in deleted state since $($deletedCert.DeletedDate). It must be purged before creating a new one; otherwise specify a different certificate name."
+    }  
+
+    # check if a complete certificate with the same name already exists in the key vault
+    Write-Log "Checking if a certificate with the same name already exists in the key vault..."
+    try {
+        $cert = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName
+        if ($null -ne $cert -and $null -ne $cert.Certificate) {     # pending requests do not have a certificate property
+            throw "An active certificate $CertificateName already exists in the key vault. Please use a different name or use the Renew action to create a new version."
+        }
+    }
+    catch {
+        throw "Error checking for existing certificate: $_"
+    }
 
     # create certificate - if a previous request is in progress, reuse it
     $csr = $null
     try {
         $op = Get-AzKeyVaultCertificateOperation -VaultName $VaultName -Name $CertificateName | Where-Object { $_.Status -eq "inProgress" }
         if ($null -ne $op) {
-            Write-Log "Certificate request is already in progress for this certificate: $CertificateName; reusing the existing request."
+            Write-Log "Certificate request is already in progress for this certificate: $CertificateName; reusing the existing request." -Level "Warning"
             $csr = $op.CertificateSigningRequest
         }
         else {
@@ -181,137 +319,157 @@ function New-CertificateRequest {
         }
     }
     catch {
-        Write-Log "Error generating CSR in Key Vault: $_" -Level "Error"
-        return
+        throw "Error generating CSR in Key Vault: $_"
     }
-    $script:Progress++
-
+    
     # Write the CSR content to a temporary file
     $csrFile = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "$CertificateName.csr"
     Set-Content -Path $csrFile -Value $csr
     Write-Log "CSR file created: $csrFile"
-    $script:Progress++
-
+    
     # Send request to the CA and remove the CSR file
     Write-Log "Sending request to the CA..."
     try {
         $certificateRequest = Submit-CertificateRequest -CA $ca -Path $csrFile -Attribute "CertificateTemplate:$($CertificateTemplate)"    
     }
     catch {
-        Write-Log "Error sending request to the CA: $_" -Level "Error"
-        return
+        throw "Error sending request to the CA: $_"
     }
     finally {
         # remove the CSR file
         Remove-Item -Path $csrFile -Force -ErrorAction SilentlyContinue
     }
     if ($null -eq $certificateRequest) {
-        Write-Log "Error sending request to the CA: empty response returned!" -Level "Error"
-        return
+        throw "Error sending request to the CA: empty response returned!"
     }
     $certificate = $certificateRequest.Certificate
     if ($null -eq $certificate) {
-        Write-Log "Error getting certificate from the CA: no X.509 certificate returned!" -Level "Error"
-        return
+        throw "Error getting certificate from the CA: no X.509 certificate returned!"
     }
-    $script:Progress++
+    
+    # certificate is X509Certificate2. We can use X509Certificate2.Export to export the certificate in different formats.
+    $certFormat = [System.Security.Cryptography.X509Certificates.X509ContentType]::Cert
+    $certEncoded = [System.Convert]::ToBase64String($certificate.Export($certFormat), [System.Base64FormattingOptions]::InsertLineBreaks)
+    $certPem = "-----BEGIN CERTIFICATE-----`n$certEncoded`n-----END CERTIFICATE-----"
+    $certPemFile = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "$CertificateName.pem"
+    Set-Content -Path $certPemFile -Value $certPem
+
+    write-output $certPemFile
+
+    throw "STOP HERE"
 
     # write the returned signed certificate to a temporary file
-    Write-Log "Exporting the signed certificate to a temporary file..."
     $certFile = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "$CertificateName.p7b"
+    Write-Log "Exporting the signed certificate to temporary file $certFile..."
     try {
         Export-Certificate -Cert $certificate -FilePath $certFile -Type P7B | Out-Null    
     }
     catch {
-        Write-Log "Error exporting certificate to file: $_" -Level "Error"
-        return
+        throw "Error exporting certificate to file: $_"
     }
     Write-Log "Certificate file created: $certFile"
-    $script:Progress++
+    
+    throw "STOP HERE"
 
     # use certutil -encode to convert the certificate to base64 - this is required to import a p7b file into the key vault
     # (https://learn.microsoft.com/en-us/azure/key-vault/certificates/certificate-scenarios#formats-of-merge-csr-we-support)
     Write-Log "Converting the certificate to base64..."
-    $certFileBase64 = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "$CertificateName.b64"
-    $process = Start-Process -FilePath "certutil.exe" -ArgumentList "-encode", $certFile, $certFileBase64 -NoNewWindow -Wait -PassThru
-    Remove-Item -Path $certFile -Force -ErrorAction SilentlyContinue
-    if ($process.ExitCode -ne 0) {
-        Write-Log "certutil.exe failed with exit code $($process.ExitCode)" -Level "Error"
-        return
+    $certUtil = Join-Path $env:SystemRoot 'System32\certutil.exe'
+    if (-not (Test-Path -Path $certUtil)) {
+        throw "certutil.exe not found!"
     }
-    $script:Progress++
+    $certFileBase64 = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "$CertificateName.b64"
+    $stdoutFile = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "$CertificateName.stdout.txt"
+    $stderrFile = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "$CertificateName.stderr.txt"
 
+    $process = Start-Process -FilePath $certUtil -ArgumentList "-encode", $certFile, $certFileBase64 `
+        -NoNewWindow -Wait -PassThru `
+        -RedirectStandardOutput $stdoutFile `
+        -RedirectStandardError $stderrFile
+
+    Remove-Item -Path $certFile -Force -ErrorAction SilentlyContinue
+    $exitCode = $process.ExitCode
+
+    if ($exitCode -ne 0) {
+        $stdout = Get-Content -Path $stdoutFile -ErrorAction SilentlyContinue
+        $stderr = Get-Content -Path $stderrFile -ErrorAction SilentlyContinue
+        $exitCodeHex = ("0x{0:X8}" -f ($exitCode -band 0xFFFFFFFF))
+        throw "certutil.exe failed with exit code $exitCode ($exitCodeHex).`nSTDOUT:`n$stdout`nSTDERR:`n$stderr"
+    }
+
+    Remove-Item -Path $stdoutFile, $stderrFile -Force -ErrorAction SilentlyContinue
+    
     # import the certificate into the key vault
     Write-Log "Importing the certificate $CertificateName into the key vault $VaultName..."
     try {
         $newCert = Import-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -FilePath $certFileBase64 
     }
     catch {
-        Write-Log "Error importing certificate into the key vault: $_" -Level "Error"
-        return
+        throw "Error importing certificate into the key vault: $_"
     }
     finally {
         Remove-Item -Path $certFileBase64 -Force -ErrorAction SilentlyContinue
     }
     Write-Log "Certificate imported into the key vault."
-    $script:Progress++
-
+    
     # if required, download the certificate to a local file in the pfx folder
-    if ($null -ne $pfxFolder) {
-
-        # get the password for the PFX file from the key vault
-        Write-Log "Retrieving the certificate password from Key Vault..."
-        try {
-            $CertPassword = (Get-AzKeyVaultSecret -VaultName $VaultName -Name "CertPassword").SecretValueText
-        }
-        catch {
-            Write-Log "Failed to retrieve certificate password from Key Vault: $_" -Level "Error"
-            return
-        }
-        $script:Progress++
+    if ($null -ne $PfxFolder) {
 
         # create the folder if it does not exist
-        if (-not (Test-Path -Path $pfxFolder)) {
-            Write-Log "Creating the PFX folder: $pfxFolder"
-            New-Item -Path $pfxFolder -ItemType Directory -Force | Out-Null
+        if (-not (Test-Path -Path $PfxFolder)) {
+            Write-Log "Creating the PFX folder: $PfxFolder"
+            New-Item -Path $PfxFolder -ItemType Directory -Force | Out-Null
         }
-        Write-Log "PFX folder verified: $pfxFolder"
-        $script:Progress++
-
+        $pfxFile = Join-Path -Path $PfxFolder -ChildPath "$($CertificateName).pfx"
+        Write-Log "PFX folder verified: $PfxFolder"
+        
+        # get the password for the PFX file from the key vault
+        Write-Log "Retrieving the certificate password from Key Vault $VaultName, secret $($CertPswSecretName)..."
+        try {
+            $SecCertPassword = (Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertPswSecretName).SecretValue
+        }
+        catch {
+            throw "Failed to retrieve certificate password from secret $CertPswSecretName in Key Vault $($VaultName): $_"
+        }
+        
         # download the certificate to a local file in the pfx folder
-        $pfxFile = Join-Path -Path $pfxFolder -ChildPath "$($CertificateName).pfx"
         Write-Log "Exporting the $CertificateName certificate to PFX file: $pfxFile"
         try {
-            $CertBase64 = Get-AzKeyVaultSecret -VaultName $vaultName -Name $CertificateName -AsPlainText
+            $CertBase64 = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertificateName -AsPlainText
             $CertBytes = [Convert]::FromBase64String($CertBase64)
             $x509Cert = New-Object Security.Cryptography.X509Certificates.X509Certificate2($certBytes, $null, [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
+
+            # get clear text password from the secure string and clear it as soon as possible
+            $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecCertPassword)
+            try { $CertPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto($ptr) }
+            finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
+
+            # export the certificate to a PFX file
             $pfxFileByte = $x509Cert.Export([Security.Cryptography.X509Certificates.X509ContentType]::Pkcs12, $CertPassword)
             [IO.File]::WriteAllBytes($pfxFile, $pfxFileByte)
         }
         catch {
-            Write-Log "Error exporting certificate to PFX: $_" -Level "Error"
-            return
+            throw "Error exporting certificate to PFX: $_"
+        }
+        finally {
+            $CertPassword = $null
+            $CertBase64 = $null
+            $pfxFileByte = $null
+            $x509Cert = $null
+            $SecCertPassword = $null
+            # force garbage collection to free the memory used by above sensitive variables
+            [GC]::Collect()
+            [GC]::WaitForPendingFinalizers()
         }
         Write-Log "Certificate exported to PFX file: $pfxFile"
-        $script:Progress++
     }
 }
 
-################
-# MAIN - 00-19 #
-################
+#################################
+# MAIN - modules and parameters #
+#################################
 
-# see if Az module is installed
-Write-Log "Checking if Az module is installed..."
-if (-not (Get-InstalledModule -Name Az)) {
-    Write-Log "Az module not installed!" -Level "Error"
-    return
-}
-$script:Progress++
-
-# Connect to azure
-
-# Ensures you do not inherit an AzContext, since we are using a system-assigned identity for login
+# Connect to Azure. Ensures we do not inherit an AzContext, since we are using a system-assigned identity for login
 $null = Disable-AzContextAutosave -Scope Process
 
 # Connect using a Managed Service Identity
@@ -320,64 +478,51 @@ try {
     $AzureConnection = (Connect-AzAccount -Identity).context
 }
 catch {
-    Write-Log "There is no system-assigned user identity." -Level "Error"
-    return
+    $msg = "There is no system-assigned user identity."
+    Write-Log $msg -Level "Error"
+    throw $msg
 }
-$script:Progress++
 
 # set and store context
 $AzureContext = Set-AzContext -SubscriptionName $AzureConnection.Subscription -DefaultProfile $AzureConnection
 
-# get a token for the ingestion endpoint
-Write-Log "Getting token for ingestion endpoint..."
-$secureToken = (Get-AzAccessToken -ResourceUrl "https://monitor.azure.com//.default"-AsSecureString ).Token
-$LAToken = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureToken))
-$script:Progress++
+# get a token for the ingestion endpoint if Log Analytics ingestion is enabled
+if ($LAEnabled) {
+    Write-Log "Getting token for ingestion endpoint..."
+    $secureToken = (Get-AzAccessToken -ResourceUrl "https://monitor.azure.com//.default"-AsSecureString ).Token
+    $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureToken)
+    try { $LAToken = [Runtime.InteropServices.Marshal]::PtrToStringAuto($ptr) }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
+    $secureToken = $null
+}
 
 # Check if the script is running on Azure or on hybrid worker
-Write-Log "Script started, checking worker..."
+Write-Log "Script started, running on $($env:COMPUTERNAME). Checking worker..."
 $envVars = Get-ChildItem env:
 $HybridWorker = ($envVars | Where-Object { $_.name -like 'Fabric_*' } ).count -eq 0
 if (-not $HybridWorker) {
-    Write-Log "This workbook must be executed by a hybrid worker!" -Level "Error"
-    return
+    $msg = "This workbook must be executed by a hybrid worker!"
+    Write-Log $msg -Level "Error"
+    throw $msg
 }
-$worker = $env:COMPUTERNAME
-Write-Log "Running on $worker"
-$script:Progress++
 
-# see if PSPKI module is installed
-Write-Log "Check if PSPKI module is installed..."
-if (-not (Get-InstalledModule -Name PSPKI)) {
-    Write-Log "PSPKI module not installed!" -Level "Error"
-    return
-}
+# import other modules
 import-module PSPKI
-$script:Progress++
-
-# get CA details
-Write-Log "Getting the CA details for $CAServer..."
-$ca = Get-CertificationAuthority -ComputerName $CAServer
-if ($null -eq $ca) {
-    Write-Log "Error getting CA details: $CAServer not found" -Level "Error"
-    return
-}
-$script:Progress++
 
 # Parse the webhook data
-Write-Log "Parsing webhook data..."
 if (($null -eq $WebhookData) -or ($null -eq $WebhookData.RequestBody)) {
-    Write-Log "Webhook data missing! Ensure the runbook is called from a webhook!" -Level "Error"
-    return
+    $msg = "Webhook data missing! Ensure the runbook is called from a webhook!"
+    Write-Log $msg -Level "Error"
+    throw $msg
 }
 try {
     $requestBody = ConvertFrom-Json -InputObject $WebhookData.RequestBody
 }
 catch {
-    Write-Log "Failed to parse WebhookData.RequestBody as JSON. Error: $_" -Level "Error"
-    return
+    $msg = "Failed to parse WebhookData.RequestBody as JSON. Error: $_"
+    Write-Log $msg -Level "Error"
+    throw $msg
 }
-$script:Progress++
 
 $CertLCVersion = $requestBody.CertLCVersion
 $Action = $requestBody.Action
@@ -385,346 +530,200 @@ $VaultName = $requestBody.VaultName
 $CertificateName = $requestBody.CertificateName
 $CertificateTemplate = $requestBody.CertificateTemplate
 $CertificateSubject = $requestBody.CertificateSubject
-$CertificateDNSNames = $requestBody.CertificateDNSNames
+$CertificateDnsNames = $requestBody.CertificateDnsNames
 
+# check version and determine action to perform
 if ($null -eq $CertLCVersion) {
     Write-Log "CertLCVersion is missing: assuming this is an automatic renewal request triggered by Event Grid"
     $Action = "autorenew"
-
-    # write all the static and parsed parameters to the log
-    Write-Log "Action: $Action"
-    Write-Log "VaultName: will get from the queue message"
-    Write-Log "CertificateName: will get from the queue message"    
 }
 else {
     if ($CertLCVersion -ne $Version) {
-        Write-Log "CertLCVersion $CertLCVersion does not match the script version $Version!" -Level "Error"
-        return
+        $msg = "CertLCVersion $CertLCVersion does not match the script version $Version!"
+        Write-Log $msg -Level "Error"
+        throw $msg
     }
+    else {
+        Write-Log "CertLCVersion: $CertLCVersion"
+    }
+
     if ([string]::IsNullOrWhiteSpace($Action)) {
-        Write-Log "Missing or empty mandatory parameter: 'Action'" -Level "Error"
-        return
+        $msg = "Missing or empty mandatory parameter: 'Action'"
+        Write-Log $msg -Level "Error"
+        throw $msg
     }
     $Action = $Action.ToLower()
     if ($Action -ne "new" -and $Action -ne "renew") {
-        Write-Log "Invalid value for 'Action': $Action. Must be 'New' or 'Renew'!" -Level "Error"
-        return
-    }
-    if ([string]::IsNullOrWhiteSpace($VaultName)) {
-        Write-Log "Missing or empty mandatory parameter: 'VaultName'" -Level "Error"
-        return
-    }
-    if ([string]::IsNullOrWhiteSpace($CertificateName)) {
-        Write-Log "Missing or empty mandatory parameter: 'CertificateName'" -Level "Error"
-        return
-    }
-
-    # check if there is a deleted certificate with the same name in the key vault
-    Write-Log "Checking if there is a deleted certificate with the same name in the key vault..."
-    try {
-        $deletedCert = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -InRemovedState
-        if (($null -ne $deletedCert) -and ($null -ne $deletedCert.DeletedDate)) {
-            Write-Log "Certificate $CertificateName is already in the key vault and in deleted state since $($deletedCert.DeletedDate). It must be purged before creating a new one; otherwise specify a different certificate name." -Level "Error"
-            return
-        }  
-    }
-    catch {
-        Write-Log "Error checking for deleted certificate: $_" -Level "Error"
-        return
-    }
-
-    # the following parameters are only required for new certificates
-    if ($Action -eq "new") {
-        if ([string]::IsNullOrWhiteSpace($CertificateTemplate)) {
-            Write-Log "Missing or empty mandatory parameter: 'CertificateTemplate'" -Level "Error"
-            return
-        }
-
-        # check if the template exists in AD
-        Write-Log "Checking if the template $CertificateTemplate exists in AD..."
-        $tmpl = Get-CertificateTemplate -Name $CertificateTemplate -ErrorAction SilentlyContinue
-        if ($null -eq $tmpl) {
-            Write-Log "Template $($CertificateTemplate) not found in AD! Check its name." -Level "Error"
-            return
-        }
-        $script:Progress++
-
-        if ([string]::IsNullOrWhiteSpace($CertificateSubject)) {
-            Write-Log "Missing or empty mandatory parameter: 'CertificateSubject'" -Level "Error"
-            return
-        }
-        if ($CertificateDnsNames -and $CertificateDNSNames -isnot [array]) {
-            Write-Log "'CertificateDNSNames' parameter is not an array!" -Level "Error"
-            return
-        }
-    }
-
-    # write the parsed parameters to the log
-    Write-Log "CertLCVersion: $CertLCVersion"
-    Write-Log "Action: $Action"
-    Write-Log "VaultName: $VaultName"
-    Write-Log "CertificateName: $CertificateName"
-    if ($null -ne $CertificateTemplate) {
-        Write-Log "CertificateTemplate: $CertificateTemplate"
-    }
-    else {
-        Write-Log "CertificateTemplate: N/A"
-    }
-    if ($null -ne $CertificateSubject) {
-        Write-Log "CertificateSubject: $CertificateSubject"
-    }
-    else {
-        Write-Log "CertificateSubject: N/A"
-    }
-    if ($null -ne $CertificateDNSNames) {
-        Write-Log "CertificateDNSNames: $($CertificateDNSNames -join ', ')"
-    }
-    else {
-        Write-Log "CertificateDNSNames: N/A"
+        $msg = "Invalid value for 'Action': $Action. Must be 'New' or 'Renew'!"
+        Write-Log $msg -Level "Error"
+        throw $msg
     }
 }
 
-Write-Log "Runbook parameters parsed successfully."
-
-##########################
-# MAIN - 20+ (AUTORENEW) #
-##########################
+####################
+# MAIN - AUTORENEW #
+####################
 
 if ($Action -eq "autorenew") {
 
-    $script:Progress = 20
-    Write-Log "Starting autorenewal process..."
-
-    Write-Log "Creating context to work with storage account..."
-    $ctx = New-AzStorageContext -StorageAccountName $QueueStorageAccountName -UseConnectedAccount
-    $script:Progress++
-
-    # check the queue for messages for a maximum of $queueAttempts times
     try {
-        for ($i = 0; $i -lt $queueAttempts; $i++) {
-            Write-Log "Checking the queue (attempt $($i+1) of $queueAttempts)..."
-            $queue = Get-AzStorageQueue -Name $queueName -Context $ctx
+        $ctx = New-AzStorageContext -StorageAccountName $QueueStorageAccount -UseConnectedAccount        
+    }
+    catch {
+        $msg = "Error creating a context to work with storage account $($QueueStorageAccount): $_"
+        Write-Log $msg -Level "Error"
+        throw $msg
+    }
+    
+    # wait until the queue has messages for a maximum of $QueueAttempts
+    Write-Log "Performing autorenew: waiting for messages in the queue $QueueName..."
+    try {
+        for ($i = 0; $i -lt $QueueAttempts; $i++) {
+            Write-Log "Checking the queue (attempt $($i+1) of $QueueAttempts)..."
+            $queue = Get-AzStorageQueue -Name $QueueName -Context $ctx
             Write-Log ("Queued messages " + $queue.ApproximateMessageCount)
     
             if ($queue.ApproximateMessageCount -gt 0) {
                 break
             }
             else {
-                Write-Log "Queue is empty: going to sleep for $queueWait seconds before checking again..." -Level "Warning"
-                Start-Sleep -Seconds $queueWait
+                Write-Log "Queue is empty: going to sleep for $QueueWait seconds before checking again..." -Level "Warning"
+                Start-Sleep -Seconds $QueueWait
             }
         }
-        if ($i -eq $queueAttempts) {
-            Write-Log "No messages in the queue after $queueAttempts attempts. Exiting." -Level "Error"
-            return
+        if ($i -eq $QueueAttempts) {
+            $msg = "No messages in the queue after $QueueAttempts attempts. Exiting."
+            Write-Log $msg -Level "Error"
+            throw $msg
         }        
     }
     catch {
-        Write-Log "Error getting the queue: $_" -Level "Error"
-        return
+        $msg = "Error getting the queue: $_"
+        Write-Log $msg -Level "Error"
+        throw $msg
     }
-    $script:Progress++
-
+    
     # process the messages in the queue
-    for ($i = 1; $i -le $queue.ApproximateMessageCount; $i++ ) {
-        Write-Log "Processing message $i of $($queue.ApproximateMessageCount)..."
+    while ($queueMessage = $queue.QueueClient.ReceiveMessage($QueueInvisibilityTimeout)) {
 
-        # get the message from the queue    
-        try {
-            $queueMessage = $queue.QueueClient.ReceiveMessage($queueInvisibilityTimeout)
-            if ($null -eq $queueMessage.Value) {
-                Write-Log "No message value found, skipping." -Level "Warning"
-                continue
-            }            
+        if (-not $queueMessage.Value) {
+            Write-Log "No more messages in the queue. Exiting."
+            break
         }
-        catch {
-            Write-Log "Error getting message from the queue: $_" -Level "Error"
-            return
-        }
-        $script:Progress++
-
-        # decode body of the message from base64
-        $messageText = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($queueMessage.value.MessageText))   
-        Write-Log "JSON Message fetched from the queue: $($messageText)"
-
-        # parse the message
+    
         try {
+            # decode body of the message from base64 and parse the message
+            $messageText = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($queueMessage.value.MessageText))   
             $message = ConvertFrom-Json -InputObject $messageText
-        }
-        catch {
-            Write-Log "Failed to parse message body as JSON. Error: $_" -Level "Error"
-            return
-        }
-        $script:Progress++
-
-        $VaultName = $message.data.VaultName
-        $CertificateName = $message.data.ObjectName
-
-        # before processing the request, we need to obtain the other certificate details, such as template, subject, and DNS names
-        Write-Log "Getting remaining certificate details from the key vault..."
-
-        Write-Log "Getting certificate details for $CertificateName from vault $VaultName..."
-        $cert = $null
-        try {
-            $cert = Get-AzKeyVaultCertificate -VaultName $vaultName -Name $CertificateName
-        }
-        catch {
-            Write-Log "Error getting certificate details for $CertificateName from vault: $_" -Level "Error"
-            return
-        }
-        if ($null -eq $cert) {
-            Write-Log "Cannot get certificate details for $CertificateName from vault: empty response! It is possible that the certificate was deleted before the renewal process started. This request will be ignored and removed from the queue" -Level "Warning"
-        }
-
-        else {
-            Write-Log "Certificate $CertificateName found in vault $VaultName."
-            $script:Progress++
         
-            $CertificateSubject = $cert.Certificate.Subject
-            Write-Log "Certificate Subject: $SubjectName"
-
-            # get the DNS names from the certificate
-            $CertificateDnsNames = $null
-            $san = $cert.Certificate.Extensions | Where-Object { $_.Oid.FriendlyName -eq "Subject Alternative Name" }
-            if ($null -ne $san) {
-                # $DNS.Format(0) returns a string like: DNS Name=server01.contoso.com, DNS Name=server01.litware.com.
-                # Transform it into an array of DNS names using regex; remove the "DNS Name=" prefix and split by comma
-                $CertificateDnsNames = ($san.Format(0) -replace 'DNS Name=', '').Split(',').Trim() | Where-Object { $_ -ne "" }
-                Write-Log "Certificate DNS Names: $($CertificateDnsNames -join ', ')"
-            }
-            else {
-                Write-Log "Certificate DNS Names: N/A"
-            }
-            $script:Progress++
-
-            # get the OID of the Certificate Template
-            $oid = $cert.Certificate.Extensions | Where-Object { $_.Oid.FriendlyName -eq "Certificate Template Information" }
-            if ($null -eq $oid) {
-                Write-Log "Error getting OID from certificate: Certificate Template Information not found" -Level "Error"
-                return
-            }
-            # convert in a string like:
-            # Template=Flab-ShortWebServer(1.3.6.1.4.1.311.21.8.15431357.2613787.6440092.16459852.14380503.11.12399345.16691736), Major Version Number=100, Minor Version Number=5
-            $oid = $oid.Format(0)
-
-            # extract the template name and the ASN.1 values using regex
-            $CertificateTemplate = $oid -replace '.*Template=(.*)\(.*\).*', '$1'
-            $CertificateTemplateASN = $oid -replace '.*\((.*)\).*', '$1'
-            Write-Log "Certificate Template: $CertificateTemplate ($CertificateTemplateASN)"
-            $script:Progress++
-
-            # Now we have all the details to create the new certificate request.
-            # We can use the same code as for new certificates
-            New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDNSNames $CertificateDnsNames -CAServer $CAServer -PfxFolder $PFXFolder 
-        }
-
-        # delete the message from the queue
-        Write-Log "Deleting message from the queue..."
-        try {
-            $queue.QueueClient.DeleteMessage($queueMessage.value.MessageId, $queueMessage.value.PopReceipt) | Out-Null        
+            $VaultName = $message.data.VaultName
+            $CertificateName = $message.data.ObjectName
+            
+            Invoke-Renewal -VaultName $VaultName -CertificateName $CertificateName -CAServer $CAServer -PfxFolder $PfxFolder -CertPswSecretName $CertPswSecretName
         }
         catch {
-            Write-Log "Error deleting message from the queue: $_" -Level "Error"
-            return
+            Write-Log "Error processing message: $_" -Level "Warning"
+            continue    # continue to the next message in the queue
+        }
+        finally {
+            # Make sure the message is deleted from the queue even if there is an error
+            # If the message is not deleted, it will be visible again after the invisibility timeout
+            Write-Log "Deleting message from the queue..."
+            $queue.QueueClient.DeleteMessage($queueMessage.Value.MessageId, $queueMessage.Value.PopReceipt) | Out-Null
         }
     }
 }
 
-#####################
-# MAIN - 40+ (REEW) #
-#####################
+##################
+# MAIN - (RENEW) #
+##################
 
 elseif ($Action -eq "renew" ) {
 
-    $script:Progress = 40
-    Write-Log "Starting the '$Action' process..."
+    # check required parameters for renewal
+    if ([string]::IsNullOrWhiteSpace($VaultName)) {
+        $msg = "Missing or empty mandatory parameter: 'VaultName'"
+        Write-Log $msg -Level "Error"
+        throw $msg
+    }
+    if ([string]::IsNullOrWhiteSpace($CertificateName)) {
+        $msg = "Missing or empty mandatory parameter: 'CertificateName'"
+        Write-Log $msg -Level "Error"
+        throw $msg
+    }
 
-    # before processing the request, we need to obtain the other certificate details, such as template, subject, and DNS names
-    Write-Log "Getting remaining certificate details from the key vault..."
-
-    Write-Log "Getting certificate $CertificateName from vault $VaultName..."
-    $cert = $null
+    # process the renewal request
+    Write-Log "Performing certificate renew request for $CertificateName using $VaultName..."
     try {
-        $cert = Get-AzKeyVaultCertificate -VaultName $vaultName -Name $CertificateName
+        Invoke-Renewal -VaultName $VaultName -CertificateName $CertificateName -CAServer $CAServer -PfxFolder $PfxFolder -CertPswSecretName $CertPswSecretName            
     }
     catch {
-        Write-Log "Error getting certificate from vault: $_" -Level "Error"
-        return
+        $msg = "Error processing renewal request: $_"
+        Write-Log $msg -Level "Error"
+        throw $msg
     }
-    if ($null -eq $cert) {
-        Write-Log "Error getting certificate $CertificateName from vault: empty response! It is possible that the certificate was deleted before the renewal process started." -Level "Error"
-        return
-    }
-    $script:Progress++
-        
-    $CertificateSubject = $cert.Certificate.Subject
-    Write-Log "Certificate Subject: $SubjectName"
-
-    # get the DNS names from the certificate
-    $CertificateDnsNames = $null
-    $san = $cert.Certificate.Extensions | Where-Object { $_.Oid.FriendlyName -eq "Subject Alternative Name" }
-    if ($null -ne $san) {
-        # $DNS.Format(0) returns a string like: DNS Name=server01.contoso.com, DNS Name=server01.litware.com.
-        # Transform it into an array of DNS names using regex; remove the "DNS Name=" prefix and split by comma
-        $CertificateDnsNames = ($san.Format(0) -replace 'DNS Name=', '').Split(',').Trim() | Where-Object { $_ -ne "" }
-        Write-Log "Certificate DNS Names: $($CertificateDnsNames -join ', ')"
-    }
-    else {
-        Write-Log "Certificate DNS Names: N/A"
-    }
-    $script:Progress++
-
-    # get the OID of the Certificate Template
-    $oid = $cert.Certificate.Extensions | Where-Object { $_.Oid.FriendlyName -eq "Certificate Template Information" }
-    if ($null -eq $oid) {
-        Write-Log "Error getting OID from certificate: Certificate Template Information not found" -Level "Error"
-        return
-    }
-    # convert in a string like:
-    # Template=Flab-ShortWebServer(1.3.6.1.4.1.311.21.8.15431357.2613787.6440092.16459852.14380503.11.12399345.16691736), Major Version Number=100, Minor Version Number=5
-    $oid = $oid.Format(0)
-
-    # extract the template name and the ASN.1 values using regex
-    $CertificateTemplate = $oid -replace '.*Template=(.*)\(.*\).*', '$1'
-    $CertificateTemplateASN = $oid -replace '.*\((.*)\).*', '$1'
-    Write-Log "Certificate Template: $CertificateTemplate ($CertificateTemplateASN)"
-    $script:Progress++
-
-    New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDNSNames $CertificateDnsNames -CAServer $CAServer -PfxFolder $PFXFolder 
 }
 
-####################
-# MAIN - 60+ (new) #
-####################
+################
+# MAIN - (NEW) #
+################
 
 else {
 
-    $script:Progress = 60
-    Write-Log "Starting the '$Action' process..."
+    # check required parameters for new certificate requests. Vault
+    if ([string]::IsNullOrWhiteSpace($VaultName)) {
+        $msg = "Missing or empty mandatory parameter: 'VaultName'"
+        Write-Log $msg -Level "Error"
+        throw $msg
+    }
 
-    # check if a certificate with the same name already exists in the key vault
-    Write-Log "Checking if a certificate with the same name already exists in the key vault..."
+    # certificate name
+    if ([string]::IsNullOrWhiteSpace($CertificateName)) {
+        $msg = "Missing or empty mandatory parameter: 'CertificateName'"
+        Write-Log $msg -Level "Error"
+        throw $msg
+    }
+    # template
+    if ([string]::IsNullOrWhiteSpace($CertificateTemplate)) {
+        $msg = "Missing or empty mandatory parameter: 'CertificateTemplate'"
+        Write-Log $msg -Level "Error"
+        throw $msg
+    }   
+    # subject
+    if ([string]::IsNullOrWhiteSpace($CertificateSubject)) {
+        $msg = "Missing or empty mandatory parameter: 'CertificateSubject'"
+        Write-Log $msg -Level "Error"
+        throw $msg
+    }
+    # DnsNames (optional, but if specified, must be an array)
+    if ($CertificateDnsNames -and $CertificateDnsNames -isnot [array]) {
+        $msg = "Parameter 'CertificateDnsNames' is not an array!"
+        Write-Log $msg -Level "Error"
+        throw $msg
+    }
+
+    if ($null -ne $CertificateDnsNames)
+    {
+        Write-Log "Performing new certificate request for certificate $CertificateName using vault $VaultName, template $CertificateTemplate, subject $CertificateSubject, DNS names $($CertificateDnsNames -join ', ')..."
+    }
+    else {
+        Write-Log "Performing new certificate request for certificate $CertificateName using vault $VaultName, template $CertificateTemplate, subject $CertificateSubject..."
+    }
+
+    # process the new certificate request
     try {
-        $cert = Get-AzKeyVaultCertificate -VaultName $vaultName -Name $CertificateName
-        if ($null -ne $cert) {
-            Write-Log "Certificate $CertificateName already exists in the key vault. Please use a different name or use the Renew action to create a new version." -Level "Error"
-            return
-        }
+        New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CAServer $CAServer -PfxFolder $PfxFolder -CertPswSecretName $CertPswSecretName     
+        
     }
     catch {
-        Write-Log "Error checking for existing certificate: $_" -Level "Error"
-        return
+        $msg = "Error processing new request: $_"
+        Write-Log $msg -Level "Error"
+        throw $msg
     }
-    $script:Progress++
-
-    # we already have all the parameters from the webhook body, so we can create the new certificate request
-    New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDNSNames $CertificateDNSNames -CAServer $CAServer -PfxFolder $PFXFolder
 }
 
 ##############
 # MAIN - end #
 ##############
 
-$script:Progress = 100
 Write-Log "Runbook completed successfully."
-

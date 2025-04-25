@@ -1,26 +1,26 @@
 [
     {
+      "TimeGenerated": "2023-10-01T12:00:00Z",
       "CorrelationId": "e7b8c9d2-3f4a-4a6b-8d9e-2f3c7a1e5b6f",
       "Status": "Info",
-      "Progress": 0,
-      "Description": "Initialization started."
+      "Message": "Initialization started."
     },
     {
+      "TimeGenerated": "2023-10-01T12:00:01Z",
       "CorrelationId": "e7b8c9d2-3f4a-4a6b-8d9e-2f3c7a1e5b6f",
       "Status": "Warning",
-      "Progress": 40,
-      "Description": "Network latency detected, continuing with reduced throughput."
+      "Message": "Network latency detected, continuing with reduced throughput."
     },
     {
+      "TimeGenerated": "2023-10-01T12:00:02Z",
       "CorrelationId": "e7b8c9d2-3f4a-4a6b-8d9e-2f3c7a1e5b6f",
       "Status": "Warning",
-      "Progress": 60,
-      "Description": "Temporary failure accessing remote storage."
+      "Message": "Temporary failure accessing remote storage."
     },
     {
+      "TimeGenerated": "2023-10-01T12:00:03Z",
       "CorrelationId": "e7b8c9d2-3f4a-4a6b-8d9e-2f3c7a1e5b6f",
       "Status": "Success",
-      "Progress": 100,
-      "Description": "Process completed successfully."
+      "Message": "Process completed successfully."
     }
   ]
