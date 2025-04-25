@@ -135,11 +135,12 @@ function Write-Log {
     }
 }
 
-##############################
-# FUNCTIONS - Invoke-Renewal #
-##############################
+#############################################
+# FUNCTIONS - New-CertificateRenewalRequest #
+#############################################
 
-function Invoke-QueueItemRenewal {
+function New-CertificateRenewalRequest
+{
     param (
 
         [Parameter(Mandatory = $true)]
@@ -284,18 +285,6 @@ function New-CertificateRequest {
         throw "Certificate $CertificateName is already in the key vault and in deleted state since $($deletedCert.DeletedDate). It must be purged before creating a new one; otherwise specify a different certificate name."
     }  
 
-    # check if a complete certificate with the same name already exists in the key vault
-    Write-Log "Checking if a certificate with the same name already exists in the key vault..."
-    try {
-        $cert = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName
-        if ($null -ne $cert -and $null -ne $cert.Certificate) {     # pending requests do not have a certificate property
-            throw "An active certificate $CertificateName already exists in the key vault. Please use a different name or use the Renew action to create a new version."
-        }
-    }
-    catch {
-        throw "Error checking for existing certificate: $_"
-    }
-
     # create certificate - if a previous request is in progress, reuse it
     $csr = $null
     try {
@@ -363,49 +352,6 @@ function New-CertificateRequest {
     $certP7BEncodedFile = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "$CertificateName.p7b.encoded"
     Set-Content -Path $certP7BEncodedFile -Value $certP7BEncoded
 
-<# old method using certutil.exe
-
-    # write the returned signed certificate to a temporary file
-    $certFile = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "$CertificateName.p7b"
-    Write-Log "Exporting the signed certificate to temporary file $certFile..."
-    try {
-        Export-Certificate -Cert $certificate -FilePath $certFile -Type P7B | Out-Null    
-    }
-    catch {
-        throw "Error exporting certificate to file: $_"
-    }
-    Write-Log "Certificate file created: $certFile"
-  
-    # use certutil -encode to convert the certificate to base64 - this is required to import a p7b file into the key vault
-    # (https://learn.microsoft.com/en-us/azure/key-vault/certificates/certificate-scenarios#formats-of-merge-csr-we-support)
-    Write-Log "Converting the certificate to base64..."
-    $certUtil = Join-Path $env:SystemRoot 'System32\certutil.exe'
-    if (-not (Test-Path -Path $certUtil)) {
-        throw "certutil.exe not found!"
-    }
-    $certP7BEncodedFile = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "$CertificateName.p7b.encoded"
-    $stdoutFile = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "$CertificateName.stdout.txt"
-    $stderrFile = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "$CertificateName.stderr.txt"
-
-    $process = Start-Process -FilePath $certUtil -ArgumentList "-encode", $certFile, $certP7BEncodedFile `
-        -NoNewWindow -Wait -PassThru `
-        -RedirectStandardOutput $stdoutFile `
-        -RedirectStandardError $stderrFile
-
-    Remove-Item -Path $certFile -Force -ErrorAction SilentlyContinue
-    $exitCode = $process.ExitCode
-
-    if ($exitCode -ne 0) {
-        $stdout = Get-Content -Path $stdoutFile -ErrorAction SilentlyContinue
-        $stderr = Get-Content -Path $stderrFile -ErrorAction SilentlyContinue
-        $exitCodeHex = ("0x{0:X8}" -f ($exitCode -band 0xFFFFFFFF))
-        throw "certutil.exe failed with exit code $exitCode ($exitCodeHex).`nSTDOUT:`n$stdout`nSTDERR:`n$stderr"
-    }
-    else {
-        Write-Log "certutil.exe completed successfully."
-        Remove-Item -Path $stdoutFile, $stderrFile -Force -ErrorAction SilentlyContinue
-    }
-#>
     # import the certificate into the key vault
     Write-Log "Importing the certificate $CertificateName into the key vault $VaultName..."
     try {
@@ -629,7 +575,7 @@ if ($Action -eq "autorenew") {
             $VaultName = $message.data.VaultName
             $CertificateName = $message.data.ObjectName
             
-            Invoke-Renewal -VaultName $VaultName -CertificateName $CertificateName -CAServer $CAServer -PfxFolder $PfxFolder -CertPswSecretName $CertPswSecretName
+            New-CertificateRenewalRequest -VaultName $VaultName -CertificateName $CertificateName -CAServer $CAServer -PfxFolder $PfxFolder -CertPswSecretName $CertPswSecretName
         }
         catch {
             Write-Log "Error processing message: $_" -Level "Warning"
@@ -665,7 +611,7 @@ elseif ($Action -eq "renew" ) {
     # process the renewal request
     Write-Log "Performing certificate renew request for $CertificateName using $VaultName..."
     try {
-        Invoke-Renewal -VaultName $VaultName -CertificateName $CertificateName -CAServer $CAServer -PfxFolder $PfxFolder -CertPswSecretName $CertPswSecretName            
+        New-CertificateRenewalRequest -VaultName $VaultName -CertificateName $CertificateName -CAServer $CAServer -PfxFolder $PfxFolder -CertPswSecretName $CertPswSecretName            
     }
     catch {
         $msg = "Error processing renewal request: $_"
