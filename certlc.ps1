@@ -347,16 +347,23 @@ function New-CertificateRequest {
         throw "Error getting certificate from the CA: no X.509 certificate returned!"
     }
     
-    # certificate is X509Certificate2. We can use X509Certificate2.Export to export the certificate in different formats.
-    $certFormat = [System.Security.Cryptography.X509Certificates.X509ContentType]::Cert
-    $certEncoded = [System.Convert]::ToBase64String($certificate.Export($certFormat), [System.Base64FormattingOptions]::InsertLineBreaks)
-    $certPem = "-----BEGIN CERTIFICATE-----`n$certEncoded`n-----END CERTIFICATE-----"
-    $certPemFile = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "$CertificateName.pem"
-    Set-Content -Path $certPemFile -Value $certPem
+    # Certificate is X509Certificate2. We wrap it into a X509Certificate2Collection, that can be used to export the certificate in different formats.
+    # Here, we need Pkcs#7, that needs also to be converted to base64 as expected by the Key Vault for the merge operation
 
-    write-output $certPemFile
+    $certFormat = [System.Security.Cryptography.X509Certificates.X509ContentType]::Pkcs7
+    $certCollection = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
+    $certCollection.Add($certificate)
 
-    throw "STOP HERE"
+    # Export the certificate in Pkcs#7 format and convert it to base64 with line breaks
+    $certP7B = $certCollection.Export($certFormat)
+    $certP7BEncoded = [Convert]::ToBase64String($certP7B, [System.Base64FormattingOptions]::InsertLineBreaks)
+
+    # Wrap in PEM headers and footers
+    $certP7BEncoded = "-----BEGIN CERTIFICATE-----`n$certP7BEncoded`n-----END CERTIFICATE-----"
+    $certP7BEncodedFile = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "$CertificateName.p7b.encoded"
+    Set-Content -Path $certP7BEncodedFile -Value $certP7BEncoded
+
+<# old method using certutil.exe
 
     # write the returned signed certificate to a temporary file
     $certFile = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "$CertificateName.p7b"
@@ -368,9 +375,7 @@ function New-CertificateRequest {
         throw "Error exporting certificate to file: $_"
     }
     Write-Log "Certificate file created: $certFile"
-    
-    throw "STOP HERE"
-
+  
     # use certutil -encode to convert the certificate to base64 - this is required to import a p7b file into the key vault
     # (https://learn.microsoft.com/en-us/azure/key-vault/certificates/certificate-scenarios#formats-of-merge-csr-we-support)
     Write-Log "Converting the certificate to base64..."
@@ -378,11 +383,11 @@ function New-CertificateRequest {
     if (-not (Test-Path -Path $certUtil)) {
         throw "certutil.exe not found!"
     }
-    $certFileBase64 = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "$CertificateName.b64"
+    $certP7BEncodedFile = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "$CertificateName.p7b.encoded"
     $stdoutFile = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "$CertificateName.stdout.txt"
     $stderrFile = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath "$CertificateName.stderr.txt"
 
-    $process = Start-Process -FilePath $certUtil -ArgumentList "-encode", $certFile, $certFileBase64 `
+    $process = Start-Process -FilePath $certUtil -ArgumentList "-encode", $certFile, $certP7BEncodedFile `
         -NoNewWindow -Wait -PassThru `
         -RedirectStandardOutput $stdoutFile `
         -RedirectStandardError $stderrFile
@@ -396,19 +401,24 @@ function New-CertificateRequest {
         $exitCodeHex = ("0x{0:X8}" -f ($exitCode -band 0xFFFFFFFF))
         throw "certutil.exe failed with exit code $exitCode ($exitCodeHex).`nSTDOUT:`n$stdout`nSTDERR:`n$stderr"
     }
-
-    Remove-Item -Path $stdoutFile, $stderrFile -Force -ErrorAction SilentlyContinue
-    
+    else {
+        Write-Log "certutil.exe completed successfully."
+        Remove-Item -Path $stdoutFile, $stderrFile -Force -ErrorAction SilentlyContinue
+    }
+#>
     # import the certificate into the key vault
     Write-Log "Importing the certificate $CertificateName into the key vault $VaultName..."
     try {
-        $newCert = Import-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -FilePath $certFileBase64 
+        $newCert = Import-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -FilePath $certP7BEncodedFile
+        if ($null -eq $newCert) {
+            throw "Error importing certificate into the key vault: Import-AzKeyVaultCertificate returned null!"
+        }
     }
     catch {
         throw "Error importing certificate into the key vault: $_"
     }
     finally {
-        Remove-Item -Path $certFileBase64 -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $certP7BEncodedFile -Force -ErrorAction SilentlyContinue
     }
     Write-Log "Certificate imported into the key vault."
     
