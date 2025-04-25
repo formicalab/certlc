@@ -245,7 +245,7 @@ function New-CertificateRequest {
         [string]$CertificateSubject,
 
         [Parameter(Mandatory = $false)]
-        [array]$CertificateDnsNames,
+        [string[]]$CertificateDnsNames,
 
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
