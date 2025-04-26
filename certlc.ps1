@@ -460,106 +460,110 @@ Write-Log "Runbook running on hybrid worker $($env:COMPUTERNAME)."
 import-module PSPKI
 
 # Parse the webhook data
+# We have different cases:
+# - WebhookData is null or empty: the runbook is not called from a webhook but it was started manually. In this case we assume action is 'autorenew', so that we can check if there are requests pending in the queue
+# - WebhookData is not null or empty: the runbook is called from a webhook. We need to parse the request body and extract the parameters.
+
 if ([string]::IsNullOrEmpty($WebhookData)) {
-    $msg = "WebhookData missing or empty! Ensure the runbook is called from a webhook!"
-    Write-Log $msg -Level "Error"
-    throw $msg
-}
-
-# using Powershell 7.x, the WebhookData is passed not as a structure but as a string with a wrongly formatted JSON...
-# (see https://learn.microsoft.com/en-us/azure/automation/automation-webhooks?tabs=portal#create-a-webhook)
-# such as: 
-# {WebhookName:certlc,RequestBody:{"CertLCVersion":"1.0","Action":"renew","VaultName":"flazkv-shared-neu-001","CertificateName":"mycert11"},RequestHeader:{Accept-Encoding:gzip,Host:70cf67fa-9b4f-4a13-97c5-0c099a08c2df.webhook.ne.azure-automation.net,User-Agent:Mozilla/5.0,x-ms-request-id:87b1179c-1beb-4593-a3ed-9154efe3e060}}
-#
-# The problem is that WebhookName, RequestBody and RequestHeader are not enclosed in double quotes.
-# We try to extract the RequestBody via regex and convert it to JSON.
-# The regex matches these cases:
-# - RequestBody is enclosed in double quotes (valid case):   "RequestBody":"{...}"
-# - RequestBody is not enclosed in double quotes (invalid case):   RequestBody:{...}
-# - After RequestBody there is an array:  RequestBody:[{...}] or "RequestBody":[{...},{...}]
-
-if ($WebhookData -match '\"?RequestBody\"?\s*:\s*(\{.*?\}|\[.*?\])') {
-    $jsonRequestBody = $matches[1]
-}
-else {
-    $msg = "WebhookData.RequestBody not found! Ensure the runbook is called from a webhook! WebhookData structure received is: $($WebhookData)"
-    Write-Log $msg -Level "Error"
-    throw $msg
-}
-
-try {
-    $requestBody = ConvertFrom-Json -InputObject $jsonRequestBody
-}
-catch {
-    $msg = "Failed to parse WebhookData.RequestBody as JSON. Error: $_"
-    Write-Log $msg -Level "Error"
-    throw $msg
-}
-
-if (string::IsNullOrEmpty($requestBody)) {
-    $msg = "WebhookData.RequestBody is empty! Ensure the runbook is called from a webhook! WebhookData structure received is: $($WebhookData)"
-    Write-Log $msg -Level "Error"
-    throw $msg
-}
-
-# in case the request arrives from Event Grid, the body has a structure like this:
-# [{"id":"1af41fa2-54b2-4b03-ba46-f5088ba709c7","topic":"/subscriptions/<guid>/resourceGroups/<rgname>/providers/Microsoft.KeyVault/vaults/<vaultname>","subject":"<certificatename>","eventType":"Microsoft.KeyVault.CertificateNearExpiry","data":{"Id":"https://<vaultname>.vault.azure.net/certificates/<certificatename>/<versionid>","VaultName":"<vaultname>","ObjectType":"Certificate","ObjectName":"<certificatename>","Version":"<versionid>","NBF":1745695048,"EXP":1745702248},"dataVersion":"1","metadataVersion":"1","eventTime":"2025-04-26T19:29:34.4197223Z"}]
-
-
-if ($requestBody.eventType -eq "Microsoft.KeyVault.CertificateNearExpiry") {
-
-    # if we have an eventType field with a value of Microsoft.KeyVault.CertificateNearExpiry, we need to extract the VaultName and ObjectName from the data field
-    # and set the Action to autorenew. The CertLCVersion is not present in this case.
-
+    Write-Log "WebhookData missing or empty! Assuming autorenew action and checking the queue for messages..."
     $Action = "autorenew"
-    $VaultName = $requestBody.data.VaultName            # we preset this, but it will be overwritten by the queue message
-    $CertificateName = $requestBody.data.ObjectName     # we preset this, but it will be overwritten by the queue message
-    Write-Log "WebhookData is an Event Grid event. Setting Action to 'autorenew' for certificate $($CertificateName) in vault $($VaultName)..."
 }
-else {
 
-    # otherwise, it is a new or renew request invoked explicitly from the webhook. We need to extract the parameters from the request body.
+else
+{
+    # using Powershell 7.x, the WebhookData is passed not as a structure but as a string with a wrongly formatted JSON...
+    # (see https://learn.microsoft.com/en-us/azure/automation/automation-webhooks?tabs=portal#create-a-webhook)
+    # such as: 
+    # {WebhookName:certlc,RequestBody:{"CertLCVersion":"1.0","Action":"renew","VaultName":"flazkv-shared-neu-001","CertificateName":"mycert11"},RequestHeader:{Accept-Encoding:gzip,Host:70cf67fa-9b4f-4a13-97c5-0c099a08c2df.webhook.ne.azure-automation.net,User-Agent:Mozilla/5.0,x-ms-request-id:87b1179c-1beb-4593-a3ed-9154efe3e060}}
+    #
+    # The problem is that WebhookName, RequestBody and RequestHeader are not enclosed in double quotes.
+    # We try to extract the RequestBody via regex and convert it to JSON.
+    # The regex matches these cases:
+    # - RequestBody is enclosed in double quotes (valid case):   "RequestBody":"{...}"
+    # - RequestBody is not enclosed in double quotes (invalid case):   RequestBody:{...}
+    # - After RequestBody there is an array:  RequestBody:[{...}] or "RequestBody":[{...},{...}]
 
-    $CertLCVersion = $requestBody.CertLCVersion
-    $Action = $requestBody.Action
-    $VaultName = $requestBody.VaultName
-    $CertificateName = $requestBody.CertificateName
-    $CertificateTemplate = $requestBody.CertificateTemplate
-    $CertificateSubject = $requestBody.CertificateSubject
-    $CertificateDnsNames = $requestBody.CertificateDnsNames
-
-    # check version
-    if ($CertLCVersion -ne $Version) {
-        $msg = "CertLCVersion $CertLCVersion does not match the script version $Version!"
-        Write-Log $msg -Level "Error"
-        throw $msg
+    if ($WebhookData -match '\"?RequestBody\"?\s*:\s*(\{.*?\}|\[.*?\])') {
+        $jsonRequestBody = $matches[1]
     }
     else {
-        Write-Log "CertLCVersion: $CertLCVersion"
-    }
-
-    if ([string]::IsNullOrEmpty($Action)) {
-        $msg = "Missing or empty mandatory parameter: 'Action'"
-        Write-Log $msg -Level "Error"
-        throw $msg
-    }
-    $Action = $Action.ToLower()
-    if ($Action -ne "new" -and $Action -ne "renew") {
-        $msg = "Invalid value for 'Action': $Action. Must be 'New' or 'Renew'!"
+        $msg = "WebhookData.RequestBody not found! WebhookData structure received is: $($WebhookData)"
         Write-Log $msg -Level "Error"
         throw $msg
     }
 
-    # check mandatory parameters for both new and renew requests
-    if ([string]::IsNullOrEmpty($VaultName)) {
-        $msg = "Missing or empty mandatory parameter: 'VaultName'"
+    # we have a RequestBody, convert from JSON to object
+    try {
+        $requestBody = ConvertFrom-Json -InputObject $jsonRequestBody
+    }
+    catch {
+        $msg = "Failed to parse WebhookData.RequestBody as JSON. Error: $_"
         Write-Log $msg -Level "Error"
         throw $msg
     }
-    if ([string]::IsNullOrEmpty($CertificateName)) {
-        $msg = "Missing or empty mandatory parameter: 'CertificateName'"
+    if (string::IsNullOrEmpty($requestBody)) {
+        $msg = "WebhookData.RequestBody is empty! Ensure the runbook is called from a webhook! WebhookData structure received is: $($WebhookData)"
         Write-Log $msg -Level "Error"
         throw $msg
+    }
+
+    # in case the request arrives from Event Grid, the body has a structure like this:
+    # [{"id":"1af41fa2-54b2-4b03-ba46-f5088ba709c7","topic":"/subscriptions/<guid>/resourceGroups/<rgname>/providers/Microsoft.KeyVault/vaults/<vaultname>","subject":"<certificatename>","eventType":"Microsoft.KeyVault.CertificateNearExpiry","data":{"Id":"https://<vaultname>.vault.azure.net/certificates/<certificatename>/<versionid>","VaultName":"<vaultname>","ObjectType":"Certificate","ObjectName":"<certificatename>","Version":"<versionid>","NBF":1745695048,"EXP":1745702248},"dataVersion":"1","metadataVersion":"1","eventTime":"2025-04-26T19:29:34.4197223Z"}]
+    if ($requestBody.eventType -eq "Microsoft.KeyVault.CertificateNearExpiry") {
+
+        # if we have an eventType field with a value of Microsoft.KeyVault.CertificateNearExpiry, we need to extract the VaultName and ObjectName from the data field
+        # and set the Action to autorenew. The CertLCVersion is not present in this case.
+
+        $Action = "autorenew"
+        $VaultName = $requestBody.data.VaultName            # we preset this, but it will be overwritten by the queue message since we need to process the queue in any case
+        $CertificateName = $requestBody.data.ObjectName     # we preset this, but it will be overwritten by the queue message since we need to process the queue in any case
+        Write-Log "WebhookData is an Event Grid event. Setting Action to 'autorenew' for certificate $($CertificateName) in vault $($VaultName)..."
+    }
+    else {
+
+        # otherwise, it is a new or renew request invoked explicitly from the webhook. We need to extract the parameters from the request body.
+
+        $CertLCVersion = $requestBody.CertLCVersion
+        $Action = $requestBody.Action
+        $VaultName = $requestBody.VaultName
+        $CertificateName = $requestBody.CertificateName
+        $CertificateTemplate = $requestBody.CertificateTemplate
+        $CertificateSubject = $requestBody.CertificateSubject
+        $CertificateDnsNames = $requestBody.CertificateDnsNames
+
+        # check version
+        if ($CertLCVersion -ne $Version) {
+            $msg = "CertLCVersion $CertLCVersion does not match the script version $Version!"
+            Write-Log $msg -Level "Error"
+            throw $msg
+        }
+        else {
+            Write-Log "CertLCVersion: $CertLCVersion"
+        }
+
+        if ([string]::IsNullOrEmpty($Action)) {
+            $msg = "Missing or empty mandatory parameter: 'Action'"
+            Write-Log $msg -Level "Error"
+            throw $msg
+        }
+        $Action = $Action.ToLower()
+        if ($Action -ne "new" -and $Action -ne "renew") {
+            $msg = "Invalid value for 'Action': $Action. Must be 'New' or 'Renew'!"
+            Write-Log $msg -Level "Error"
+            throw $msg
+        }
+
+        # check mandatory parameters for both new and renew requests
+        if ([string]::IsNullOrEmpty($VaultName)) {
+            $msg = "Missing or empty mandatory parameter: 'VaultName'"
+            Write-Log $msg -Level "Error"
+            throw $msg
+        }
+        if ([string]::IsNullOrEmpty($CertificateName)) {
+            $msg = "Missing or empty mandatory parameter: 'CertificateName'"
+            Write-Log $msg -Level "Error"
+            throw $msg
+        }
     }
 }
 
