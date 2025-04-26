@@ -474,11 +474,11 @@ else
     # using Powershell 7.x, the WebhookData is passed not as a structure but as a string with a wrongly formatted JSON...
     # (see https://learn.microsoft.com/en-us/azure/automation/automation-webhooks?tabs=portal#create-a-webhook)
     # such as: 
-    # {WebhookName:certlc,RequestBody:{"CertLCVersion":"1.0","Action":"renew","VaultName":"flazkv-shared-neu-001","CertificateName":"mycert11"},RequestHeader:{Accept-Encoding:gzip,Host:70cf67fa-9b4f-4a13-97c5-0c099a08c2df.webhook.ne.azure-automation.net,User-Agent:Mozilla/5.0,x-ms-request-id:87b1179c-1beb-4593-a3ed-9154efe3e060}}
+    # {WebhookName:certlc,RequestBody:{"CertLCVersion":"1.0","Action":"renew","VaultName":"<vaultname>","CertificateName":"<certificatename>"},RequestHeader:{Accept-Encoding:gzip,Host:<webhook uri>,User-Agent:Mozilla/5.0,x-ms-request-id:<guid>}}
     #
     # The problem is that WebhookName, RequestBody and RequestHeader are not enclosed in double quotes.
-    # We try to extract the RequestBody via regex and convert it to JSON.
-    # The regex matches these cases:
+    # We try to extract the RequestBody via regex and convert it from JSON to object.
+    # The following regex matches these cases:
     # - RequestBody is enclosed in double quotes (valid case):   "RequestBody":"{...}"
     # - RequestBody is not enclosed in double quotes (invalid case):   RequestBody:{...}
     # - After RequestBody there is an array:  RequestBody:[{...}] or "RequestBody":[{...},{...}]
@@ -492,12 +492,12 @@ else
         throw $msg
     }
 
-    # we have a RequestBody, convert from JSON to object
+    # we now have a RequestBody, convert from JSON to object
     try {
         $requestBody = ConvertFrom-Json -InputObject $jsonRequestBody
     }
     catch {
-        $msg = "Failed to parse WebhookData.RequestBody as JSON. Error: $_"
+        $msg = "Failed to parse WebhookData.RequestBody as JSON. WebhookData structure received is: $($WebhookData). Error: $_"
         Write-Log $msg -Level "Error"
         throw $msg
     }
