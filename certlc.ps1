@@ -31,7 +31,10 @@ param
 # - WebhookData.RequestHeaders: the headers of the request that triggered the runbook
 # - WebhookData.RequestBody: the body of the request that triggered the runbook
 
-# We assume to use the followng JSON structure for the webhook body:
+# Note: using Powershell 7.x, the WebhookData is passed not as a structure but as a string with a wrongly formatted JSON.
+# See the code in Main section for details and workaround.
+
+# We assume to use the followng JSON structure for the RequestBody:
 
 # for NEW CERTIFICATES:
 # {
@@ -445,7 +448,6 @@ if ($LAEnabled) {
 }
 
 # Check if the script is running on Azure or on hybrid worker
-Write-Log "Script started, running on $($env:COMPUTERNAME). Checking worker..."
 $envVars = Get-ChildItem env:
 $HybridWorker = ($envVars | Where-Object { $_.name -like 'Fabric_*' } ).count -eq 0
 if (-not $HybridWorker) {
@@ -453,18 +455,39 @@ if (-not $HybridWorker) {
     Write-Log $msg -Level "Error"
     throw $msg
 }
+Write-Log "Runbook running on hybrid worker $($env:COMPUTERNAME)."
 
 # import other modules
 import-module PSPKI
 
 # Parse the webhook data
-if (($null -eq $WebhookData) -or ($null -eq $WebhookData.RequestBody)) {
-    $msg = "Webhook data missing! Ensure the runbook is called from a webhook!"
+if ([string]::IsNullOrEmpty($WebhookData)) {
+    $msg = "WebhookData missing or empty! Ensure the runbook is called from a webhook!"
     Write-Log $msg -Level "Error"
     throw $msg
 }
+
+# using Powershell 7.x, the WebhookData is passed not as a structure but as a string with a wrongly formatted JSON...
+# (see https://learn.microsoft.com/en-us/azure/automation/automation-webhooks?tabs=portal#create-a-webhook)
+# such as: 
+# {WebhookName:certlc,RequestBody:{"CertLCVersion":"1.0","Action":"renew","VaultName":"flazkv-shared-neu-001","CertificateName":"mycert11"},RequestHeader:{Accept-Encoding:gzip,Host:70cf67fa-9b4f-4a13-97c5-0c099a08c2df.webhook.ne.azure-automation.net,User-Agent:Mozilla/5.0,x-ms-request-id:87b1179c-1beb-4593-a3ed-9154efe3e060}}
+#
+# The problem is that WebhookName, RequestBody and RequestHeader are not enclosed in double quotes.
+# We try to extract the RequestBody via regex and convert it to JSON.
+# The regex will also work if the bug is fixed, since it will match the RequestBody field also if it is enclosed in double quotes.
+
+if ($WebhookData -match '\"?RequestBody\"?\s*:\s*(\{.*?\})'
+{
+    $jsonRequestBody = $matches[1]
+}
+else {
+    $msg = "WebhookData.RequestBody not found! Ensure the runbook is called from a webhook! WebhookData structure received is: $($WebhookData)"
+    Write-Log $msg -Level "Error"
+    throw $msg
+}
+
 try {
-    $requestBody = ConvertFrom-Json -InputObject $WebhookData.RequestBody
+    $requestBody = ConvertFrom-Json -InputObject $jsonRequestBody
 }
 catch {
     $msg = "Failed to parse WebhookData.RequestBody as JSON. Error: $_"
@@ -481,7 +504,7 @@ $CertificateSubject = $requestBody.CertificateSubject
 $CertificateDnsNames = $requestBody.CertificateDnsNames
 
 # check version and determine action to perform
-if ($null -eq $CertLCVersion) {
+if ([string]::IsNullOrEmpty($CertLCVersion)) {
     Write-Log "CertLCVersion is missing: assuming this is an automatic renewal request triggered by Event Grid"
     $Action = "autorenew"
 }
@@ -495,7 +518,7 @@ else {
         Write-Log "CertLCVersion: $CertLCVersion"
     }
 
-    if ([string]::IsNullOrWhiteSpace($Action)) {
+    if ([string]::IsNullOrEmpty($Action)) {
         $msg = "Missing or empty mandatory parameter: 'Action'"
         Write-Log $msg -Level "Error"
         throw $msg
@@ -589,12 +612,12 @@ if ($Action -eq "autorenew") {
 elseif ($Action -eq "renew" ) {
 
     # check required parameters for renewal
-    if ([string]::IsNullOrWhiteSpace($VaultName)) {
+    if ([string]::IsNullOrEmpty($VaultName)) {
         $msg = "Missing or empty mandatory parameter: 'VaultName'"
         Write-Log $msg -Level "Error"
         throw $msg
     }
-    if ([string]::IsNullOrWhiteSpace($CertificateName)) {
+    if ([string]::IsNullOrEmpty($CertificateName)) {
         $msg = "Missing or empty mandatory parameter: 'CertificateName'"
         Write-Log $msg -Level "Error"
         throw $msg
@@ -619,26 +642,26 @@ elseif ($Action -eq "renew" ) {
 else {
 
     # check required parameters for new certificate requests. Vault
-    if ([string]::IsNullOrWhiteSpace($VaultName)) {
+    if ([string]::IsNullOrEmpty($VaultName)) {
         $msg = "Missing or empty mandatory parameter: 'VaultName'"
         Write-Log $msg -Level "Error"
         throw $msg
     }
 
     # certificate name
-    if ([string]::IsNullOrWhiteSpace($CertificateName)) {
+    if ([string]::IsNullOrEmpty($CertificateName)) {
         $msg = "Missing or empty mandatory parameter: 'CertificateName'"
         Write-Log $msg -Level "Error"
         throw $msg
     }
     # template
-    if ([string]::IsNullOrWhiteSpace($CertificateTemplate)) {
+    if ([string]::IsNullOrEmpty($CertificateTemplate)) {
         $msg = "Missing or empty mandatory parameter: 'CertificateTemplate'"
         Write-Log $msg -Level "Error"
         throw $msg
     }   
     # subject
-    if ([string]::IsNullOrWhiteSpace($CertificateSubject)) {
+    if ([string]::IsNullOrEmpty($CertificateSubject)) {
         $msg = "Missing or empty mandatory parameter: 'CertificateSubject'"
         Write-Log $msg -Level "Error"
         throw $msg
