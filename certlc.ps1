@@ -555,7 +555,7 @@ if ($Action -eq "autorenew") {
         for ($i = 0; $i -lt $QueueAttempts; $i++) {
             Write-Log "Checking the queue (attempt $($i+1) of $QueueAttempts)..."
             $queue = Get-AzStorageQueue -Name $QueueName -Context $ctx
-            Write-Log ("Queued messages " + $queue.ApproximateMessageCount)
+            Write-Log ("Queued messages: " + $queue.ApproximateMessageCount)
     
             if ($queue.ApproximateMessageCount -gt 0) {
                 break
