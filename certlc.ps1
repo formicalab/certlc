@@ -143,8 +143,7 @@ function Write-Log {
 # FUNCTIONS - New-CertificateRenewalRequest #
 #############################################
 
-function New-CertificateRenewalRequest
-{
+function New-CertificateRenewalRequest {
     param (
 
         [Parameter(Mandatory = $true)]
@@ -316,7 +315,7 @@ function New-CertificateRequest {
     }
     
     # Write the CSR content to a temporary file
-    $csrFile       = New-TemporaryFile
+    $csrFile = New-TemporaryFile
     Set-Content -Path $csrFile -Value $csr
     Write-Log "CSR file created: $csrFile"
     
@@ -351,7 +350,7 @@ function New-CertificateRequest {
     $certP7B = $certCollection.Export($certFormat)
     $certP7BEncoded = [Convert]::ToBase64String($certP7B, [System.Base64FormattingOptions]::InsertLineBreaks)
     $certP7BEncoded = "-----BEGIN CERTIFICATE-----`n$certP7BEncoded`n-----END CERTIFICATE-----"
-    $certP7BEncodedFile   = New-TemporaryFile
+    $certP7BEncodedFile = New-TemporaryFile
     Set-Content -Path $certP7BEncodedFile -Value $certP7BEncoded
 
     # import the certificate into the key vault
@@ -479,8 +478,7 @@ if ([string]::IsNullOrEmpty($WebhookData)) {
 # - RequestBody is not enclosed in double quotes (invalid case):   RequestBody:{...}
 # - After RequestBody there is an array:  RequestBody:[{...}] or "RequestBody":[{...},{...}]
 
-if ($WebhookData -match '\"?RequestBody\"?\s*:\s*(\{.*?\}|\[.*?\])')
-{
+if ($WebhookData -match '\"?RequestBody\"?\s*:\s*(\{.*?\}|\[.*?\])') {
     $jsonRequestBody = $matches[1]
 }
 else {
@@ -498,20 +496,39 @@ catch {
     throw $msg
 }
 
-$CertLCVersion = $requestBody.CertLCVersion
-$Action = $requestBody.Action
-$VaultName = $requestBody.VaultName
-$CertificateName = $requestBody.CertificateName
-$CertificateTemplate = $requestBody.CertificateTemplate
-$CertificateSubject = $requestBody.CertificateSubject
-$CertificateDnsNames = $requestBody.CertificateDnsNames
+if (string::IsNullOrEmpty($requestBody)) {
+    $msg = "WebhookData.RequestBody is empty! Ensure the runbook is called from a webhook! WebhookData structure received is: $($WebhookData)"
+    Write-Log $msg -Level "Error"
+    throw $msg
+}
 
-# check version and determine action to perform
-if ([string]::IsNullOrEmpty($CertLCVersion)) {
-    Write-Log "CertLCVersion is missing: assuming this is an automatic renewal request triggered by Event Grid"
+# in case the request arrives from Event Grid, the body has a structure like this:
+# [{"id":"1af41fa2-54b2-4b03-ba46-f5088ba709c7","topic":"/subscriptions/<guid>/resourceGroups/<rgname>/providers/Microsoft.KeyVault/vaults/<vaultname>","subject":"<certificatename>","eventType":"Microsoft.KeyVault.CertificateNearExpiry","data":{"Id":"https://<vaultname>.vault.azure.net/certificates/<certificatename>/<versionid>","VaultName":"<vaultname>","ObjectType":"Certificate","ObjectName":"<certificatename>","Version":"<versionid>","NBF":1745695048,"EXP":1745702248},"dataVersion":"1","metadataVersion":"1","eventTime":"2025-04-26T19:29:34.4197223Z"}]
+
+
+if ($requestBody.eventType -eq "Microsoft.KeyVault.CertificateNearExpiry") {
+
+    # if we have an eventType field with a value of Microsoft.KeyVault.CertificateNearExpiry, we need to extract the VaultName and ObjectName from the data field
+    # and set the Action to autorenew. The CertLCVersion is not present in this case.
+
     $Action = "autorenew"
+    $VaultName = $requestBody.data.VaultName            # we preset this, but it will be overwritten by the queue message
+    $CertificateName = $requestBody.data.ObjectName     # we preset this, but it will be overwritten by the queue message
+    Write-Log "WebhookData is an Event Grid event. Setting Action to 'autorenew' for certificate $($CertificateName) in vault $($VaultName)..."
 }
 else {
+
+    # otherwise, it is a new or renew request invoked explicitly from the webhook. We need to extract the parameters from the request body.
+
+    $CertLCVersion = $requestBody.CertLCVersion
+    $Action = $requestBody.Action
+    $VaultName = $requestBody.VaultName
+    $CertificateName = $requestBody.CertificateName
+    $CertificateTemplate = $requestBody.CertificateTemplate
+    $CertificateSubject = $requestBody.CertificateSubject
+    $CertificateDnsNames = $requestBody.CertificateDnsNames
+
+    # check version
     if ($CertLCVersion -ne $Version) {
         $msg = "CertLCVersion $CertLCVersion does not match the script version $Version!"
         Write-Log $msg -Level "Error"
@@ -529,6 +546,18 @@ else {
     $Action = $Action.ToLower()
     if ($Action -ne "new" -and $Action -ne "renew") {
         $msg = "Invalid value for 'Action': $Action. Must be 'New' or 'Renew'!"
+        Write-Log $msg -Level "Error"
+        throw $msg
+    }
+
+    # check mandatory parameters for both new and renew requests
+    if ([string]::IsNullOrEmpty($VaultName)) {
+        $msg = "Missing or empty mandatory parameter: 'VaultName'"
+        Write-Log $msg -Level "Error"
+        throw $msg
+    }
+    if ([string]::IsNullOrEmpty($CertificateName)) {
+        $msg = "Missing or empty mandatory parameter: 'CertificateName'"
         Write-Log $msg -Level "Error"
         throw $msg
     }
@@ -614,18 +643,6 @@ if ($Action -eq "autorenew") {
 
 elseif ($Action -eq "renew" ) {
 
-    # check required parameters for renewal
-    if ([string]::IsNullOrEmpty($VaultName)) {
-        $msg = "Missing or empty mandatory parameter: 'VaultName'"
-        Write-Log $msg -Level "Error"
-        throw $msg
-    }
-    if ([string]::IsNullOrEmpty($CertificateName)) {
-        $msg = "Missing or empty mandatory parameter: 'CertificateName'"
-        Write-Log $msg -Level "Error"
-        throw $msg
-    }
-
     # process the renewal request
     Write-Log "Performing certificate renew request for $CertificateName using $VaultName..."
     try {
@@ -644,20 +661,7 @@ elseif ($Action -eq "renew" ) {
 
 else {
 
-    # check required parameters for new certificate requests. Vault
-    if ([string]::IsNullOrEmpty($VaultName)) {
-        $msg = "Missing or empty mandatory parameter: 'VaultName'"
-        Write-Log $msg -Level "Error"
-        throw $msg
-    }
-
-    # certificate name
-    if ([string]::IsNullOrEmpty($CertificateName)) {
-        $msg = "Missing or empty mandatory parameter: 'CertificateName'"
-        Write-Log $msg -Level "Error"
-        throw $msg
-    }
-    # template
+    # check additional required parameters for new certificate requests: template
     if ([string]::IsNullOrEmpty($CertificateTemplate)) {
         $msg = "Missing or empty mandatory parameter: 'CertificateTemplate'"
         Write-Log $msg -Level "Error"
@@ -675,9 +679,7 @@ else {
         Write-Log $msg -Level "Error"
         throw $msg
     }
-
-    if ($null -ne $CertificateDnsNames)
-    {
+    if ($null -ne $CertificateDnsNames) {
         Write-Log "Performing new certificate request for certificate $CertificateName using vault $VaultName, template $CertificateTemplate, subject $CertificateSubject, DNS names $($CertificateDnsNames -join ', ')..."
     }
     else {
