@@ -476,7 +476,7 @@ if ([string]::IsNullOrEmpty($WebhookData)) {
 # We try to extract the RequestBody via regex and convert it to JSON.
 # The regex will also work if the bug is fixed, since it will match the RequestBody field also if it is enclosed in double quotes.
 
-if ($WebhookData -match '\"?RequestBody\"?\s*:\s*(\{.*?\})'
+if ($WebhookData -match '\"?RequestBody\"?\s*:\s*(\{.*?\})')
 {
     $jsonRequestBody = $matches[1]
 }
