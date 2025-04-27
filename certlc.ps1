@@ -90,8 +90,8 @@ $CertPswSecretName = "CertPassword"     # name of the secret in the key vault th
 # GLOBAL VARIABLES #
 ####################
 
-$LAToken = $null                                # token using to send logs to Log Analytics
-$CorrelationId = [guid]::NewGuid().ToString()   # correlation ID for the log entry
+$LAToken = $null       # token using to send logs to Log Analytics
+$JobId = $null         # we will use job id as correlation ID for the log entry, or a new guid if running locally
 
 #########################
 # FUNCTIONS - Write-Log #
@@ -110,7 +110,7 @@ function Write-Log {
     if ($LAEnabled -and ($null -ne $LAToken)) {
         $log_entry = @{
             TimeGenerated = (Get-Date).ToUniversalTime()
-            CorrelationId = $CorrelationId
+            CorrelationId = $JobId
             Status        = $Level
             Message       = $Message
         }
@@ -441,14 +441,24 @@ if ($LAEnabled) {
 }
 
 # Check if the script is running on Azure or on hybrid worker
-$envVars = Get-ChildItem env:
-$HybridWorker = ($envVars | Where-Object { $_.name -like 'Fabric_*' } ).count -eq 0
-if (-not $HybridWorker) {
-    $msg = "This workbook must be executed by a hybrid worker!"
-    Write-Log $msg -Level "Error"
+# https://rakhesh.com/azure/azure-automation-powershell-variables/
+if ($env:AZUREPS_HOST_ENVIRONMENT -eq "AzureAutomation/") {
+    # We are in a Hybrid Runbook Worker
+    $jobId = $env:PSPrivateMetadata
+    Write-Log "Runbook running wiith job id $jobId on hybrid worker $($env:COMPUTERNAME)."
+}
+elseif ($env:AZUREPS_HOST_ENVIRONMENT -eq "AzureAutomation") {
+    # We are in Azure Automation
+    $jobId = $PSPrivateMetadata.JobId
+    $msg = "Runbook running with job id $jobId in Azure Automation. This runbook must be executed by a hybrid worker instead!"
+     Write-Log $msg -Level "Error"
     throw $msg
 }
-Write-Log "Runbook running on hybrid worker $($env:COMPUTERNAME)."
+else {
+    # We are in a local environment
+    $jobId = [guid]::NewGuid().ToString()
+    Write-Log "Runbook running with locally-generated job id $jobId in local environment on $($env:COMPUTERNAME)."
+}
 
 # Parse the webhook data
 # We have different cases:
