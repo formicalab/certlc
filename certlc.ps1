@@ -3,7 +3,6 @@ using module Az.Accounts
 using module Az.KeyVault
 using module Az.Storage
 using module Az.Resources
-using module PSPKI
 
 ##########
 # CERTLC #
@@ -13,10 +12,6 @@ using module PSPKI
 # The key vault is used to generate all requests, storing the private keys safely.
 
 # The script is designed to be run using PowerShell 7.x in an Azure Automation hybrid worker environment.
-# Requires the following modules:
-# - Az
-# - PSPKI
-
 # Based on certlc solution https://learn.microsoft.com/en-us/azure/architecture/example-scenario/certificate-lifecycle/
 
 param
@@ -82,14 +77,14 @@ $QueueAttempts = 10                                 # number of attempts to chec
 $QueueWait = 5                                      # seconds to wait between attempts
 $QueueInvisibilityTimeout = [System.TimeSpan]::FromSeconds(30) # seconds to wait for the message to be invisible in the queue when it is being processed
 
-$CAServer = "flazdc03.formicalab.casa"  # CA server name
+$CA = "flazdc03.formicalab.casa\SubCA"  # Issuing CA server (must be in the form <servername>\<CAname>)
 $PfxFolder = "C:\Temp"                  # folder where the PFX file will be downloaded
-$CertPswSecretName = "CertPassword"    # name of the secret in the key vault that contains the password for the PFX file
+$CertPswSecretName = "CertPassword"     # name of the secret in the key vault that contains the password for the PFX file
 
 # TODO: where possible, use automation variables instead (see renewcertviakv.ps1). Sample usage:
 #$QueueStorageAccount = (Get-AzAutomationVariable -ResourceGroupName $automationAccountRG -AutomationAccountName $automationAccountName -name "certlc-storageaccount").Value
 #$QueueName = (Get-AzAutomationVariable -ResourceGroupName $automationAccountRG -AutomationAccountName $automationAccountName -name "certlc-queue").Value
-#$CAServer = (Get-AzAutomationVariable -ResourceGroupName $automationAccountRG -AutomationAccountName $automationAccountName -name "certlc-ca").Value
+#$CA = (Get-AzAutomationVariable -ResourceGroupName $automationAccountRG -AutomationAccountName $automationAccountName -name "certlc-ca").Value
 
 ####################
 # GLOBAL VARIABLES #
@@ -156,7 +151,7 @@ function New-CertificateRenewalRequest {
 
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
-        [string]$CAServer,
+        [string]$CA,
 
         [Parameter(Mandatory = $false)]
         [string]$PfxFolder,
@@ -216,7 +211,7 @@ function New-CertificateRenewalRequest {
     # We can use the same code as for new certificates
     
     try {
-        New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CAServer $CAServer -PfxFolder $PfxFolder -CertPswSecretName $CertPswSecretName            
+        New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxFolder $PfxFolder -CertPswSecretName $CertPswSecretName            
     }
     catch {
         throw "Error creating certificate request: $_"
@@ -252,7 +247,7 @@ function New-CertificateRequest {
 
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
-        [string]$CAServer,
+        [string]$CA,
 
         [Parameter(Mandatory = $false)]
         [string]$PfxFolder,
@@ -267,13 +262,6 @@ function New-CertificateRequest {
     $tmpl = Get-CertificateTemplate -Name $CertificateTemplate -ErrorAction SilentlyContinue
     if ($null -eq $tmpl) {
         throw "Template $($CertificateTemplate) not found in AD! Check its name."
-    }
-
-    # get CA details
-    Write-Log "Getting the CA details for $CAServer..."
-    $ca = Get-CertificationAuthority -ComputerName $CAServer
-    if ($null -eq $ca) {
-        throw "Error getting CA details: $CAServer not found"
     }
     
     # check if there is a deleted certificate with the same name in the key vault
@@ -314,49 +302,46 @@ function New-CertificateRequest {
         throw "Error generating CSR in Key Vault: $_"
     }
     
-    # Write the CSR content to a temporary file
-    $csrFile = New-TemporaryFile
-    Set-Content -Path $csrFile -Value $csr
-    Write-Log "CSR file created: $csrFile"
-    
-    # Send request to the CA and remove the CSR file
+    # see https://www.sysadmins.lv/blog-en/introducing-to-certificate-enrollment-apis-part-3-certificate-request-submission-and-response-installation.aspx
+    # 255 = CR_IN_ENCODEANY
     Write-Log "Sending request to the CA..."
     try {
-        $certificateRequest = Submit-CertificateRequest -CA $ca -Path $csrFile -Attribute "CertificateTemplate:$($CertificateTemplate)"    
+        $CertRequest = New-Object -ComObject CertificateAuthority.Request
+        $CertRequestStatus = $CertRequest.Submit(255,$csr,"CertificateTemplate:$($CertificateTemplate)",$CA)
+        
+        # status is described in https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-wcce/c084a3e3-4df3-4a28-9a3b-6b08487b04f3?redirectedfrom=MSDN
+
+        switch ($CertRequestStatus) {
+            2 {
+                throw "Request was denied."
+            }
+            3 {
+                Write-Log "Request submitted successfully."
+                # https://learn.microsoft.com/en-us/windows/win32/api/certcli/nf-certcli-icertrequest-getcertificate?redirectedfrom=MSDN
+                # 0 = CR_IN_BASE64ENCODED (BASE64 format with begin/end header - this is how the key vault expects the certificate in order to perform a merge)
+                $CertEncoded = $CertRequest.GetCertificate(0)   
+                Write-Log "Certificate received from CA."
+            }
+            5 {
+                throw "Request is pending. This is not expected since this runbook expects to process only completed requests. Review the certiicate template to ensure that certificates are immediately issued"
+            }
+            Default {
+                throw "Request failed with status $($CertRequestStatus). Check codes in https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-wcce/c084a3e3-4df3-4a28-9a3b-6b08487b04f3?redirectedfrom=MSDN"
+            }
+        }
+
     }
     catch {
-        throw "Error sending request to the CA: $_"
+        throw "Error submitting request to the CA: $_"
     }
-    finally {
-        # remove the CSR file
-        Remove-Item -Path $csrFile -Force -ErrorAction SilentlyContinue
-    }
-    if ($null -eq $certificateRequest) {
-        throw "Error sending request to the CA: empty response returned!"
-    }
-    $certificate = $certificateRequest.Certificate
-    if ($null -eq $certificate) {
-        throw "Error getting certificate from the CA: no X.509 certificate returned!"
-    }
-    
-    # Certificate is X509Certificate2. We wrap it into a X509Certificate2Collection, that can be used to export the certificate in different formats.
-    # Here, we need Pkcs#7, that needs also to be converted to base64 as expected by the Key Vault for the merge operation
 
-    $certFormat = [System.Security.Cryptography.X509Certificates.X509ContentType]::Pkcs7
-    $certCollection = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
-    $certCollection.Add($certificate)
-
-    # Export the certificate in Pkcs#7 format and convert it to base64 with line breaks and wrapped in PEM headers and footers
-    $certP7B = $certCollection.Export($certFormat)
-    $certP7BEncoded = [Convert]::ToBase64String($certP7B, [System.Base64FormattingOptions]::InsertLineBreaks)
-    $certP7BEncoded = "-----BEGIN CERTIFICATE-----`n$certP7BEncoded`n-----END CERTIFICATE-----"
-    $certP7BEncodedFile = New-TemporaryFile
-    Set-Content -Path $certP7BEncodedFile -Value $certP7BEncoded
+    $CertEncodedFile = New-TemporaryFile
+    Set-Content -Path $CertEncodedFile -Value $CertEncoded
 
     # import the certificate into the key vault
     Write-Log "Importing the certificate $CertificateName into the key vault $VaultName..."
     try {
-        $newCert = Import-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -FilePath $certP7BEncodedFile
+        $newCert = Import-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -FilePath $CertEncodedFile
         if ($null -eq $newCert) {
             throw "Error importing certificate into the key vault: Import-AzKeyVaultCertificate returned null!"
         }
@@ -365,7 +350,7 @@ function New-CertificateRequest {
         throw "Error importing certificate into the key vault: $_"
     }
     finally {
-        Remove-Item -Path $certP7BEncodedFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $CertEncodedFile -Force -ErrorAction SilentlyContinue
     }
     Write-Log "Certificate imported into the key vault."
     
@@ -456,9 +441,6 @@ if (-not $HybridWorker) {
 }
 Write-Log "Runbook running on hybrid worker $($env:COMPUTERNAME)."
 
-# import other modules
-import-module PSPKI
-
 # Parse the webhook data
 # We have different cases:
 # - WebhookData is null or empty: the runbook is not called from a webhook but it was started manually. In this case we assume action is 'autorenew', so that we can check if there are requests pending in the queue
@@ -501,7 +483,7 @@ else
         Write-Log $msg -Level "Error"
         throw $msg
     }
-    if (string::IsNullOrEmpty($requestBody)) {
+    if ([string]::IsNullOrEmpty($requestBody)) {
         $msg = "WebhookData.RequestBody is empty! Ensure the runbook is called from a webhook! WebhookData structure received is: $($WebhookData)"
         Write-Log $msg -Level "Error"
         throw $msg
@@ -626,7 +608,7 @@ if ($Action -eq "autorenew") {
             $VaultName = $message.data.VaultName
             $CertificateName = $message.data.ObjectName
             
-            New-CertificateRenewalRequest -VaultName $VaultName -CertificateName $CertificateName -CAServer $CAServer -PfxFolder $PfxFolder -CertPswSecretName $CertPswSecretName
+            New-CertificateRenewalRequest -VaultName $VaultName -CertificateName $CertificateName -CA $CA -PfxFolder $PfxFolder -CertPswSecretName $CertPswSecretName
         }
         catch {
             Write-Log "Error processing message: $_" -Level "Warning"
@@ -650,7 +632,7 @@ elseif ($Action -eq "renew" ) {
     # process the renewal request
     Write-Log "Performing certificate renew request for $CertificateName using $VaultName..."
     try {
-        New-CertificateRenewalRequest -VaultName $VaultName -CertificateName $CertificateName -CAServer $CAServer -PfxFolder $PfxFolder -CertPswSecretName $CertPswSecretName            
+        New-CertificateRenewalRequest -VaultName $VaultName -CertificateName $CertificateName -CA $CA -PfxFolder $PfxFolder -CertPswSecretName $CertPswSecretName            
     }
     catch {
         $msg = "Error processing renewal request: $_"
@@ -692,7 +674,7 @@ else {
 
     # process the new certificate request
     try {
-        New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CAServer $CAServer -PfxFolder $PfxFolder -CertPswSecretName $CertPswSecretName     
+        New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxFolder $PfxFolder -CertPswSecretName $CertPswSecretName     
         
     }
     catch {
