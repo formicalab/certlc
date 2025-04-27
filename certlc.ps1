@@ -303,27 +303,35 @@ function New-CertificateRequest {
     }
     
     # see https://www.sysadmins.lv/blog-en/introducing-to-certificate-enrollment-apis-part-3-certificate-request-submission-and-response-installation.aspx
-    # 255 = CR_IN_ENCODEANY
+    
+    # CR_IN_BASE64HEADER = 0x0,
+    # CR_IN_BASE64 = 0x1,
+    # CR_IN_BINARY = 0x2,
+    # CR_IN_ENCODEANY = 0xff,
+    # CR_OUT_BASE64HEADER = 0x0,
+    # CR_OUT_BASE64 = 0x1,
+    # CR_OUT_BINARY = 0x2
+
     Write-Log "Sending request to the CA..."
     try {
         $CertRequest = New-Object -ComObject CertificateAuthority.Request
-        $CertRequestStatus = $CertRequest.Submit(255,$csr,"CertificateTemplate:$($CertificateTemplate)",$CA)
+        $CertRequestStatus = $CertRequest.Submit(0x1, $csr, "CertificateTemplate:$($CertificateTemplate)", $CA)
         
         # status is described in https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-wcce/c084a3e3-4df3-4a28-9a3b-6b08487b04f3?redirectedfrom=MSDN
 
         switch ($CertRequestStatus) {
             2 {
-                throw "Request was denied."
+                throw "Request was denied. Check the CA for details."
             }
             3 {
-                Write-Log "Request submitted successfully."
+                Write-Log "Certificate Request submitted successfully."
                 # https://learn.microsoft.com/en-us/windows/win32/api/certcli/nf-certcli-icertrequest-getcertificate?redirectedfrom=MSDN
-                # 0 = CR_IN_BASE64ENCODED (BASE64 format with begin/end header - this is how the key vault expects the certificate in order to perform a merge)
-                $CertEncoded = $CertRequest.GetCertificate(0)   
+                # 0 = CR_OUT_BASE64HEADER (BASE64 format with begin/end header - this is how the key vault expects the certificate in order to perform a merge)
+                $CertEncoded = $CertRequest.GetCertificate(0x0)   
                 Write-Log "Certificate received from CA."
             }
             5 {
-                throw "Request is pending. This is not expected since this runbook expects to process only completed requests. Review the certiicate template to ensure that certificates are immediately issued"
+                throw "Request is pending. This is not expected since this runbook can only process completed requests. Review the certiicate template and CA configuration to ensure that certificates are immediately issued."
             }
             Default {
                 throw "Request failed with status $($CertRequestStatus). Check codes in https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-wcce/c084a3e3-4df3-4a28-9a3b-6b08487b04f3?redirectedfrom=MSDN"
@@ -335,6 +343,7 @@ function New-CertificateRequest {
         throw "Error submitting request to the CA: $_"
     }
 
+    # we need to save the certificate in a temporary file because the Import-AzKeyVaultCertificate cmdlet does not accept a base64 string as input
     $CertEncodedFile = New-TemporaryFile
     Set-Content -Path $CertEncodedFile -Value $CertEncoded
 
