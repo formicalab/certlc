@@ -441,14 +441,23 @@ if ($LAEnabled) {
 }
 
 # Check if the script is running on Azure or on hybrid worker
-$envVars = Get-ChildItem env:
-$HybridWorker = ($envVars | Where-Object { $_.name -like 'Fabric_*' } ).count -eq 0
-if (-not $HybridWorker) {
-    $msg = "This workbook must be executed by a hybrid worker!"
-    Write-Log $msg -Level "Error"
+# https://rakhesh.com/azure/azure-automation-powershell-variables/
+if ($env:AZUREPS_HOST_ENVIRONMENT -eq "AzureAutomation/") {
+    # We are in a Hybrid Runbook Worker
+    $jobId = $env:PSPrivateMetadata
+    Write-Log "Runbook running as job $jobId on hybrid worker $($env:COMPUTERNAME)."
+}
+elseif ($env:AZUREPS_HOST_ENVIRONMENT -eq "AzureAutomation") {
+    # We are in Azure Automation
+    $jobId = $PSPrivateMetadata.JobId
+    $msg = "Runbook running as job $jobId in Azure Automation. This runbook must be executed by a hybrid worker instead!"
+     Write-Log $msg -Level "Error"
     throw $msg
 }
-Write-Log "Runbook running on hybrid worker $($env:COMPUTERNAME)."
+else {
+    # We are in a local environment
+    Write-Log "Runbook running in local environment on $($env:COMPUTERNAME)."
+}
 
 # Parse the webhook data
 # We have different cases:
