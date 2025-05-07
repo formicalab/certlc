@@ -79,7 +79,6 @@ $QueueInvisibilityTimeout = [System.TimeSpan]::FromSeconds(30) # seconds to wait
 
 $CA = "flazdc03.formicalab.casa\SubCA"  # Issuing CA server (must be in the form <servername>\<CAname>)
 $PfxFolder = "C:\Temp"                  # folder where the PFX file will be downloaded
-$CertPswSecretName = "CertPassword"     # name of the secret in the key vault that contains the password for the PFX file
 
 # TODO: where possible, use automation variables instead (see renewcertviakv.ps1). Sample usage:
 #$QueueStorageAccount = (Get-AzAutomationVariable -ResourceGroupName $automationAccountRG -AutomationAccountName $automationAccountName -name "certlc-storageaccount").Value
@@ -91,7 +90,7 @@ $CertPswSecretName = "CertPassword"     # name of the secret in the key vault th
 ####################
 
 $LAToken = $null       # token using to send logs to Log Analytics
-$JobId = $null         # we will use job id as correlation ID for the log entry, or a new guid if running locally
+$jobId = $null         # we will use job id as correlation ID for the log entry, or a new guid if running locally
 
 #########################
 # FUNCTIONS - Write-Log #
@@ -110,7 +109,7 @@ function Write-Log {
     if ($LAEnabled -and ($null -ne $LAToken)) {
         $log_entry = @{
             TimeGenerated = (Get-Date).ToUniversalTime()
-            CorrelationId = $JobId
+            CorrelationId = $jobId
             Status        = $Level
             Message       = $Message
         }
@@ -157,7 +156,7 @@ function New-CertificateRenewalRequest {
         [string]$PfxFolder,
 
         [Parameter(Mandatory = $false)]
-        [string]$CertPswSecretName
+        [string]$PfxProtectTo
     )
 
     # before processing the request, we need to obtain the other certificate details, such as template, subject, and DNS names
@@ -211,7 +210,7 @@ function New-CertificateRenewalRequest {
     # We can use the same code as for new certificates
     
     try {
-        New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxFolder $PfxFolder -CertPswSecretName $CertPswSecretName            
+        New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxFolder $PfxFolder -PfxProtectTo $PfxProtectTo            
     }
     catch {
         throw "Error creating certificate request: $_"
@@ -253,7 +252,7 @@ function New-CertificateRequest {
         [string]$PfxFolder,
 
         [Parameter(Mandatory = $false)]
-        [string]$CertPswSecretName
+        [string]$PfxProtectTo
 
     )
 
@@ -364,7 +363,7 @@ function New-CertificateRequest {
     Write-Log "Certificate imported into the key vault."
     
     # if required, download the certificate to a local file in the pfx folder
-    if ($null -ne $PfxFolder) {
+    if (-not [string]::IsNullOrEmpty($PfxProtectTo)) {
 
         # create the folder if it does not exist
         if (-not (Test-Path -Path $PfxFolder)) {
@@ -374,38 +373,21 @@ function New-CertificateRequest {
         $pfxFile = Join-Path -Path $PfxFolder -ChildPath "$($CertificateName).pfx"
         Write-Log "PFX folder verified: $PfxFolder"
         
-        # get the password for the PFX file from the key vault
-        Write-Log "Retrieving the certificate password from Key Vault $VaultName, secret $($CertPswSecretName)..."
-        try {
-            $SecCertPassword = (Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertPswSecretName).SecretValue
-        }
-        catch {
-            throw "Failed to retrieve certificate password from secret $CertPswSecretName in Key Vault $($VaultName): $_"
-        }
-        
         # download the certificate to a local file in the pfx folder
         Write-Log "Exporting the $CertificateName certificate to PFX file: $pfxFile"
         try {
             $CertBase64 = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertificateName -AsPlainText
             $CertBytes = [Convert]::FromBase64String($CertBase64)
             $x509Cert = New-Object Security.Cryptography.X509Certificates.X509Certificate2($certBytes, $null, [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
-
-            # get clear text password from the secure string and clear it as soon as possible
-            $CertPassword = ConvertFrom-SecureString -SecureString $SecCertPassword -AsPlainText
-
-            # export the certificate to a PFX file
-            $pfxFileByte = $x509Cert.Export([Security.Cryptography.X509Certificates.X509ContentType]::Pkcs12, $CertPassword)
-            [IO.File]::WriteAllBytes($pfxFile, $pfxFileByte)
+            Export-PfxCertificate -Cert $x509Cert -FilePath $pfxFile -ProtectTo $PfxProtectTo | Out-Null
         }
         catch {
             throw "Error exporting certificate to PFX: $_"
         }
         finally {
-            $CertPassword = $null
             $CertBase64 = $null
-            $pfxFileByte = $null
+            $certBytes = $null
             $x509Cert = $null
-            $SecCertPassword = $null
         }
         Write-Log "Certificate exported to PFX file: $pfxFile"
     }
@@ -435,7 +417,7 @@ $AzureContext = Set-AzContext -SubscriptionName $AzureConnection.Subscription -D
 # get a token for the ingestion endpoint if Log Analytics ingestion is enabled
 if ($LAEnabled) {
     Write-Log "Getting token for ingestion endpoint..."
-    $secureToken = (Get-AzAccessToken -ResourceUrl "https://monitor.azure.com//.default"-AsSecureString ).Token
+    $secureToken = (Get-AzAccessToken -ResourceUrl "https://monitor.azure.com/.default"-AsSecureString ).Token
     $LAToken = ConvertFrom-SecureString -SecureString $secureToken -AsPlainText
     $secureToken = $null
 }
@@ -461,6 +443,7 @@ else {
 }
 
 # Parse the webhook data
+# Note that, using Powershell 7.x, the WebhookData is passed not as a structure but as a string
 # We have different cases:
 # - WebhookData is null or empty: the runbook is not called from a webhook but it was started manually. In this case we assume action is 'autorenew', so that we can check if there are requests pending in the queue
 # - WebhookData is not null or empty: the runbook is called from a webhook. We need to parse the request body and extract the parameters.
@@ -472,7 +455,7 @@ if ([string]::IsNullOrEmpty($WebhookData)) {
 
 else
 {
-    # using Powershell 7.x, the WebhookData is passed not as a structure but as a string with a wrongly formatted JSON...
+    # using Powershell 7.x, the WebhookData string contains a wrongly formatted JSON...
     # (see https://learn.microsoft.com/en-us/azure/automation/automation-webhooks?tabs=portal#create-a-webhook)
     # such as: 
     # {WebhookName:certlc,RequestBody:{"CertLCVersion":"1.0","Action":"renew","VaultName":"<vaultname>","CertificateName":"<certificatename>"},RequestHeader:{Accept-Encoding:gzip,Host:<webhook uri>,User-Agent:Mozilla/5.0,x-ms-request-id:<guid>}}
@@ -531,6 +514,7 @@ else
         $CertificateTemplate = $requestBody.CertificateTemplate
         $CertificateSubject = $requestBody.CertificateSubject
         $CertificateDnsNames = $requestBody.CertificateDnsNames
+        $PfxProtectTo = $requestBody.PfxProtectTo
 
         # check version
         if ($CertLCVersion -ne $Version) {
@@ -627,7 +611,8 @@ if ($Action -eq "autorenew") {
             $VaultName = $message.data.VaultName
             $CertificateName = $message.data.ObjectName
             
-            New-CertificateRenewalRequest -VaultName $VaultName -CertificateName $CertificateName -CA $CA -PfxFolder $PfxFolder -CertPswSecretName $CertPswSecretName
+            # invoke renwal without passing Pfx parameters (autorenew will not download the certificate to a local file)
+            New-CertificateRenewalRequest -VaultName $VaultName -CertificateName $CertificateName -CA $CA
         }
         catch {
             Write-Log "Error processing message: $_" -Level "Warning"
@@ -651,7 +636,7 @@ elseif ($Action -eq "renew" ) {
     # process the renewal request
     Write-Log "Performing certificate renew request for $CertificateName using $VaultName..."
     try {
-        New-CertificateRenewalRequest -VaultName $VaultName -CertificateName $CertificateName -CA $CA -PfxFolder $PfxFolder -CertPswSecretName $CertPswSecretName            
+        New-CertificateRenewalRequest -VaultName $VaultName -CertificateName $CertificateName -CA $CA -PfxFolder $PfxFolder -PfxProtectTo $PfxProtectTo            
     }
     catch {
         $msg = "Error processing renewal request: $_"
@@ -693,8 +678,7 @@ else {
 
     # process the new certificate request
     try {
-        New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxFolder $PfxFolder -CertPswSecretName $CertPswSecretName     
-        
+        New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxFolder $PfxFolder -PfxProtectTo $PfxProtectTo             
     }
     catch {
         $msg = "Error processing new request: $_"
