@@ -1,2 +1,2 @@
-# Ignore the Test folder and its contents
-Test/
+# Ignore all Tests folders and their contents
+Tests/
