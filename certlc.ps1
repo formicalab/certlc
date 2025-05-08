@@ -40,6 +40,7 @@ param
 #   "CertificateTemplate": "string",            # name of the certificate template to use
 #   "CertificateSubject": "string",             # subject of the certificate to create or renew
 #   "CertificateDnsNames": array of strings     # optional, certificate DNS names
+#   "PfxProtectTo": "string"                    # optional, user or group to protect the PFX file (if not specified, the PFX will not be downloaded)
 # }
 
 # for RENEWALS:
@@ -50,12 +51,32 @@ param
 #   "CertificateName": "string",                # name of the certificate to renew (it will have the same subject, DNS names, template, and a new private key)
 # }
 
-# Note: RENEWALS can be triggered by event grid events, for example when the certificate is about to expire.
-# In this case, the webhook body will not contain the above structure.
-# A missing 'CertLCVersion' field will be used to identify the webhook as an autorenewal. CertificateName and VaultName will be fetched from the queue message.
+# for AUTORENEWALS (when the runbook is triggered by event grid events):
+# [
+#   {
+#     "id": "string",                           # event id
+#     "topic": "string",                        # event topic (resource id of the key vault)
+#     "subject": "string",                      # event subject (name of the expiring certificate)
+#     "eventType": "string",                    # event type (Microsoft.KeyVault.CertificateNearExpiry)
+#     "data": {                                 # event data
+#       "Id": "string",                         # resource id of the expiring certificate version
+#       "VaultName": "string",                  # name of the key vault
+#       "ObjectType": "string",                 # object type (Certificate)
+#       "ObjectName": "string",                 # name of the expiring certificate
+#       "Version": "string",                    # version of the expiring certificate
+#       "NBF": "integer",                       # not before date (epoch time)
+#       "EXP": "integer"                        # expiration date (epoch time)
+#       "DataVersion": "string",                # data version (1)
+#       "MetadataVersion": "string",            # metadata version (1)
+#       "EventTime": "string"                   # event time (ISO 8601 format)
+#   }
+#]
 
 # Prohibits references to uninitialized variables
 Set-StrictMode -Version 1.0
+
+# Ensure the script stops on errors so that try/catch can be used to handle them
+$ErrorActionPreference = "Stop"
 
 ###################
 # STATIC SETTINGS #
@@ -376,8 +397,8 @@ function New-CertificateRequest {
         # download the certificate to a local file in the pfx folder
         Write-Log "Exporting the $CertificateName certificate to PFX file: $pfxFile"
         try {
-            $CertBase64 = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertificateName -AsPlainText
-            $CertBytes = [Convert]::FromBase64String($CertBase64)
+            $certBase64 = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertificateName -AsPlainText
+            $certBytes = [Convert]::FromBase64String($certBase64)
             $x509Cert = New-Object Security.Cryptography.X509Certificates.X509Certificate2($certBytes, $null, [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
             Export-PfxCertificate -Cert $x509Cert -FilePath $pfxFile -ProtectTo $PfxProtectTo | Out-Null
         }
@@ -385,7 +406,7 @@ function New-CertificateRequest {
             throw "Error exporting certificate to PFX: $_"
         }
         finally {
-            $CertBase64 = $null
+            $certBase64 = $null
             $certBytes = $null
             $x509Cert = $null
         }
@@ -433,7 +454,7 @@ elseif ($env:AZUREPS_HOST_ENVIRONMENT -eq "AzureAutomation") {
     # We are in Azure Automation
     $jobId = $PSPrivateMetadata.JobId
     $msg = "Runbook running with job id $jobId in Azure Automation. This runbook must be executed by a hybrid worker instead!"
-     Write-Log $msg -Level "Error"
+    Write-Log $msg -Level "Error"
     throw $msg
 }
 else {
@@ -453,8 +474,7 @@ if ([string]::IsNullOrEmpty($WebhookData)) {
     $Action = "autorenew"
 }
 
-else
-{
+else {
     # using Powershell 7.x, the WebhookData string contains a wrongly formatted JSON...
     # (see https://learn.microsoft.com/en-us/azure/automation/automation-webhooks?tabs=portal#create-a-webhook)
     # such as: 
