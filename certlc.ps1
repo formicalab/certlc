@@ -98,8 +98,8 @@ $QueueAttempts = 10                                 # number of attempts to chec
 $QueueWait = 5                                      # seconds to wait between attempts
 $QueueInvisibilityTimeout = [System.TimeSpan]::FromSeconds(30) # seconds to wait for the message to be invisible in the queue when it is being processed
 
-$CA = "flazdc03.formicalab.casa\SubCA"  # Issuing CA server (must be in the form <servername>\<CAname>)
-$PfxFolder = "C:\Temp"                  # folder where the PFX file will be downloaded
+$CA = "flazdc03.formicalab.casa\SubCA"      # Issuing CA server (must be in the form <servername>\<CAname>)
+$PfxRootFolder = "C:\Temp"                  # root of folder tree where the PFX files will be downloaded
 
 # TODO: where possible, use automation variables instead (see renewcertviakv.ps1). Sample usage:
 #$QueueStorageAccount = (Get-AzAutomationVariable -ResourceGroupName $automationAccountRG -AutomationAccountName $automationAccountName -name "certlc-storageaccount").Value
@@ -174,7 +174,7 @@ function New-CertificateRenewalRequest {
         [string]$CA,
 
         [Parameter(Mandatory = $false)]
-        [string]$PfxFolder,
+        [string]$PfxRootFolder,
 
         [Parameter(Mandatory = $false)]
         [string]$PfxProtectTo
@@ -231,7 +231,7 @@ function New-CertificateRenewalRequest {
     # We can use the same code as for new certificates
     
     try {
-        New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxFolder $PfxFolder -PfxProtectTo $PfxProtectTo            
+        New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxRootFolder $PfxRootFolder -PfxProtectTo $PfxProtectTo            
     }
     catch {
         throw "Error creating certificate request: $_"
@@ -270,7 +270,7 @@ function New-CertificateRequest {
         [string]$CA,
 
         [Parameter(Mandatory = $false)]
-        [string]$PfxFolder,
+        [string]$PfxRootFolder,
 
         [Parameter(Mandatory = $false)]
         [string]$PfxProtectTo
@@ -386,15 +386,65 @@ function New-CertificateRequest {
     # if required, download the certificate to a local file in the pfx folder
     if (-not [string]::IsNullOrEmpty($PfxProtectTo)) {
 
-        # create the folder if it does not exist
-        if (-not (Test-Path -Path $PfxFolder)) {
-            Write-Log "Creating the PFX folder: $PfxFolder"
-            New-Item -Path $PfxFolder -ItemType Directory -Force | Out-Null
+        # create the root folder if it does not exist
+        if (-not (Test-Path -Path $PfxRootFolder)) {
+            Write-Log "Creating the PFX root folder: $PfxRootFolder"
+            New-Item -Path $PfxRootFolder -ItemType Directory -Force | Out-Null
         }
-        $pfxFile = Join-Path -Path $PfxFolder -ChildPath "$($CertificateName).pfx"
-        Write-Log "PFX folder verified: $PfxFolder"
+        Write-Log "PFX folder verified: $PfxRootFolder"
+
+        # determine per-user folder name from $PfxProtectTo
+        [string]$pfxUser = $null
+        if ($PfxProtectTo -match '\\') {
+            $pfxUser = ($PfxProtectTo -split '\\')[-1]     # DOMAIN\username → username
+        }
+        elseif ($PfxProtectTo -match '@') {
+            $pfxUser = ($PfxProtectTo -split '@')[0]       # username@domain → username
+        }
+        else {
+            $pfxUser = $PfxProtectTo                       # already just username
+        }
+
+        # build full target folder path  (root folder\username)
+        $PfxTargetFolder = Join-Path -Path $PfxRootFolder -ChildPath $pfxUser 
+
+        # create the per-user folder if it does not exist
+        if (-not (Test-Path -Path $PfxTargetFolder)) {
+            Write-Log "Creating the per-user PFX folder: $PfxTargetFolder"
+            New-Item -Path $PfxTargetFolder -ItemType Directory -Force | Out-Null
+
+            try {
+                $acl = Get-Acl -Path $PfxTargetFolder
+                # disable inheritance and remove existing inherited ACEs
+                $acl.SetAccessRuleProtection($true, $false)
+
+                $inheritFlags = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit `
+                              -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+                $propFlags   = [System.Security.AccessControl.PropagationFlags]::None
+
+                $adminRule  = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                                'BUILTIN\Administrators', 'FullControl', $inheritFlags, $propFlags, 'Allow')
+                $systemRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                                'NT AUTHORITY\SYSTEM',   'FullControl', $inheritFlags, $propFlags, 'Allow')
+                $userRule   = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                                $PfxProtectTo,           'ReadAndExecute', $inheritFlags, $propFlags, 'Allow')
+
+                $acl.SetAccessRule($adminRule)
+                $acl.SetAccessRule($systemRule)
+                $acl.SetAccessRule($userRule)
+
+                Set-Acl -Path $PfxTargetFolder -AclObject $acl
+                Write-Log "ACL set on per-user PFX folder: $($PfxTargetFolder): Administrators & SYSTEM FullControl, $PfxProtectTo Read+Execute"
+            }
+            catch {
+                throw "Error setting permissions on the per-user PFX folder $($PfxTargetFolder): $_"
+            }           
+        }
         
-        # download the certificate to a local file in the pfx folder
+        Write-Log "Per-user PFX folder verified: $PfxTargetFolder"
+      
+        # download the certificate to a local file in the per-user folder
+        $pfxFile = Join-Path -Path $PfxTargetFolder -ChildPath "$($CertificateName).pfx"
         Write-Log "Exporting the $CertificateName certificate to PFX file: $pfxFile"
         try {
             $certBase64 = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertificateName -AsPlainText
@@ -656,7 +706,7 @@ elseif ($Action -eq "renew" ) {
     # process the renewal request
     Write-Log "Performing certificate renew request for $CertificateName using $VaultName..."
     try {
-        New-CertificateRenewalRequest -VaultName $VaultName -CertificateName $CertificateName -CA $CA -PfxFolder $PfxFolder -PfxProtectTo $PfxProtectTo            
+        New-CertificateRenewalRequest -VaultName $VaultName -CertificateName $CertificateName -CA $CA -PfxRootFolder $PfxRootFolder -PfxProtectTo $PfxProtectTo            
     }
     catch {
         $msg = "Error processing renewal request: $_"
@@ -698,7 +748,7 @@ else {
 
     # process the new certificate request
     try {
-        New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxFolder $PfxFolder -PfxProtectTo $PfxProtectTo             
+        New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxRootFolder $PfxRootFolder -PfxProtectTo $PfxProtectTo             
     }
     catch {
         $msg = "Error processing new request: $_"
