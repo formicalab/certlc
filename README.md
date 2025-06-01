@@ -31,7 +31,7 @@ CertLC is a PowerShell 7 runbook designed to fully automate X.509 certificate li
 certlc.ps1          # Main runbook with all logic
 ```
 
-## Setup
+## Initial configuration
 
 1. Deploy the runbook to an Automation Account with a Hybrid Worker.  
 2. Configure the Automation variables (e.g., CA name, storage account, queue).  
