@@ -40,6 +40,7 @@ param
 #   "CertificateTemplate": "string",            # name of the certificate template to use
 #   "CertificateSubject": "string",             # subject of the certificate to create or renew
 #   "CertificateDnsNames": array of strings     # optional, certificate DNS names
+#   "PfxProtectTo": "string"                    # optional, user or group to protect the PFX file (if not specified, the PFX will not be downloaded)
 # }
 
 # for RENEWALS:
@@ -50,12 +51,32 @@ param
 #   "CertificateName": "string",                # name of the certificate to renew (it will have the same subject, DNS names, template, and a new private key)
 # }
 
-# Note: RENEWALS can be triggered by event grid events, for example when the certificate is about to expire.
-# In this case, the webhook body will not contain the above structure.
-# A missing 'CertLCVersion' field will be used to identify the webhook as an autorenewal. CertificateName and VaultName will be fetched from the queue message.
+# for AUTORENEWALS (when the runbook is triggered by event grid events):
+# [
+#   {
+#     "id": "string",                           # event id
+#     "topic": "string",                        # event topic (resource id of the key vault)
+#     "subject": "string",                      # event subject (name of the expiring certificate)
+#     "eventType": "string",                    # event type (Microsoft.KeyVault.CertificateNearExpiry)
+#     "data": {                                 # event data
+#       "Id": "string",                         # resource id of the expiring certificate version
+#       "VaultName": "string",                  # name of the key vault
+#       "ObjectType": "string",                 # object type (Certificate)
+#       "ObjectName": "string",                 # name of the expiring certificate
+#       "Version": "string",                    # version of the expiring certificate
+#       "NBF": "integer",                       # not before date (epoch time)
+#       "EXP": "integer"                        # expiration date (epoch time)
+#       "DataVersion": "string",                # data version (1)
+#       "MetadataVersion": "string",            # metadata version (1)
+#       "EventTime": "string"                   # event time (ISO 8601 format)
+#   }
+#]
 
 # Prohibits references to uninitialized variables
 Set-StrictMode -Version 1.0
+
+# Ensure the script stops on errors so that try/catch can be used to handle them
+$ErrorActionPreference = "Stop"
 
 ###################
 # STATIC SETTINGS #
@@ -77,8 +98,8 @@ $QueueAttempts = 10                                 # number of attempts to chec
 $QueueWait = 5                                      # seconds to wait between attempts
 $QueueInvisibilityTimeout = [System.TimeSpan]::FromSeconds(30) # seconds to wait for the message to be invisible in the queue when it is being processed
 
-$CA = "flazdc03.formicalab.casa\SubCA"  # Issuing CA server (must be in the form <servername>\<CAname>)
-$PfxFolder = "C:\Temp"                  # folder where the PFX file will be downloaded
+$CA = "flazdc03.formicalab.casa\SubCA"      # Issuing CA server (must be in the form <servername>\<CAname>)
+$PfxRootFolder = "C:\Temp"                  # root of folder tree where the PFX files will be downloaded
 
 # TODO: where possible, use automation variables instead (see renewcertviakv.ps1). Sample usage:
 #$QueueStorageAccount = (Get-AzAutomationVariable -ResourceGroupName $automationAccountRG -AutomationAccountName $automationAccountName -name "certlc-storageaccount").Value
@@ -153,7 +174,7 @@ function New-CertificateRenewalRequest {
         [string]$CA,
 
         [Parameter(Mandatory = $false)]
-        [string]$PfxFolder,
+        [string]$PfxRootFolder,
 
         [Parameter(Mandatory = $false)]
         [string]$PfxProtectTo
@@ -210,7 +231,7 @@ function New-CertificateRenewalRequest {
     # We can use the same code as for new certificates
     
     try {
-        New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxFolder $PfxFolder -PfxProtectTo $PfxProtectTo            
+        New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxRootFolder $PfxRootFolder -PfxProtectTo $PfxProtectTo            
     }
     catch {
         throw "Error creating certificate request: $_"
@@ -249,7 +270,7 @@ function New-CertificateRequest {
         [string]$CA,
 
         [Parameter(Mandatory = $false)]
-        [string]$PfxFolder,
+        [string]$PfxRootFolder,
 
         [Parameter(Mandatory = $false)]
         [string]$PfxProtectTo
@@ -365,19 +386,69 @@ function New-CertificateRequest {
     # if required, download the certificate to a local file in the pfx folder
     if (-not [string]::IsNullOrEmpty($PfxProtectTo)) {
 
-        # create the folder if it does not exist
-        if (-not (Test-Path -Path $PfxFolder)) {
-            Write-Log "Creating the PFX folder: $PfxFolder"
-            New-Item -Path $PfxFolder -ItemType Directory -Force | Out-Null
+        # create the root folder if it does not exist
+        if (-not (Test-Path -Path $PfxRootFolder)) {
+            Write-Log "Creating the PFX root folder: $PfxRootFolder"
+            New-Item -Path $PfxRootFolder -ItemType Directory -Force | Out-Null
         }
-        $pfxFile = Join-Path -Path $PfxFolder -ChildPath "$($CertificateName).pfx"
-        Write-Log "PFX folder verified: $PfxFolder"
+        Write-Log "PFX folder verified: $PfxRootFolder"
+
+        # determine per-user folder name from $PfxProtectTo
+        [string]$pfxUser = $null
+        if ($PfxProtectTo -match '\\') {
+            $pfxUser = ($PfxProtectTo -split '\\')[-1]     # DOMAIN\username → username
+        }
+        elseif ($PfxProtectTo -match '@') {
+            $pfxUser = ($PfxProtectTo -split '@')[0]       # username@domain → username
+        }
+        else {
+            $pfxUser = $PfxProtectTo                       # already just username
+        }
+
+        # build full target folder path  (root folder\username)
+        $PfxTargetFolder = Join-Path -Path $PfxRootFolder -ChildPath $pfxUser 
+
+        # create the per-user folder if it does not exist
+        if (-not (Test-Path -Path $PfxTargetFolder)) {
+            Write-Log "Creating the per-user PFX folder: $PfxTargetFolder"
+            New-Item -Path $PfxTargetFolder -ItemType Directory -Force | Out-Null
+
+            try {
+                $acl = Get-Acl -Path $PfxTargetFolder
+                # disable inheritance and remove existing inherited ACEs
+                $acl.SetAccessRuleProtection($true, $false)
+
+                $inheritFlags = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit `
+                              -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+                $propFlags   = [System.Security.AccessControl.PropagationFlags]::None
+
+                $adminRule  = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                                'BUILTIN\Administrators', 'FullControl', $inheritFlags, $propFlags, 'Allow')
+                $systemRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                                'NT AUTHORITY\SYSTEM',   'FullControl', $inheritFlags, $propFlags, 'Allow')
+                $userRule   = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                                $PfxProtectTo,           'ReadAndExecute', $inheritFlags, $propFlags, 'Allow')
+
+                $acl.SetAccessRule($adminRule)
+                $acl.SetAccessRule($systemRule)
+                $acl.SetAccessRule($userRule)
+
+                Set-Acl -Path $PfxTargetFolder -AclObject $acl
+                Write-Log "ACL set on per-user PFX folder: $($PfxTargetFolder): Administrators & SYSTEM FullControl, $PfxProtectTo Read+Execute"
+            }
+            catch {
+                throw "Error setting permissions on the per-user PFX folder $($PfxTargetFolder): $_"
+            }           
+        }
         
-        # download the certificate to a local file in the pfx folder
+        Write-Log "Per-user PFX folder verified: $PfxTargetFolder"
+      
+        # download the certificate to a local file in the per-user folder
+        $pfxFile = Join-Path -Path $PfxTargetFolder -ChildPath "$($CertificateName).pfx"
         Write-Log "Exporting the $CertificateName certificate to PFX file: $pfxFile"
         try {
-            $CertBase64 = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertificateName -AsPlainText
-            $CertBytes = [Convert]::FromBase64String($CertBase64)
+            $certBase64 = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertificateName -AsPlainText
+            $certBytes = [Convert]::FromBase64String($certBase64)
             $x509Cert = New-Object Security.Cryptography.X509Certificates.X509Certificate2($certBytes, $null, [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
             Export-PfxCertificate -Cert $x509Cert -FilePath $pfxFile -ProtectTo $PfxProtectTo | Out-Null
         }
@@ -385,7 +456,7 @@ function New-CertificateRequest {
             throw "Error exporting certificate to PFX: $_"
         }
         finally {
-            $CertBase64 = $null
+            $certBase64 = $null
             $certBytes = $null
             $x509Cert = $null
         }
@@ -433,7 +504,7 @@ elseif ($env:AZUREPS_HOST_ENVIRONMENT -eq "AzureAutomation") {
     # We are in Azure Automation
     $jobId = $PSPrivateMetadata.JobId
     $msg = "Runbook running with job id $jobId in Azure Automation. This runbook must be executed by a hybrid worker instead!"
-     Write-Log $msg -Level "Error"
+    Write-Log $msg -Level "Error"
     throw $msg
 }
 else {
@@ -453,8 +524,7 @@ if ([string]::IsNullOrEmpty($WebhookData)) {
     $Action = "autorenew"
 }
 
-else
-{
+else {
     # using Powershell 7.x, the WebhookData string contains a wrongly formatted JSON...
     # (see https://learn.microsoft.com/en-us/azure/automation/automation-webhooks?tabs=portal#create-a-webhook)
     # such as: 
@@ -636,7 +706,7 @@ elseif ($Action -eq "renew" ) {
     # process the renewal request
     Write-Log "Performing certificate renew request for $CertificateName using $VaultName..."
     try {
-        New-CertificateRenewalRequest -VaultName $VaultName -CertificateName $CertificateName -CA $CA -PfxFolder $PfxFolder -PfxProtectTo $PfxProtectTo            
+        New-CertificateRenewalRequest -VaultName $VaultName -CertificateName $CertificateName -CA $CA -PfxRootFolder $PfxRootFolder -PfxProtectTo $PfxProtectTo            
     }
     catch {
         $msg = "Error processing renewal request: $_"
@@ -678,7 +748,7 @@ else {
 
     # process the new certificate request
     try {
-        New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxFolder $PfxFolder -PfxProtectTo $PfxProtectTo             
+        New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxRootFolder $PfxRootFolder -PfxProtectTo $PfxProtectTo             
     }
     catch {
         $msg = "Error processing new request: $_"
