@@ -498,7 +498,7 @@ if ($LAEnabled) {
 if ($env:AZUREPS_HOST_ENVIRONMENT -eq "AzureAutomation/") {
     # We are in a Hybrid Runbook Worker
     $jobId = $env:PSPrivateMetadata
-    Write-Log "Runbook running wiith job id $jobId on hybrid worker $($env:COMPUTERNAME)."
+    Write-Log "Runbook running with job id $jobId on hybrid worker $($env:COMPUTERNAME)."
 }
 elseif ($env:AZUREPS_HOST_ENVIRONMENT -eq "AzureAutomation") {
     # We are in Azure Automation
@@ -537,7 +537,9 @@ else {
     # - RequestBody is not enclosed in double quotes (invalid case):   RequestBody:{...}
     # - After RequestBody there is an array:  RequestBody:[{...}] or "RequestBody":[{...},{...}]
 
-    if ($WebhookData -match '\"?RequestBody\"?\s*:\s*(\{.*?\}|\[.*?\])') {
+    #     if ($WebhookData -match '\"?RequestBody\"?\s*:\s*(\{.*?\}|\[.*?\])') {
+
+    if ($WebhookData -match '\"?RequestBody\"?\s*:\s*((?:{([^{}]|(?<open>{)|(?<-open>}))*(?(open)(?!))})|(?:\[([^\[\]]|(?<open>\[)|(?<-open>\]))*(?(open)(?!))\]))') {
         $jsonRequestBody = $matches[1]
     }
     else {
@@ -561,9 +563,28 @@ else {
         throw $msg
     }
 
-    # in case the request arrives from Event Grid, the body has a structure like this:
-    # [{"id":"1af41fa2-54b2-4b03-ba46-f5088ba709c7","topic":"/subscriptions/<guid>/resourceGroups/<rgname>/providers/Microsoft.KeyVault/vaults/<vaultname>","subject":"<certificatename>","eventType":"Microsoft.KeyVault.CertificateNearExpiry","data":{"Id":"https://<vaultname>.vault.azure.net/certificates/<certificatename>/<versionid>","VaultName":"<vaultname>","ObjectType":"Certificate","ObjectName":"<certificatename>","Version":"<versionid>","NBF":1745695048,"EXP":1745702248},"dataVersion":"1","metadataVersion":"1","eventTime":"2025-04-26T19:29:34.4197223Z"}]
-    if ($requestBody.eventType -eq "Microsoft.KeyVault.CertificateNearExpiry") {
+    <# in case the request arrives from Event Grid, the body has a structure like this (assuming CloudSchema is used in Event Grid subscription)
+    {
+        "id": "e1a6f79d-fed0-4e2c-80a6-3cfd09ee3b13",
+        "source": "/subscriptions/4a570962-701a-475e-bf5b-8dc76ec748ff/resourceGroups/rg-shared-neu-001/providers/Microsoft.KeyVault/vaults/flazkv-shared-neu-001",
+        "specversion": "1.0",
+        "type": "Microsoft.KeyVault.CertificateNearExpiry",
+        "subject": "TESTFUNCTION.PS1",
+        "time": "2025-06-08T19:52:25.1524887Z",
+        "data": {
+            "Id": "https://flazkv-shared-neu-001.vault.azure.net/certificates/mycert05/7983b04bd0534cb0bf57e6b27c00f3bd",
+            "VaultName": "flazkv-shared-neu-001",
+            "ObjectType": "Certificate",
+            "ObjectName": "mycert05",
+            "Version": "7983b04bd0534cb0bf57e6b27c00f3bd",
+            "NBF": 1749411621,
+            "EXP": 1749418821
+        }
+    }
+
+    #>
+    
+    if ($requestBody.type -eq "Microsoft.KeyVault.CertificateNearExpiry") {
 
         # if we have an eventType field with a value of Microsoft.KeyVault.CertificateNearExpiry, we need to extract the VaultName and ObjectName from the data field
         # and set the Action to autorenew. The CertLCVersion is not present in this case.
@@ -576,6 +597,27 @@ else {
     else {
 
         # otherwise, it is a new or renew request invoked explicitly from the webhook. We need to extract the parameters from the request body.
+        # TODO: we might use the same CloudEventSchema also for new and renew requests, ie:
+
+        <#
+            {
+                "id": <not used>",
+                "source": "<not used>"",
+                "specversion": "1.0",
+                "type": "Poste.CertLC.NewCertificateRequest",
+                "subject": "<not used>",
+                "time": <not used or actual request time, like: "2025-06-08T19:52:25.1524887Z">
+                "data": {
+                    "Id": "<ticket id>"",
+                    "VaultName": "<keyvault name>",
+                    "CertificateName": "<certificate name>",
+                    "CertificateTemplate": "<certificate template>",
+                    "CertificateSubject": "<certificate subject>",
+                    "CertificateDnsNames": ["<dns name 1>", "<dns name 2>"],
+                    "PfxProtectTo": "<user to protect the PFX file>"
+                }
+            }
+    #>
 
         $CertLCVersion = $requestBody.CertLCVersion
         $Action = $requestBody.Action

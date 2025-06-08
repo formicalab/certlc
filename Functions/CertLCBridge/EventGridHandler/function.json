@@ -1,0 +1,10 @@
+{
+  "scriptFile": "run.ps1",
+  "bindings": [
+    {
+      "type": "eventGridTrigger",
+      "name": "cloudEvent",
+      "direction": "in"
+    }
+  ]
+}
