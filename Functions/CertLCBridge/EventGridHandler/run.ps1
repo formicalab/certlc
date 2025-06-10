@@ -14,30 +14,24 @@ Converted back to JSON, if CloudEventSchema is used, has this format:
 
 {
   "id": "51739d81-c68c-436b-a28c-52ebe1ebb37f",
-  "source": "/subscriptions/4a570962-701a-475e-bf5b-8dc76ec748ff/resourceGroups/rg-shared-neu-001/providers/Microsoft.KeyVault/vaults/flazkv-shared-neu-001",
+  "source": "/subscriptions/<guid>/resourceGroups/<rg>/providers/Microsoft.KeyVault/vaults/<keyvault>",
   "specversion": "1.0",
   "type": "Microsoft.KeyVault.CertificateNearExpiry",
   "subject": "mycert05",
   "time": "2025-06-08T17:45:12.2205855Z",
   "data": {
-    "Id": "https://flazkv-shared-neu-001.vault.azure.net/certificates/mycert05/5ec09ca501b24923ae958493c9b136fd",
-    "VaultName": "flazkv-shared-neu-001",
+    "Id": "https://<keyvault>.vault.azure.net/certificates/mycert05/<version>",
+    "VaultName": "<keyvault>",
     "ObjectType": "Certificate",
     "ObjectName": "mycert05",
-    "Version": "5ec09ca501b24923ae958493c9b136fd",
+    "Version": "<version>",
     "NBF": 1749403975,
     "EXP": 1749411175
   }
 }
 
-$triggerMetadata is not used in this example, it can provide additional context about the event trigger:
-
-Name                           Value
-----                           -----
-FunctionName                   EventGridHandler
-FunctionDirectory              D:\source\repos\CertLC\Functions\CertLCBridge\EventGridHandler
-InvocationId                   5a9e6346-4e78-4671-8f16-01895060f294
-data                           {[Id, https://flazkv-shared-neu-001.vault.azure.net/certificates/mycert13/89e4274cf92540…
+$triggerMetadata is not used in this example, it can provide additional context about the event trigger
+(see https://learn.microsoft.com/en-us/azure/azure-functions/functions-reference-powershell?tabs=portal#triggermetadata-parameter)
 
 #>
 

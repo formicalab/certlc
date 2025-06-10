@@ -419,15 +419,15 @@ function New-CertificateRequest {
                 $acl.SetAccessRuleProtection($true, $false)
 
                 $inheritFlags = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit `
-                              -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
-                $propFlags   = [System.Security.AccessControl.PropagationFlags]::None
+                    -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+                $propFlags = [System.Security.AccessControl.PropagationFlags]::None
 
-                $adminRule  = New-Object System.Security.AccessControl.FileSystemAccessRule(
-                                'BUILTIN\Administrators', 'FullControl', $inheritFlags, $propFlags, 'Allow')
+                $adminRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                    'BUILTIN\Administrators', 'FullControl', $inheritFlags, $propFlags, 'Allow')
                 $systemRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-                                'NT AUTHORITY\SYSTEM',   'FullControl', $inheritFlags, $propFlags, 'Allow')
-                $userRule   = New-Object System.Security.AccessControl.FileSystemAccessRule(
-                                $PfxProtectTo,           'ReadAndExecute', $inheritFlags, $propFlags, 'Allow')
+                    'NT AUTHORITY\SYSTEM', 'FullControl', $inheritFlags, $propFlags, 'Allow')
+                $userRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                    $PfxProtectTo, 'ReadAndExecute', $inheritFlags, $propFlags, 'Allow')
 
                 $acl.SetAccessRule($adminRule)
                 $acl.SetAccessRule($systemRule)
@@ -520,66 +520,100 @@ else {
 # - WebhookData is not null or empty: the runbook is called from a webhook. We need to parse the request body and extract the parameters.
 
 if ([string]::IsNullOrEmpty($WebhookData)) {
-    Write-Log "WebhookData missing or empty! Assuming autorenew action and checking the queue for messages..."
+    Write-Log "WebhookData missing or empty: assuming autorenew action..."
     $Action = "autorenew"
 }
 
 else {
+
+    Write-Log "WebhookData received is: $($WebhookData)"
+    
     # using Powershell 7.x, the WebhookData string contains a wrongly formatted JSON...
     # (see https://learn.microsoft.com/en-us/azure/automation/automation-webhooks?tabs=portal#create-a-webhook)
     # such as: 
+    #
     # {WebhookName:certlc,RequestBody:{"CertLCVersion":"1.0","Action":"renew","VaultName":"<vaultname>","CertificateName":"<certificatename>"},RequestHeader:{Accept-Encoding:gzip,Host:<webhook uri>,User-Agent:Mozilla/5.0,x-ms-request-id:<guid>}}
     #
     # The problem is that WebhookName, RequestBody and RequestHeader are not enclosed in double quotes.
-    # We try to extract the RequestBody via regex and convert it from JSON to object.
-    # The following regex matches these cases:
-    # - RequestBody is enclosed in double quotes (valid case):   "RequestBody":"{...}"
-    # - RequestBody is not enclosed in double quotes (invalid case):   RequestBody:{...}
-    # - After RequestBody there is an array:  RequestBody:[{...}] or "RequestBody":[{...},{...}]
+    # We try to parse the JSON but, if it fails, we 'manually' extract the RequestBody via regex and convert it from JSON to object.
 
-    #     if ($WebhookData -match '\"?RequestBody\"?\s*:\s*(\{.*?\}|\[.*?\])') {
-
-    if ($WebhookData -match '\"?RequestBody\"?\s*:\s*((?:{([^{}]|(?<open>{)|(?<-open>}))*(?(open)(?!))})|(?:\[([^\[\]]|(?<open>\[)|(?<-open>\]))*(?(open)(?!))\]))') {
-        $jsonRequestBody = $matches[1]
-    }
-    else {
-        $msg = "WebhookData.RequestBody not found! WebhookData structure received is: $($WebhookData)"
-        Write-Log $msg -Level "Error"
-        throw $msg
-    }
-
-    # we now have a RequestBody, convert from JSON to object
+    # Try to parse WebhookData as JSON first
     try {
-        $requestBody = ConvertFrom-Json -InputObject $jsonRequestBody
+        $request = ConvertFrom-Json -InputObject $WebhookData
+        $requestBody = $request.RequestBody
     }
     catch {
-        $msg = "Failed to parse WebhookData.RequestBody as JSON. WebhookData structure received is: $($WebhookData). Error: $_"
-        Write-Log $msg -Level "Error"
-        throw $msg
+        # Fallback to regex extraction for broken 
+
+        # The following regex matches these cases:
+        # - RequestBody is enclosed in double quotes (valid case):   "RequestBody":"{...}"
+        # - RequestBody is not enclosed in double quotes (invalid case):   RequestBody:{...}
+        # - After RequestBody there is an array:  RequestBody:[{...}] or "RequestBody":[{...},{...}]
+
+        Write-Log "Failed to parse WebhookData as JSON. Attempting to extract RequestBody using regex..." -Level "Warning"
+
+        if ($WebhookData -match '"?RequestBody"?\s*:\s*((?:{([^{}]|(?<open>{)|(?<-open>}))*(?(open)(?!))})|(?:\[([^\[\]]|(?<open>\[)|(?<-open>\]))*(?(open)(?!))\]))') {
+            $jsonRequestBody = $matches[1]
+            try {
+                $requestBody = ConvertFrom-Json -InputObject $jsonRequestBody
+            }
+            catch {
+                $msg = "Failed to parse WebhookData.RequestBody using regex, error: $_"
+                Write-Log $msg -Level "Error"
+                throw $msg
+            }
+        }
+        else {
+            $msg = "WebhookData.RequestBody not recognized using regex!"
+            Write-Log $msg -Level "Error"
+            throw $msg
+        }
     }
     if ([string]::IsNullOrEmpty($requestBody)) {
-        $msg = "WebhookData.RequestBody is empty! Ensure the runbook is called from a webhook! WebhookData structure received is: $($WebhookData)"
+        $msg = "WebhookData.RequestBody is empty! Ensure the runbook is called from a webhook!"
         Write-Log $msg -Level "Error"
         throw $msg
     }
 
-    <# in case the request arrives from Event Grid, the body has a structure like this (assuming CloudSchema is used in Event Grid subscription)
+    <# in case the request arrives from Event Grid, the body has a structure like this (assuming CloudEventSchema is used):
+
     {
-        "id": "e1a6f79d-fed0-4e2c-80a6-3cfd09ee3b13",
-        "source": "/subscriptions/4a570962-701a-475e-bf5b-8dc76ec748ff/resourceGroups/rg-shared-neu-001/providers/Microsoft.KeyVault/vaults/flazkv-shared-neu-001",
+        "id": "51739d81-c68c-436b-a28c-52ebe1ebb37f",
+        "source": "/subscriptions/<guid>/resourceGroups/<rg>/providers/Microsoft.KeyVault/vaults/<keyvault>",
         "specversion": "1.0",
         "type": "Microsoft.KeyVault.CertificateNearExpiry",
-        "subject": "TESTFUNCTION.PS1",
-        "time": "2025-06-08T19:52:25.1524887Z",
+        "subject": "mycert05",
+        "time": "2025-06-08T17:45:12.2205855Z",
         "data": {
-            "Id": "https://flazkv-shared-neu-001.vault.azure.net/certificates/mycert05/7983b04bd0534cb0bf57e6b27c00f3bd",
-            "VaultName": "flazkv-shared-neu-001",
+            "Id": "https://<keyvault>.vault.azure.net/certificates/mycert05/<version>",
+            "VaultName": "<keyvault>",
             "ObjectType": "Certificate",
             "ObjectName": "mycert05",
-            "Version": "7983b04bd0534cb0bf57e6b27c00f3bd",
-            "NBF": 1749411621,
-            "EXP": 1749418821
+            "Version": "<version>",
+            "NBF": 1749403975,
+            "EXP": 1749411175
         }
+    }
+
+    If, instead, the EventGridSchema is used, the body has a structure like this:
+
+    {
+        "id": "1af41fa2-54b2-4b03-ba46-f5088ba709c7",
+        "topic": "/subscriptions/4a570962-701a-475e-bf5b-8dc76ec748ff/resourceGroups/rg-shared-neu-001/providers/Microsoft.KeyVault/vaults/flazkv-shared-neu-001",
+        "subject": "mycert13",
+        "eventType": "Microsoft.KeyVault.CertificateNearExpiry",
+        "data": {
+            "Id": "https://flazkv-shared-neu-001.vault.azure.net/certificates/mycert13/89e4274cf92540479770a1178cce17ff",
+            "VaultName": "flazkv-shared-neu-001",
+            "ObjectType": "Certificate",
+            "ObjectName": "mycert13",
+            "Version": "89e4274cf92540479770a1178cce17ff",
+            "NBF": 1745695048,
+            "EXP": 1745702248
+        },
+        "dataVersion": "1",
+        "metadataVersion": "1",
+        "eventTime": "2025-04-26T19:29:34.4197223Z"
     }
 
     #>
@@ -597,26 +631,25 @@ else {
     else {
 
         # otherwise, it is a new or renew request invoked explicitly from the webhook. We need to extract the parameters from the request body.
-        # TODO: we might use the same CloudEventSchema also for new and renew requests, ie:
+        # TODO: we might use the same EventGridSchema also for new and renew requests, ie:
 
         <#
             {
-                "id": <not used>",
-                "source": "<not used>"",
-                "specversion": "1.0",
-                "type": "Poste.CertLC.NewCertificateRequest",
-                "subject": "<not used>",
-                "time": <not used or actual request time, like: "2025-06-08T19:52:25.1524887Z">
-                "data": {
-                    "Id": "<ticket id>"",
-                    "VaultName": "<keyvault name>",
-                    "CertificateName": "<certificate name>",
-                    "CertificateTemplate": "<certificate template>",
-                    "CertificateSubject": "<certificate subject>",
-                    "CertificateDnsNames": ["<dns name 1>", "<dns name 2>"],
-                    "PfxProtectTo": "<user to protect the PFX file>"
-                }
+
+            "id": "<not used>",
+            "topic": "<not used",
+            "subject": "<not used>",
+            "eventType": "<Customer>.CertLC.NewCertificateRequest",
+            "data": {
+                "Id": "<ticket id>"",
+                "VaultName": "<keyvault name>",
+                "CertificateName": "<certificate name>",
+                "CertificateTemplate": "<certificate template>",
+                "CertificateSubject": "<certificate subject>",
+                "CertificateDnsNames": ["<dns name 1>", "<dns name 2>"],
+                "PfxProtectTo": "<user to protect the PFX file>"
             }
+        }
     #>
 
         $CertLCVersion = $requestBody.CertLCVersion
