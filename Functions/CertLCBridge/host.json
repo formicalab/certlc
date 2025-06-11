@@ -2,8 +2,8 @@
   "version": "2.0",
   "logging": {
     "logLevel": {
-      "default": "Debug",
-      "Function": "Trace"
+      "default": "Information",
+      "Function": "Debug"
     },
     "applicationInsights": {
       "samplingSettings": {

@@ -631,15 +631,17 @@ else {
     else {
 
         # otherwise, it is a new or renew request invoked explicitly from the webhook. We need to extract the parameters from the request body.
-        # TODO: we might use the same EventGridSchema also for new and renew requests, ie:
+        # TODO: we might use the same CloudEventSchema also for new and renew requests, ie:
 
         <#
             {
 
             "id": "<not used>",
-            "topic": "<not used",
+            "source": "<not used",
+            "specversion": "1.0",
+            "type": "<Customer>.CertLC.NewCertificateRequest",
             "subject": "<not used>",
-            "eventType": "<Customer>.CertLC.NewCertificateRequest",
+            "time": "<not used>",
             "data": {
                 "Id": "<ticket id>"",
                 "VaultName": "<keyvault name>",
