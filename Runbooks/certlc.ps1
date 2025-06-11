@@ -12,7 +12,7 @@ using module Az.Resources
 # The key vault is used to generate all requests, storing the private keys safely.
 
 # The script is designed to be run using PowerShell 7.x in an Azure Automation hybrid worker environment.
-# Based on certlc solution https://learn.microsoft.com/en-us/azure/architecture/example-scenario/certificate-lifecycle/
+# Initially based on certlc solution https://learn.microsoft.com/en-us/azure/architecture/example-scenario/certificate-lifecycle/
 
 param
 (
@@ -20,57 +20,60 @@ param
     [object] $WebhookData
 )
 
-# the WebhookData is documented here: https://learn.microsoft.com/en-us/azure/automation/automation-webhooks?tabs=portal
-# Contains:
-# - WebhookData.WebhookName: the name of the webhook that triggered the runbook
-# - WebhookData.RequestHeaders: the headers of the request that triggered the runbook
-# - WebhookData.RequestBody: the body of the request that triggered the runbook
+<#
 
-# Note: using Powershell 7.x, the WebhookData is passed not as a structure but as a string with a wrongly formatted JSON.
-# See the code in Main section for details and workaround.
+The WebhookData is documented here: https://learn.microsoft.com/en-us/azure/automation/automation-webhooks?tabs=portal
+It contains:
+- WebhookData.WebhookName: the name of the webhook that triggered the runbook
+- WebhookData.RequestHeaders: the headers of the request that triggered the runbook
+- WebhookData.RequestBody: the body of the request that triggered the runbook
 
-# We assume to use the followng JSON structure for the RequestBody:
+Note: using Powershell 7.x, the WebhookData is passed not as a structure but as a string and with a wrongly formatted JSON.
+See the code in Main section for details and workaround.
 
-# for NEW CERTIFICATES:
-# {
-#   "CertLCVersion": "1.0",                     # version tag
-#   "Action": "New"                             # action to perform
-#   "VaultName": "string"                       # key vault name
-#   "CertificateName": "string",                # name of the certificate to create or renew
-#   "CertificateTemplate": "string",            # name of the certificate template to use
-#   "CertificateSubject": "string",             # subject of the certificate to create or renew
-#   "CertificateDnsNames": array of strings     # optional, certificate DNS names
-#   "PfxProtectTo": "string"                    # optional, user or group to protect the PFX file (if not specified, the PFX will not be downloaded)
-# }
+We assume that WebhookData.RequestBody is a JSON string using CloudEventSchema.
+For certificate near expiry events, the body has a structure like this:
 
-# for RENEWALS:
-# {
-#   "CertLCVersion": "1.0",                     # version tag
-#   "Action": "Renew"                           # action to perform
-#   "VaultName": "string",                      # key vault name
-#   "CertificateName": "string",                # name of the certificate to renew (it will have the same subject, DNS names, template, and a new private key)
-# }
+{
+  "id": "<event idenfier>",
+  "source": "/subscriptions/<subscriptionid>/resourceGroups/<keyvault resource group>/providers/Microsoft.KeyVault/<key vault name>",
+  "specversion": "1.0",
+  "type": "Microsoft.KeyVault.CertificateNearExpiry",
+  "subject": "<name of the expiring certificate>",
+  "time": "<event time, using format: 2025-06-08T19:52:25.1524887Z>",
+  "data": {
+    "Id": "https://<key vault name>.vault.azure.net/certificates/<certificate name>/<certificate version>",
+    "VaultName": "<key vault name>",
+    "ObjectType": "Certificate",
+    "ObjectName": "<certificate name>",
+    "Version": "<certificate version>",
+    "NBF": 1749411621,  # not before date (epoch time)
+    "EXP": 1749418821   # expiration date (epoch time)
+  }
+}
 
-# for AUTORENEWALS (when the runbook is triggered by event grid events):
-# [
-#   {
-#     "id": "string",                           # event id
-#     "topic": "string",                        # event topic (resource id of the key vault)
-#     "subject": "string",                      # event subject (name of the expiring certificate)
-#     "eventType": "string",                    # event type (Microsoft.KeyVault.CertificateNearExpiry)
-#     "data": {                                 # event data
-#       "Id": "string",                         # resource id of the expiring certificate version
-#       "VaultName": "string",                  # name of the key vault
-#       "ObjectType": "string",                 # object type (Certificate)
-#       "ObjectName": "string",                 # name of the expiring certificate
-#       "Version": "string",                    # version of the expiring certificate
-#       "NBF": "integer",                       # not before date (epoch time)
-#       "EXP": "integer"                        # expiration date (epoch time)
-#       "DataVersion": "string",                # data version (1)
-#       "MetadataVersion": "string",            # metadata version (1)
-#       "EventTime": "string"                   # event time (ISO 8601 format)
-#   }
-#]
+For new certificate requests, the body has a structure like this:
+
+{
+  "id": "<event identifier, free field>",
+  "source": "<free field, can be used to identify the requestor>",
+  "specversion": "1.0",
+  "type": "CertLC.NewCertificateRequest",
+  "subject": "<name of the new certificate>",
+  "time": "<event time, using format: 2025-06-08T19:52:25.1524887Z>",
+  "data": {
+    "Id": "<request id, free field>",
+    "VaultName": "<key vault name>",
+    "ObjectType": "Certificate",
+    "ObjectName": "<name of the new certificate>",
+    "CertificateTemplate": "<certificate template name>",
+    "CertificateSubject": "<certificate subject>",
+    "CertificateDnsNames": [ "<dns name 1>", "<dns name 2>" ],  # optional, can be empty
+    "PfxProtectTo": "<user or group to protect the PFX file>",  # optional, can be empty. If not specified, the PFX will not be downloaded
+  }
+}
+
+#>
 
 # Prohibits references to uninitialized variables
 Set-StrictMode -Version 1.0
@@ -82,35 +85,20 @@ $ErrorActionPreference = "Stop"
 # STATIC SETTINGS #
 ###################
 
-$Version = "1.0"                        # version of the script - must match the version in the webhook body
-
-$LAEnabled = $true                                                                                  # enable Log Analytics ingestion
-$LAIngestionUrl = "https://dce-certlc-shared-itn-001-luwu.italynorth-1.ingest.monitor.azure.com"    # Log Analytics Ingestion: ingestion URL
-$LADCRImmutableId = "dcr-748535390f2943c683e85e12dbda98a1"                                          # Log Analytics Ingestion: Data Collection Rule (DCR) immutable ID
-$LATable = "certlc_CL"                                                                              # Log Analytics Ingestion: custom table name (must include also the _CL suffix)
+$Version = "1.0"                        # version of the script - must match specversion in the webhook body
 
 $AutomationAccountName = "aa-shared-neu-001"        # automation account used to run the script and to store the variables
 $AutomationAccountRG = "rg-shared-neu-001"          # resource group of the automation account
 
-$QueueStorageAccount = "flazstsharedneu001"         # name of the storage account where the queue is located
-$QueueName = "certlc"                               # name of the queue to use for autorenewals
-$QueueAttempts = 10                                 # number of attempts to check the queue
-$QueueWait = 5                                      # seconds to wait between attempts
-$QueueInvisibilityTimeout = [System.TimeSpan]::FromSeconds(30) # seconds to wait for the message to be invisible in the queue when it is being processed
-
+# TODO: where possible, use automation variables instead (see renewcertviakv.ps1). Sample usage:
+#$CA = (Get-AzAutomationVariable -ResourceGroupName $automationAccountRG -AutomationAccountName $automationAccountName -name "certlc-ca").Value
 $CA = "flazdc03.formicalab.casa\SubCA"      # Issuing CA server (must be in the form <servername>\<CAname>)
 $PfxRootFolder = "C:\Temp"                  # root of folder tree where the PFX files will be downloaded
-
-# TODO: where possible, use automation variables instead (see renewcertviakv.ps1). Sample usage:
-#$QueueStorageAccount = (Get-AzAutomationVariable -ResourceGroupName $automationAccountRG -AutomationAccountName $automationAccountName -name "certlc-storageaccount").Value
-#$QueueName = (Get-AzAutomationVariable -ResourceGroupName $automationAccountRG -AutomationAccountName $automationAccountName -name "certlc-queue").Value
-#$CA = (Get-AzAutomationVariable -ResourceGroupName $automationAccountRG -AutomationAccountName $automationAccountName -name "certlc-ca").Value
 
 ####################
 # GLOBAL VARIABLES #
 ####################
 
-$LAToken = $null       # token using to send logs to Log Analytics
 $jobId = $null         # we will use job id as correlation ID for the log entry, or a new guid if running locally
 
 #########################
@@ -125,20 +113,6 @@ function Write-Log {
         [Parameter()]
         [string]$Level = "Information"
     )
-
-    # send log to Log Analytics workspace (if token is available and output to LA is enabled)
-    if ($LAEnabled -and ($null -ne $LAToken)) {
-        $log_entry = @{
-            TimeGenerated = (Get-Date).ToUniversalTime()
-            CorrelationId = $jobId
-            Status        = $Level
-            Message       = $Message
-        }
-        $body = $log_entry | ConvertTo-Json -AsArray
-        $headers = @{"Authorization" = "Bearer $LAToken"; "Content-Type" = "application/json" };
-        $uri = "$LAIngestionUrl/dataCollectionRules/$LADCRImmutableId/streams/Custom-$LATable" + "?api-version=2023-01-01";
-        Invoke-RestMethod -Uri $uri -Method "Post" -Body $body -Headers $headers | Out-Null
-    }
 
     # write to output
     switch ($Level) {
@@ -187,11 +161,15 @@ function New-CertificateRenewalRequest {
         $cert = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName
     }
     catch {
-        throw "Error getting certificate details for $CertificateName from vault: $_"
+        $msg = "Error getting certificate details for $CertificateName from vault $($VaultName): $_"
+        Write-Log $msg -Level "Error"
+        throw $msg
     }
 
     if ($null -eq $cert) {
-        throw "Error getting certificate details for $CertificateName from vault: empty response! It is possible that the certificate was deleted before the renewal process started."
+        $msg = "Error getting certificate details for $CertificateName from vault $($VaultName): empty response! Certificate may not exist in the vault."
+        Write-Log $msg -Level "Error"
+        throw $msg
     }
 
     # get the certificate subject
@@ -209,7 +187,9 @@ function New-CertificateRenewalRequest {
     # get the OID of the Certificate Template
     $oid = $cert.Certificate.Extensions | Where-Object { $_.Oid.FriendlyName -eq "Certificate Template Information" }
     if ($null -eq $oid) {
-        throw "Error getting OID from certificate: Certificate Template Information not found"
+        $msg = "Error getting OID from certificate: Certificate Template Information not found."
+        Write-Log $msg -Level "Error"
+        throw $msg
     }
     # convert in a string like:
     # Template=Flab-ShortWebServer(1.3.6.1.4.1.311.21.8.15431357.2613787.6440092.16459852.14380503.11.12399345.16691736), Major Version Number=100, Minor Version Number=5
@@ -234,7 +214,9 @@ function New-CertificateRenewalRequest {
         New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxRootFolder $PfxRootFolder -PfxProtectTo $PfxProtectTo            
     }
     catch {
-        throw "Error creating certificate request: $_"
+        $msg = "Error creating certificate request for $($CertificateName): $_"
+        Write-Log $msg -Level "Error"
+        throw $msg
     }   
 }
 
@@ -485,15 +467,7 @@ catch {
 # set and store context
 $AzureContext = Set-AzContext -SubscriptionName $AzureConnection.Subscription -DefaultProfile $AzureConnection
 
-# get a token for the ingestion endpoint if Log Analytics ingestion is enabled
-if ($LAEnabled) {
-    Write-Log "Getting token for ingestion endpoint..."
-    $secureToken = (Get-AzAccessToken -ResourceUrl "https://monitor.azure.com/.default"-AsSecureString ).Token
-    $LAToken = ConvertFrom-SecureString -SecureString $secureToken -AsPlainText
-    $secureToken = $null
-}
-
-# Check if the script is running on Azure or on hybrid worker
+# Check if the script is running on Azure or on hybrid worker; assign jobId accordingly.
 # https://rakhesh.com/azure/azure-automation-powershell-variables/
 if ($env:AZUREPS_HOST_ENVIRONMENT -eq "AzureAutomation/") {
     # We are in a Hybrid Runbook Worker
@@ -514,321 +488,163 @@ else {
 }
 
 # Parse the webhook data
-# Note that, using Powershell 7.x, the WebhookData is passed not as a structure but as a string
-# We have different cases:
-# - WebhookData is null or empty: the runbook is not called from a webhook but it was started manually. In this case we assume action is 'autorenew', so that we can check if there are requests pending in the queue
-# - WebhookData is not null or empty: the runbook is called from a webhook. We need to parse the request body and extract the parameters.
 
 if ([string]::IsNullOrEmpty($WebhookData)) {
-    Write-Log "WebhookData missing or empty: assuming autorenew action..."
-    $Action = "autorenew"
+    $msg = "WebhookData missing or empty! Ensure the runbook is called from a webhook!"
+    Write-Log $msg -level "Error"
+    throw $msg
 }
 
-else {
+Write-Log "WebhookData received is: $($WebhookData)"
 
-    Write-Log "WebhookData received is: $($WebhookData)"
-    
-    # using Powershell 7.x, the WebhookData string contains a wrongly formatted JSON...
-    # (see https://learn.microsoft.com/en-us/azure/automation/automation-webhooks?tabs=portal#create-a-webhook)
-    # such as: 
-    #
-    # {WebhookName:certlc,RequestBody:{"CertLCVersion":"1.0","Action":"renew","VaultName":"<vaultname>","CertificateName":"<certificatename>"},RequestHeader:{Accept-Encoding:gzip,Host:<webhook uri>,User-Agent:Mozilla/5.0,x-ms-request-id:<guid>}}
-    #
-    # The problem is that WebhookName, RequestBody and RequestHeader are not enclosed in double quotes.
-    # We try to parse the JSON but, if it fails, we 'manually' extract the RequestBody via regex and convert it from JSON to object.
+<#
 
-    # Try to parse WebhookData as JSON first
-    try {
-        $request = ConvertFrom-Json -InputObject $WebhookData
-        $requestBody = $request.RequestBody
-    }
-    catch {
-        # Fallback to regex extraction for broken 
+Using Powershell 7.x, the WebhookData string contains a wrongly formatted JSON...
+(see https://learn.microsoft.com/en-us/azure/automation/automation-webhooks?tabs=portal#create-a-webhook)
+such as: 
+{WebhookName:certlc,RequestBody:{"id":"e1a6f79d-fed0-4e2c-80a6-3cfd09ee3b13","source":"/subscriptions/...etc
 
-        # The following regex matches these cases:
-        # - RequestBody is enclosed in double quotes (valid case):   "RequestBody":"{...}"
-        # - RequestBody is not enclosed in double quotes (invalid case):   RequestBody:{...}
-        # - After RequestBody there is an array:  RequestBody:[{...}] or "RequestBody":[{...},{...}]
+The problem here is that WebhookName, RequestBody and RequestHeader are not enclosed in double quotes.
+We try to parse the JSON but, if it fails, we 'manually' extract the RequestBody via regex and convert it from JSON to object.
 
-        Write-Log "Failed to parse WebhookData as JSON. Attempting to extract RequestBody using regex..." -Level "Warning"
+#>
 
-        if ($WebhookData -match '"?RequestBody"?\s*:\s*((?:{([^{}]|(?<open>{)|(?<-open>}))*(?(open)(?!))})|(?:\[([^\[\]]|(?<open>\[)|(?<-open>\]))*(?(open)(?!))\]))') {
-            $jsonRequestBody = $matches[1]
-            try {
-                $requestBody = ConvertFrom-Json -InputObject $jsonRequestBody
-            }
-            catch {
-                $msg = "Failed to parse WebhookData.RequestBody using regex, error: $_"
-                Write-Log $msg -Level "Error"
-                throw $msg
-            }
+# Try to parse WebhookData as JSON first
+try {
+    $request = ConvertFrom-Json -InputObject $WebhookData
+    $requestBody = $request.RequestBody
+}
+catch {
+    # Fallback to regex extraction for broken format. The following regex matches these cases:
+    # - RequestBody is enclosed in double quotes (valid case):   "RequestBody":"{...}"
+    # - RequestBody is not enclosed in double quotes (invalid case):   RequestBody:{...}
+    # - After RequestBody there is an array:  RequestBody:[{...}] or "RequestBody":[{...},{...}]
+    # The regex properly handles nested JSON objects, checking that braces are balanced.
+
+    Write-Log "Failed to parse WebhookData as JSON. Attempting to extract RequestBody using regex..." -Level "Warning"
+
+    if ($WebhookData -match '"?RequestBody"?\s*:\s*((?:{([^{}]|(?<open>{)|(?<-open>}))*(?(open)(?!))})|(?:\[([^\[\]]|(?<open>\[)|(?<-open>\]))*(?(open)(?!))\]))') {
+        $jsonRequestBody = $matches[1]
+        try {
+            $requestBody = ConvertFrom-Json -InputObject $jsonRequestBody -Depth 10
         }
-        else {
-            $msg = "WebhookData.RequestBody not recognized using regex!"
+        catch {
+            $msg = "Failed to parse WebhookData.RequestBody using regex, error: $_"
             Write-Log $msg -Level "Error"
             throw $msg
         }
     }
-    if ([string]::IsNullOrEmpty($requestBody)) {
-        $msg = "WebhookData.RequestBody is empty! Ensure the runbook is called from a webhook!"
+    else {
+        $msg = "WebhookData.RequestBody not recognized using regex!"
         Write-Log $msg -Level "Error"
         throw $msg
     }
+}
 
-    <# in case the request arrives from Event Grid, the body has a structure like this (assuming CloudEventSchema is used):
+if ([string]::IsNullOrEmpty($requestBody)) {
+    $msg = "WebhookData.RequestBody is empty! Ensure the runbook is called from a webhook!"
+    Write-Log $msg -Level "Error"
+    throw $msg
+}
 
-    {
-        "id": "51739d81-c68c-436b-a28c-52ebe1ebb37f",
-        "source": "/subscriptions/<guid>/resourceGroups/<rg>/providers/Microsoft.KeyVault/vaults/<keyvault>",
-        "specversion": "1.0",
-        "type": "Microsoft.KeyVault.CertificateNearExpiry",
-        "subject": "mycert05",
-        "time": "2025-06-08T17:45:12.2205855Z",
-        "data": {
-            "Id": "https://<keyvault>.vault.azure.net/certificates/mycert05/<version>",
-            "VaultName": "<keyvault>",
-            "ObjectType": "Certificate",
-            "ObjectName": "mycert05",
-            "Version": "<version>",
-            "NBF": 1749403975,
-            "EXP": 1749411175
+# now that we have a valid requestBody, check some fields and detect request type
+
+# check version
+if ($requestBody.specversion -ne $Version) {
+    $msg = "The version specified in the request, $($requestBody.specversion), does not match the script version $Version!"
+    Write-Log $msg -Level "Error"
+    throw $msg
+}
+else {
+    Write-Log "specversion: $($requestBody.specversion)"
+}
+
+# process requests based on type
+
+if (-not $requestBody.type) {
+    $msg = "Missing or empty mandatory parameter: 'type' in request body!"
+    Write-Log $msg -Level "Error"
+    throw $msg
+}
+else {
+    Write-Log "Request type: $($requestBody.type)"
+}
+
+switch ($requestBody.type) {
+
+    "Microsoft.KeyVault.CertificateNearExpiry" {
+        $VaultName = $requestBody.data.VaultName
+        $CertificateName = $requestBody.data.ObjectName
+
+        if ([string]::IsNullOrEmpty($VaultName)) {
+            $msg = "Missing or empty mandatory parameter: 'data.VaultName' in request body!"
+            Write-Log $msg -Level "Error"
+            throw $msg
         }
-    }
 
-    If, instead, the EventGridSchema is used, the body has a structure like this:
-
-    {
-        "id": "1af41fa2-54b2-4b03-ba46-f5088ba709c7",
-        "topic": "/subscriptions/4a570962-701a-475e-bf5b-8dc76ec748ff/resourceGroups/rg-shared-neu-001/providers/Microsoft.KeyVault/vaults/flazkv-shared-neu-001",
-        "subject": "mycert13",
-        "eventType": "Microsoft.KeyVault.CertificateNearExpiry",
-        "data": {
-            "Id": "https://flazkv-shared-neu-001.vault.azure.net/certificates/mycert13/89e4274cf92540479770a1178cce17ff",
-            "VaultName": "flazkv-shared-neu-001",
-            "ObjectType": "Certificate",
-            "ObjectName": "mycert13",
-            "Version": "89e4274cf92540479770a1178cce17ff",
-            "NBF": 1745695048,
-            "EXP": 1745702248
-        },
-        "dataVersion": "1",
-        "metadataVersion": "1",
-        "eventTime": "2025-04-26T19:29:34.4197223Z"
-    }
-
-    #>
-    
-    if ($requestBody.type -eq "Microsoft.KeyVault.CertificateNearExpiry") {
-
-        # if we have an eventType field with a value of Microsoft.KeyVault.CertificateNearExpiry, we need to extract the VaultName and ObjectName from the data field
-        # and set the Action to autorenew. The CertLCVersion is not present in this case.
-
-        $Action = "autorenew"
-        $VaultName = $requestBody.data.VaultName            # we preset this, but it will be overwritten by the queue message since we need to process the queue in any case
-        $CertificateName = $requestBody.data.ObjectName     # we preset this, but it will be overwritten by the queue message since we need to process the queue in any case
-        Write-Log "WebhookData is an Event Grid event. Setting Action to 'autorenew' for certificate $($CertificateName) in vault $($VaultName)..."
-    }
-    else {
-
-        # otherwise, it is a new or renew request invoked explicitly from the webhook. We need to extract the parameters from the request body.
-        # TODO: we might use the same CloudEventSchema also for new and renew requests, ie:
-
-        <#
-            {
-
-            "id": "<not used>",
-            "source": "<not used",
-            "specversion": "1.0",
-            "type": "<Customer>.CertLC.NewCertificateRequest",
-            "subject": "<not used>",
-            "time": "<not used>",
-            "data": {
-                "Id": "<ticket id>"",
-                "VaultName": "<keyvault name>",
-                "CertificateName": "<certificate name>",
-                "CertificateTemplate": "<certificate template>",
-                "CertificateSubject": "<certificate subject>",
-                "CertificateDnsNames": ["<dns name 1>", "<dns name 2>"],
-                "PfxProtectTo": "<user to protect the PFX file>"
-            }
+        if ([string]::IsNullOrEmpty($CertificateName)) {
+            $msg = "Missing or empty mandatory parameter: 'data.ObjectName' in request body!"
+            Write-Log $msg -Level "Error"
+            throw $msg
         }
-    #>
 
-        $CertLCVersion = $requestBody.CertLCVersion
-        $Action = $requestBody.Action
-        $VaultName = $requestBody.VaultName
+        # invoke renwal without passing Pfx parameters (autorenew will not download the certificate to a local file)
+        New-CertificateRenewalRequest -VaultName $VaultName -CertificateName $CertificateName -CA $CA
+    }
+
+    "CertLC.NewCertificateRequest" {
         $CertificateName = $requestBody.CertificateName
         $CertificateTemplate = $requestBody.CertificateTemplate
         $CertificateSubject = $requestBody.CertificateSubject
         $CertificateDnsNames = $requestBody.CertificateDnsNames
         $PfxProtectTo = $requestBody.PfxProtectTo
 
-        # check version
-        if ($CertLCVersion -ne $Version) {
-            $msg = "CertLCVersion $CertLCVersion does not match the script version $Version!"
+        if ([string]::IsNullOrEmpty($CertificateName)) {
+            $msg = "Missing or empty mandatory parameter: 'data.CertificateName' in request body!"
             Write-Log $msg -Level "Error"
             throw $msg
+        }
+
+        if ([string]::IsNullOrEmpty($CertificateTemplate)) {
+            $msg = "Missing or empty mandatory parameter: 'data.CertificateTemplate' in request body!"
+            Write-Log $msg -Level "Error"
+            throw $msg
+        }
+
+        if ([string]::IsNullOrEmpty($CertificateSubject)) {
+            $msg = "Missing or empty mandatory parameter: 'data.CertificateSubject' in request body!"
+            Write-Log $msg -Level "Error"
+            throw $msg
+        }
+
+        # DnsNames (optional, but if specified, must be an array)
+        if ($CertificateDnsNames -and $CertificateDnsNames -isnot [array]) {
+            $msg = "Parameter 'CertificateDnsNames' is not an array!"
+            Write-Log $msg -Level "Error"
+            throw $msg
+        }
+
+        # process the new certificate request
+
+        if ($null -ne $CertificateDnsNames) {
+            Write-Log "Performing new certificate request for certificate $CertificateName using vault $VaultName, template $CertificateTemplate, subject $CertificateSubject, DNS names $($CertificateDnsNames -join ', ')..."
         }
         else {
-            Write-Log "CertLCVersion: $CertLCVersion"
+            Write-Log "Performing new certificate request for certificate $CertificateName using vault $VaultName, template $CertificateTemplate, subject $CertificateSubject..."
         }
 
-        if ([string]::IsNullOrEmpty($Action)) {
-            $msg = "Missing or empty mandatory parameter: 'Action'"
-            Write-Log $msg -Level "Error"
-            throw $msg
-        }
-        $Action = $Action.ToLower()
-        if ($Action -ne "new" -and $Action -ne "renew") {
-            $msg = "Invalid value for 'Action': $Action. Must be 'New' or 'Renew'!"
-            Write-Log $msg -Level "Error"
-            throw $msg
-        }
-
-        # check mandatory parameters for both new and renew requests
-        if ([string]::IsNullOrEmpty($VaultName)) {
-            $msg = "Missing or empty mandatory parameter: 'VaultName'"
-            Write-Log $msg -Level "Error"
-            throw $msg
-        }
-        if ([string]::IsNullOrEmpty($CertificateName)) {
-            $msg = "Missing or empty mandatory parameter: 'CertificateName'"
-            Write-Log $msg -Level "Error"
-            throw $msg
-        }
-    }
-}
-
-####################
-# MAIN - AUTORENEW #
-####################
-
-if ($Action -eq "autorenew") {
-
-    try {
-        $ctx = New-AzStorageContext -StorageAccountName $QueueStorageAccount -UseConnectedAccount        
-    }
-    catch {
-        $msg = "Error creating a context to work with storage account $($QueueStorageAccount): $_"
-        Write-Log $msg -Level "Error"
-        throw $msg
-    }
-    
-    # wait until the queue has messages for a maximum of $QueueAttempts
-    Write-Log "Performing autorenew: waiting for messages in the queue $QueueName..."
-    try {
-        for ($i = 0; $i -lt $QueueAttempts; $i++) {
-            Write-Log "Checking the queue (attempt $($i+1) of $QueueAttempts)..."
-            $queue = Get-AzStorageQueue -Name $QueueName -Context $ctx
-            Write-Log ("Queued messages: " + $queue.ApproximateMessageCount)
-    
-            if ($queue.ApproximateMessageCount -gt 0) {
-                break
-            }
-            else {
-                Write-Log "Queue is empty: going to sleep for $QueueWait seconds before checking again..." -Level "Warning"
-                Start-Sleep -Seconds $QueueWait
-            }
-        }
-        if ($i -eq $QueueAttempts) {
-            $msg = "No messages in the queue after $QueueAttempts attempts. Exiting."
-            Write-Log $msg -Level "Error"
-            throw $msg
-        }        
-    }
-    catch {
-        $msg = "Error getting the queue: $_"
-        Write-Log $msg -Level "Error"
-        throw $msg
-    }
-    
-    # process the messages in the queue
-    while ($queueMessage = $queue.QueueClient.ReceiveMessage($QueueInvisibilityTimeout)) {
-
-        if (-not $queueMessage.Value) {
-            Write-Log "No more messages in the queue. Exiting."
-            break
-        }
-    
         try {
-            # decode body of the message from base64 and parse the message
-            $messageText = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($queueMessage.value.MessageText))   
-            $message = ConvertFrom-Json -InputObject $messageText
-        
-            $VaultName = $message.data.VaultName
-            $CertificateName = $message.data.ObjectName
-            
-            # invoke renwal without passing Pfx parameters (autorenew will not download the certificate to a local file)
-            New-CertificateRenewalRequest -VaultName $VaultName -CertificateName $CertificateName -CA $CA
+            New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxRootFolder $PfxRootFolder -PfxProtectTo $PfxProtectTo             
         }
         catch {
-            Write-Log "Error processing message: $_" -Level "Warning"
-            continue    # continue to the next message in the queue
-        }
-        finally {
-            # Make sure the message is deleted from the queue even if there is an error
-            # If the message is not deleted, it will be visible again after the invisibility timeout
-            Write-Log "Deleting message from the queue..."
-            $queue.QueueClient.DeleteMessage($queueMessage.Value.MessageId, $queueMessage.Value.PopReceipt) | Out-Null
+            $msg = "Error processing new certificate request: $_"
+            Write-Log $msg -Level "Error"
+            throw $msg
         }
     }
-}
 
-##################
-# MAIN - (RENEW) #
-##################
-
-elseif ($Action -eq "renew" ) {
-
-    # process the renewal request
-    Write-Log "Performing certificate renew request for $CertificateName using $VaultName..."
-    try {
-        New-CertificateRenewalRequest -VaultName $VaultName -CertificateName $CertificateName -CA $CA -PfxRootFolder $PfxRootFolder -PfxProtectTo $PfxProtectTo            
-    }
-    catch {
-        $msg = "Error processing renewal request: $_"
-        Write-Log $msg -Level "Error"
-        throw $msg
-    }
-}
-
-################
-# MAIN - (NEW) #
-################
-
-else {
-
-    # check additional required parameters for new certificate requests: template
-    if ([string]::IsNullOrEmpty($CertificateTemplate)) {
-        $msg = "Missing or empty mandatory parameter: 'CertificateTemplate'"
-        Write-Log $msg -Level "Error"
-        throw $msg
-    }   
-    # subject
-    if ([string]::IsNullOrEmpty($CertificateSubject)) {
-        $msg = "Missing or empty mandatory parameter: 'CertificateSubject'"
-        Write-Log $msg -Level "Error"
-        throw $msg
-    }
-    # DnsNames (optional, but if specified, must be an array)
-    if ($CertificateDnsNames -and $CertificateDnsNames -isnot [array]) {
-        $msg = "Parameter 'CertificateDnsNames' is not an array!"
-        Write-Log $msg -Level "Error"
-        throw $msg
-    }
-    if ($null -ne $CertificateDnsNames) {
-        Write-Log "Performing new certificate request for certificate $CertificateName using vault $VaultName, template $CertificateTemplate, subject $CertificateSubject, DNS names $($CertificateDnsNames -join ', ')..."
-    }
-    else {
-        Write-Log "Performing new certificate request for certificate $CertificateName using vault $VaultName, template $CertificateTemplate, subject $CertificateSubject..."
-    }
-
-    # process the new certificate request
-    try {
-        New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxRootFolder $PfxRootFolder -PfxProtectTo $PfxProtectTo             
-    }
-    catch {
-        $msg = "Error processing new request: $_"
+    default {
+        $msg = "Unknown request type: $($requestBody.type). Supported values are: Microsoft.KeyVault.CertificateNearExpiry, CertLC.NewCertificateRequest!"
         Write-Log $msg -Level "Error"
         throw $msg
     }
