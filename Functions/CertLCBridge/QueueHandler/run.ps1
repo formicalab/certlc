@@ -1,18 +1,12 @@
-# Input bindings are passed in via param block.
-param([object] $QueueItem, $TriggerMetadata)
+<#
 
-# The function runtime automatically decodes the message from base64
-# and parses the resulting JSON into a PowerShell object (Hashtable) before passing it to your run.ps1.
-# This allows picking up message properties directly from the $QueueItem object, for example: $QueueItem.id
+Input bindings are passed in via param block.
 
-#$triggerMetadata is not used in this example, it can provide additional context about the event trigger
-# (see https://learn.microsoft.com/en-us/azure/azure-functions/functions-reference-powershell?tabs=portal#triggermetadata-parameter)
+$QueueItem: the function runtime automatically decodes the message from base64.
+If the function framework correctly recognizes it as a JSON message, it also converts it to PowerShell object (System.Management.Automation.OrderedHashtable)
+Otherwise, it will be passed as a string.
 
-
-# However, since we need to forward the message to an Automation Webhook, we need to convert the QueueItem back to JSON
-$jsonQueueItem = $QueueItem | ConvertTo-Json -Depth 10 -Compress
-
-<# The JSON message is a CloudEventSchema event, which has the following format:
+The JSON message in $QueueItem is a CloudEventSchema event, which has the following format:
 
 {
   "id": "f36c5d73-a559-480d-b131-202c16c1c024",
@@ -34,9 +28,25 @@ $jsonQueueItem = $QueueItem | ConvertTo-Json -Depth 10 -Compress
 
 #>
 
+param([object] $QueueItem, $TriggerMetadata)
+
+# Prohibits references to uninitialized variables
+Set-StrictMode -Version 1.0
+
+# Ensure the script stops on errors so that try/catch can be used to handle them
+$ErrorActionPreference = "Stop"
+
+# check if $QueueItem is a string, if so, something went wrong with the JSON deserialization
+if ($QueueItem -is [string]) {
+    Write-Error "Queue item is a string, expected a PowerShell object. This usually means the JSON deserialization failed. Check the string: $QueueItem"
+}
+
+# convert back to JSON to show the full message for debugging purposes and, later, to forward it to the webhook
+$jsonQueueItem = $QueueItem | ConvertTo-Json -Depth 10 -Compress
+
 # Write out the queue message and metadata to the information log.
-Write-Information "CERTLC: received an event of type: $($QueueItem.type)"
-Write-Information "CERTLC: full message converted back to JSON is: $jsonQueueItem"
+Write-Information "CERTLC: full message received is: $jsonQueueItem"
+Write-Information "CERTLC: event type: $($QueueItemObj.type)"
 Write-Information "Queue item expiration time: $($TriggerMetadata.ExpirationTime)"
 Write-Information "Queue item insertion time: $($TriggerMetadata.InsertionTime)"
 Write-Information "Queue item next visible time: $($TriggerMetadata.NextVisibleTime)"
@@ -50,8 +60,8 @@ if (-not $webhookUrl) {
     Write-Error "AutomationWebhookUrl is not set in the environment variables."
 }
 
-# Invoke the webhook. The $jsonEvent will become WebhookData.RequestBody in runbook
-Write-Information "Forwarding this payload to Automation Webhook:`n$jsonQueueItem"
+# Invoke the webhook. The $QueueItem will become WebhookData.RequestBody in runbook
+Write-Information "Forwarding this payload to Automation Webhook..."
 
 try {
     $response = Invoke-RestMethod -Uri $webhookUrl -Method Post -Body $jsonQueueItem -ContentType 'application/json'

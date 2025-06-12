@@ -423,7 +423,7 @@ function New-CertificateRequest {
             }           
         }
         
-        Write-Log "Per-user PFX folder verified: $PfxTargetFolder"
+        Write-Log "Per-user PFX folder verified for PfxProtectTo $($PfxProtectTo): $PfxTargetFolder"
       
         # download the certificate to a local file in the per-user folder
         $pfxFile = Join-Path -Path $PfxTargetFolder -ChildPath "$($CertificateName).pfx"
@@ -435,7 +435,7 @@ function New-CertificateRequest {
             Export-PfxCertificate -Cert $x509Cert -FilePath $pfxFile -ProtectTo $PfxProtectTo | Out-Null
         }
         catch {
-            throw "Error exporting certificate to PFX: $_"
+            throw "Error exporting certificate to PFX protecting it to $($PfxProtectTo): $_"
         }
         finally {
             $certBase64 = $null
@@ -593,11 +593,18 @@ switch ($requestBody.type) {
     }
 
     "CertLC.NewCertificateRequest" {
-        $CertificateName = $requestBody.CertificateName
-        $CertificateTemplate = $requestBody.CertificateTemplate
-        $CertificateSubject = $requestBody.CertificateSubject
-        $CertificateDnsNames = $requestBody.CertificateDnsNames
-        $PfxProtectTo = $requestBody.PfxProtectTo
+        $VaultName = $requestBody.data.VaultName
+        $CertificateName = $requestBody.data.ObjectName
+        $CertificateTemplate = $requestBody.data.CertificateTemplate
+        $CertificateSubject = $requestBody.data.CertificateSubject
+        $CertificateDnsNames = $requestBody.data.CertificateDnsNames
+        $PfxProtectTo = $requestBody.data.PfxProtectTo
+
+        if ([string]::IsNullOrEmpty($VaultName)) {
+            $msg = "Missing or empty mandatory parameter: 'data.VaultName' in request body!"
+            Write-Log $msg -Level "Error"
+            throw $msg
+        }
 
         if ([string]::IsNullOrEmpty($CertificateName)) {
             $msg = "Missing or empty mandatory parameter: 'data.CertificateName' in request body!"
@@ -622,6 +629,14 @@ switch ($requestBody.type) {
             $msg = "Parameter 'CertificateDnsNames' is not an array!"
             Write-Log $msg -Level "Error"
             throw $msg
+        }
+
+        # remove all escape backslashes from PfxProtectTo, ensuring that only one backslash is present
+        if ($PfxProtectTo -and $PfxProtectTo -match '\\') {
+            Write-Log "PfxProtectTo contains backslashes: $PfxProtectTo"
+            # replace multiple backslashes with a single one
+            $PfxProtectTo = $PfxProtectTo -replace '\\+', '\'
+            Write-Log "PfxProtectTo after removing extra backslashes: $PfxProtectTo"
         }
 
         # process the new certificate request
