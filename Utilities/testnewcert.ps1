@@ -98,9 +98,14 @@ else {
 
   try {
     $response = Invoke-RestMethod -Uri $AutomationWebhookUrl -Method Post -Body $json -ContentType 'application/json'
-    Write-Host "Webhook invoked successfully. Response from Automation Account is: $($response | ConvertTo-Json -Depth 3)"
+    Write-Host "Webhook invoked successfully. Response status: $($response.StatusCode)"
   }
   catch {
-    Write-Error "Failed to invoke webhook. $_"
+    if ($_.ErrorDetails.Message) {
+      Write-Warning $_.ErrorDetails.Message
+    }
+    else {
+      Write-Warning $_
+    }
   }
 }
