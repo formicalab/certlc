@@ -92,6 +92,10 @@ else {
   
   Write-Host "Using Automation Webhook."
 
+  # convert to object and convert back to JSON with -Compress in order to remove any formatting issues
+  $jsonObject = $json | ConvertFrom-Json -Depth 10
+  $json = $jsonObject | ConvertTo-Json -Depth 10 -Compress
+
   try {
     $response = Invoke-RestMethod -Uri $AutomationWebhookUrl -Method Post -Body $json -ContentType 'application/json'
     Write-Host "Webhook invoked successfully. Response from Automation Account is: $($response | ConvertTo-Json -Depth 3)"
