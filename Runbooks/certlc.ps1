@@ -17,11 +17,14 @@ using module Az.Resources
 param
 (
     [Parameter(Mandatory = $false)]
-    [object] $WebhookData
+    [object] $WebhookData,
+    [Parameter(Mandatory = $false)]
+    [object] $jsonRequestBody
 )
 
 <#
 
+When invoked from a webhook, the runbook receives the WebhookData parameter.
 The WebhookData is documented here: https://learn.microsoft.com/en-us/azure/automation/automation-webhooks?tabs=portal
 It contains:
 - WebhookData.WebhookName: the name of the webhook that triggered the runbook
@@ -72,6 +75,13 @@ For new certificate requests, the body has a structure like this:
     "PfxProtectTo": "<user or group to protect the PFX file>",  # optional, can be empty. If not specified, the PFX will not be downloaded
   }
 }
+
+You can also pass the RequestBody parameter explicitly, which must be a JSON string with the same structure as above.
+In this case, use the Start-AzAutomationRunbook cmdlet to start the runbook, passing the jsonRequestBody parameter:
+
+Start-AzAutomationRunbook -Name "certlc" -Parameters @{ 'jsonRequestBody'=$jsonRequestBody }
+
+Where $jsonRequestBody is a JSON string containing the RequestBody (the same as WebhookData.RequestBody when the webhook is used).
 
 #>
 
@@ -173,7 +183,7 @@ function New-CertificateRenewalRequest {
         # Transform it into an array of DNS names using regex; remove the "DNS Name=" prefix and split by comma
         $CertificateDnsNames = ($san.Format(0) -replace 'DNS Name=', '').Split(',').Trim() | Where-Object { $_ -ne "" }
     }
-        
+
     # get the OID of the Certificate Template
     $oid = $cert.Certificate.Extensions | Where-Object { $_.Oid.FriendlyName -eq "Certificate Template Information" }
     if ($null -eq $oid) {
@@ -182,7 +192,7 @@ function New-CertificateRenewalRequest {
     # convert in a string like:
     # Template=Flab-ShortWebServer(1.3.6.1.4.1.311.21.8.15431357.2613787.6440092.16459852.14380503.11.12399345.16691736), Major Version Number=100, Minor Version Number=5
     $oid = $oid.Format(0)
-    
+
     # extract the template name and the ASN.1 values using regex
     $CertificateTemplate = $oid -replace '.*Template=(.*)\(.*\).*', '$1'
     $CertificateTemplateASN = $oid -replace '.*\((.*)\).*', '$1'
@@ -197,10 +207,10 @@ function New-CertificateRenewalRequest {
     else {
         Write-Log "Certificate DNS Names: $($CertificateDnsNames -join ', ')"
     }
-    
+
     # Now we have all the details to create the renew request.
     # Renew actually uses same code as New-CertificateRequest, so we can reuse it.
-    # Exceptions will be caught directly in the main section of the script   
+    # Exceptions will be caught directly in the main section of the script
      New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxProtectTo $PfxProtectTo
 }
 
@@ -264,9 +274,9 @@ function New-CertificateRequest {
     catch {
         throw "Error generating CSR in Key Vault: $_"
     }
-    
+
     # see https://www.sysadmins.lv/blog-en/introducing-to-certificate-enrollment-apis-part-3-certificate-request-submission-and-response-installation.aspx
-    
+
     # CR_IN_BASE64HEADER = 0x0,
     # CR_IN_BASE64 = 0x1,
     # CR_IN_BINARY = 0x2,
@@ -279,7 +289,7 @@ function New-CertificateRequest {
     try {
         $CertRequest = New-Object -ComObject CertificateAuthority.Request
         $CertRequestStatus = $CertRequest.Submit(0x1, $csr, "CertificateTemplate:$($CertificateTemplate)", $CA)
-        
+
         # status is described in https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-wcce/c084a3e3-4df3-4a28-9a3b-6b08487b04f3?redirectedfrom=MSDN
 
         switch ($CertRequestStatus) {
@@ -290,7 +300,7 @@ function New-CertificateRequest {
                 Write-Log "Certificate Request submitted successfully."
                 # https://learn.microsoft.com/en-us/windows/win32/api/certcli/nf-certcli-icertrequest-getcertificate?redirectedfrom=MSDN
                 # 0 = CR_OUT_BASE64HEADER (BASE64 format with begin/end header - this is how the key vault expects the certificate in order to perform a merge)
-                $CertEncoded = $CertRequest.GetCertificate(0x0)   
+                $CertEncoded = $CertRequest.GetCertificate(0x0)
                 Write-Log "Certificate received from CA."
             }
             5 {
@@ -325,7 +335,7 @@ function New-CertificateRequest {
         Remove-Item -Path $CertEncodedFile -Force -ErrorAction SilentlyContinue
     }
     Write-Log "Certificate imported into the key vault."
-    
+
     # if required, download the certificate to a local file in the pfx folder
     if (-not [string]::IsNullOrEmpty($PfxProtectTo)) {
 
@@ -349,7 +359,7 @@ function New-CertificateRequest {
         }
 
         # build full target folder path  (root folder\username)
-        $PfxTargetFolder = Join-Path -Path $PfxRootFolder -ChildPath $principal 
+        $PfxTargetFolder = Join-Path -Path $PfxRootFolder -ChildPath $principal
 
         # create the target folder if it does not exist
         if (-not (Test-Path -Path $PfxTargetFolder)) {
@@ -381,11 +391,11 @@ function New-CertificateRequest {
             }
             catch {
                 throw "Error setting permissions on the target folder for PFX $($PfxTargetFolder): $_"
-            }           
+            }
         }
-        
+
         Write-Log "Target folder for PFX verified for PfxProtectTo $($PfxProtectTo): $PfxTargetFolder"
-      
+
         # download the certificate to a local file in the target folder
         $pfxFile = Join-Path -Path $PfxTargetFolder -ChildPath "$($CertificateName).pfx"
         Write-Log "Exporting the $CertificateName certificate to PFX file: $pfxFile"
@@ -448,69 +458,92 @@ else {
     Write-Log "Runbook running with locally-generated job id $jobId in local environment on $($env:COMPUTERNAME)."
 }
 
-# Parse the webhook data
+# Check if we have the jsonRequestBody parameter
+if ([string]::IsNullOrEmpty($jsonRequestBody)) {
 
-if ([string]::IsNullOrEmpty($WebhookData)) {
-    $msg = "WebhookData missing or empty! Ensure the runbook is called from a webhook!"
-    Write-Log $msg -level "Error"
-    throw $msg
-}
+    # No explicit RequestBody parameter, so we will use WebhookData
+    # Try to parse the webhook data
 
-Write-Log "WebhookData received is: $($WebhookData)"
+    if ([string]::IsNullOrEmpty($WebhookData)) {
+        $msg = "Both RequestBody and WebhookData parameters are missing or empty! Call the runbook from a webhook or pass the RequestBody parameter explicitly with Start-AzAutomationRunbook!"
+        Write-Log $msg -level "Error"
+        throw $msg
+    }
 
-<#
+    Write-Log "WebhookData received is: $($WebhookData)"
 
-Using Powershell 7.x, the WebhookData string contains a wrongly formatted JSON...
-(see https://learn.microsoft.com/en-us/azure/automation/automation-webhooks?tabs=portal#create-a-webhook)
-such as: 
-{WebhookName:certlc,RequestBody:{"id":"e1a6f79d-fed0-4e2c-80a6-3cfd09ee3b13","source":"/subscriptions/...etc
+    <#
 
-The problem here is that WebhookName, RequestBody and RequestHeader are not enclosed in double quotes.
-We try to parse the JSON but, if it fails, we 'manually' extract the RequestBody via regex and convert it from JSON to object.
+    Using Powershell 7.x, the WebhookData string contains a wrongly formatted JSON...
+    (see https://learn.microsoft.com/en-us/azure/automation/automation-webhooks?tabs=portal#create-a-webhook)
+    such as:
+    {WebhookName:certlc,RequestBody:{"id":"e1a6f79d-fed0-4e2c-80a6-3cfd09ee3b13","source":"/subscriptions/...etc
 
-#>
+    The problem here is that WebhookName, RequestBody and RequestHeader are not enclosed in double quotes.
+    We try to parse the JSON but, if it fails, we 'manually' extract the RequestBody via regex and convert it from JSON to object.
 
-# Try to parse WebhookData as JSON first
-try {
-    $request = ConvertFrom-Json -InputObject $WebhookData
-    $requestBody = $request.RequestBody
-}
-catch {
-    # Fallback to regex extraction for broken format. The following regex matches these cases:
-    # - RequestBody is enclosed in double quotes (valid case):   "RequestBody":"{...}"
-    # - RequestBody is not enclosed in double quotes (invalid case):   RequestBody:{...}
-    # - After RequestBody there is an array:  RequestBody:[{...}] or "RequestBody":[{...},{...}]
-    # The regex properly handles nested JSON objects, checking that braces are balanced.
+    #>
 
-    Write-Log "Failed to parse WebhookData as JSON. Attempting to extract RequestBody using regex..." -Level "Warning"
+    # Try to parse WebhookData as JSON first
+    try {
+        $request = ConvertFrom-Json -InputObject $WebhookData
+        $requestBody = $request.RequestBody
+    }
+    catch {
+        # Fallback to regex extraction for broken format. The following regex matches these cases:
+        # - RequestBody is enclosed in double quotes (valid case):   "RequestBody":"{...}"
+        # - RequestBody is not enclosed in double quotes (invalid case):   RequestBody:{...}
+        # - After RequestBody there is an array:  RequestBody:[{...}] or "RequestBody":[{...},{...}]
+        # The regex properly handles nested JSON objects, checking that braces are balanced.
 
-    if ($WebhookData -match '"?RequestBody"?\s*:\s*((?:{([^{}]|(?<open>{)|(?<-open>}))*(?(open)(?!))})|(?:\[([^\[\]]|(?<open>\[)|(?<-open>\]))*(?(open)(?!))\]))') {
-        $jsonRequestBody = $matches[1]
-        try {
-            $requestBody = ConvertFrom-Json -InputObject $jsonRequestBody -Depth 10
+        Write-Log "Failed to parse WebhookData as JSON. Attempting to extract RequestBody using regex..." -Level "Warning"
+
+        if ($WebhookData -match '"?RequestBody"?\s*:\s*((?:{([^{}]|(?<open>{)|(?<-open>}))*(?(open)(?!))})|(?:\[([^\[\]]|(?<open>\[)|(?<-open>\]))*(?(open)(?!))\]))') {
+            $jsonRequestBody = $matches[1]
+            try {
+                $RequestBody = ConvertFrom-Json -InputObject $jsonRequestBody -Depth 10
+            }
+            catch {
+                $msg = "Failed to parse WebhookData.RequestBody using regex, error: $_"
+                Write-Log $msg -Level "Error"
+                throw $msg
+            }
         }
-        catch {
-            $msg = "Failed to parse WebhookData.RequestBody using regex, error: $_"
+        else {
+            $msg = "WebhookData.RequestBody not recognized using regex!"
             Write-Log $msg -Level "Error"
             throw $msg
         }
     }
-    else {
-        $msg = "WebhookData.RequestBody not recognized using regex!"
+
+    if ([string]::IsNullOrEmpty($requestBody)) {
+        $msg = "WebhookData.RequestBody is empty! Ensure the runbook is called from a webhook!"
         Write-Log $msg -Level "Error"
         throw $msg
     }
 }
 
-if ([string]::IsNullOrEmpty($requestBody)) {
-    $msg = "WebhookData.RequestBody is empty! Ensure the runbook is called from a webhook!"
+else {
+    # parse the jsonRequestBody parameter as JSON
+    Write-Log "jsonRequestBody received is: $($jsonRequestBody)"
+    try {
+        $requestBody = ConvertFrom-Json -InputObject $jsonRequestBody -Depth 10
+    }
+    catch {
+        $msg = "Failed to parse jsonRequestBody parameter as JSON: $_"
+        Write-Log $msg -Level "Error"
+        throw $msg
+    }
+}
+
+# now that we have a valid requestBody object, check some fields and detect request type
+
+# check version
+if ([string]::IsNullOrEmpty($requestBody.specversion)) {
+    $msg = "Missing or empty mandatory parameter: 'specversion' in request body!"
     Write-Log $msg -Level "Error"
     throw $msg
 }
-
-# now that we have a valid requestBody, check some fields and detect request type
-
-# check version
 if ($requestBody.specversion -ne $Version) {
     $msg = "The version specified in the request, $($requestBody.specversion), does not match the script version $Version!"
     Write-Log $msg -Level "Error"
@@ -521,8 +554,7 @@ else {
 }
 
 # process requests based on type
-
-if (-not $requestBody.type) {
+if ([string]::IsNullOrEmpty($requestBody.type)) {
     $msg = "Missing or empty mandatory parameter: 'type' in request body!"
     Write-Log $msg -Level "Error"
     throw $msg
@@ -594,12 +626,12 @@ switch ($requestBody.type) {
             $msg = "Error checking for deleted certificate: $_"
             Write-Log $msg -Level "Error"
             throw $msg
-        }  
+        }
         if (($null -ne $deletedCert) -and ($null -ne $deletedCert.DeletedDate)) {
             $msg = "Certificate $CertificateName is already in the key vault and in deleted state since $($deletedCert.DeletedDate). It must be purged before creating a new one; otherwise specify a different certificate name."
             Write-Log $msg -Level "Error"
             throw $msg
-        }  
+        }
 
         # CertificateTemplate: presence and non-empty check
         if ([string]::IsNullOrEmpty($CertificateTemplate)) {
@@ -615,7 +647,7 @@ switch ($requestBody.type) {
             Write-Log $msg -Level "Error"
             throw $msg
         }
-    
+
         # CertificateSubject: presence and non-empty check
         if ([string]::IsNullOrEmpty($CertificateSubject)) {
             $msg = "Missing or empty mandatory parameter: 'data.CertificateSubject' in request body!"
