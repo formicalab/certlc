@@ -95,12 +95,7 @@ $ErrorActionPreference = "Stop"
 # STATIC SETTINGS AND GLOBAL VARS #
 ###################################
 
-$Version = "1.0"                        # version of the script - must match specversion in the webhook body
-
-$AutomationAccountName = "aa-shared-neu-001"        # automation account used to run the script and to store the variables
-$AutomationAccountRG = "rg-shared-neu-001"          # resource group of the automation account
-
-$jobId = $null         # we will use job id as correlation ID for the log entry, or a new guid if running locally
+$Version = "1.0"       # version of the script - must match specversion in the webhook body
 
 #########################
 # FUNCTIONS - Write-Log #
@@ -202,7 +197,7 @@ function New-CertificateRenewalRequest {
     # Now we have all the details to create the renew request.
     # Renew actually uses same code as New-CertificateRequest, so we can reuse it.
     # Exceptions will be caught directly in the main section of the script
-     New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxProtectTo $PfxProtectTo
+    New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxProtectTo $PfxProtectTo
 }
 
 ######################################
@@ -412,27 +407,6 @@ function New-CertificateRequest {
 # MAIN - modules and parameters #
 #################################
 
-# automation account variables
-try {
-    # Get the CA from the automation account variable
-    $CA = (Get-AzAutomationVariable -ResourceGroupName $automationAccountRG -AutomationAccountName $automationAccountName -name "certlc-ca").Value
-}
-catch {
-    $msg = "Error getting automation account variable 'certlc-ca'. Ensure the variable exists in the automation account $automationAccountName in resource group $automationAccountRG."
-    Write-Log $msg -Level "Error"
-    throw $msg
-}
-
-try {
-    # Get the PfxRootFolder from the automation account variable
-    $PfxRootFolder = (Get-AzAutomationVariable -ResourceGroupName $automationAccountRG -AutomationAccountName $automationAccountName -name "certlc-pfxrootfolder").Value
-}
-catch {
-    $msg = "Error getting automation account variable 'certlc-pfxrootfolder'. Ensure the variable exists in the automation account $automationAccountName in resource group $automationAccountRG."
-    Write-Log $msg -Level "Error"
-    throw $msg
-}
-
 # Connect to Azure. Ensures we do not inherit an AzContext, since we are using a system-assigned identity for login
 $null = Disable-AzContextAutosave -Scope Process
 
@@ -465,9 +439,45 @@ elseif ($env:AZUREPS_HOST_ENVIRONMENT -eq "AzureAutomation") {
     throw $msg
 }
 else {
-    # We are in a local environment
-    $jobId = [guid]::NewGuid().ToString()
-    Write-Log "Runbook running with locally-generated job id $jobId in local environment on $($env:COMPUTERNAME)."
+    # We are in a local environment - not supported anymore because we cannot get the encrypted variables from the automation account in this case
+    $msg = "Runbook running in a local environment. This runbook must be executed by a hybrid worker instead!"
+    Write-Log $msg -Level "Error"
+    throw $msg
+}
+
+# Automation account variables
+# Note: since they are encrypted, you must use the internal cmdlet Get-AutomationVariable to retrieve them, not Get-AzAutomationVariable
+
+try {
+    # Get the CA from the automation account variable
+    $CA = Get-AutomationVariable -Name "certlc-ca"
+}
+catch {
+    $msg = "Error getting automation account variable 'certlc-ca'. Ensure the variable exists in the automation account!"
+    Write-Log $msg -Level "Error"
+    throw $msg
+}
+# Ensure the CA variable is not empty
+if ([string]::IsNullOrEmpty($CA)) {
+    $msg = "The automation account variable 'certlc-ca' is empty!"
+    Write-Log $msg -Level "Error"
+    throw $msg
+}
+
+try {
+    # Get the PfxRootFolder from the automation account variable
+    $PfxRootFolder = Get-AutomationVariable -Name "certlc-pfxrootfolder"
+}
+catch {
+    $msg = "Error getting automation account variable 'certlc-pfxrootfolder'. Ensure the variable exists in the automation account!"
+    Write-Log $msg -Level "Error"
+    throw $msg
+}
+# Ensure the PfxRootFolder variable is not empty
+if ([string]::IsNullOrEmpty($PfxRootFolder)) {
+    $msg = "The automation account variable 'certlc-pfxrootfolder' is empty!"
+    Write-Log $msg -Level "Error"
+    throw $msg
 }
 
 # Check if we have the jsonRequestBody parameter
@@ -595,7 +605,7 @@ switch ($requestBody.type) {
 
         # invoke renewal
         try {
-            New-CertificateRenewalRequest -VaultName $VaultName -CertificateName $CertificateName -CA $CA
+            New-CertificateRenewalRequest -VaultName $VaultName -CertificateName $CertificateName -CA $CA -pfxRootFolder $PfxRootFolder
         }
         catch {
             $msg = "Error processing certificate renew request: $_"
