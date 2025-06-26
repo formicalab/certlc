@@ -323,8 +323,10 @@ function New-CertificateRequest {
     Write-Log "Certificate imported into the key vault."
 
     # if required, download the certificate to a local file in the pfx folder
-    if (-not [string]::IsNullOrEmpty($PfxProtectTo)) {
-
+    if ([string]::IsNullOrEmpty($PfxProtectTo)) {
+        Write-Log "PfxProtectTo is not specified, skipping PFX export."
+    }
+    else {
         # create the root folder if it does not exist
         if (-not (Test-Path -Path $PfxRootFolder)) {
             Write-Log "Creating the PFX root folder: $PfxRootFolder"
@@ -414,7 +416,7 @@ function New-CertificateRequest {
         # convert the base64 string to a byte array and create an X509Certificate2 object
         $certBytes = [Convert]::FromBase64String($certBase64)
         $certBase64 = $null
-        $x509Cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($certBytes,[string]::Empty,[System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
+        $x509Cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($certBytes, [string]::Empty, [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
         $certBytes = $null
 
         # test exportability of private key
@@ -434,7 +436,7 @@ function New-CertificateRequest {
         }
 
         try {
-                Export-PfxCertificate -Cert $x509Cert -FilePath $pfxFile -ProtectTo $PfxProtectTo -ErrorAction Stop | Out-Null
+            Export-PfxCertificate -Cert $x509Cert -FilePath $pfxFile -ProtectTo $PfxProtectTo -ErrorAction Stop | Out-Null
         }
         catch {
             throw "Error exporting certificate to PFX protecting it to $($PfxProtectTo): $_"
@@ -654,7 +656,7 @@ switch ($requestBody.type) {
 
         # invoke renewal
         try {
-            New-CertificateRenewalRequest -VaultName $VaultName -CertificateName $CertificateName -CA $CA -pfxRootFolder $PfxRootFolder
+            New-CertificateRenewalRequest -VaultName $VaultName -CertificateName $CertificateName -CA $CA
         }
         catch {
             $msg = "Error processing certificate renew request: $_"
