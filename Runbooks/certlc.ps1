@@ -385,23 +385,8 @@ function New-CertificateRequest {
         Write-Log "Target folder for PFX verified for PfxProtectTo $($PfxProtectTo): $PfxTargetFolder"
         $pfxFile = Join-Path -Path $PfxTargetFolder -ChildPath "$($CertificateName).pfx"
 
-        # remove the PFX file if it already exists, to ensure we always export a fresh copy
-        if (Test-Path -Path $pfxFile) {
-            Write-Log "Removing existing PFX file: $pfxFile"
-            try {
-                Remove-Item -Path $pfxFile -Force
-            }
-            catch {
-                throw "Error removing existing PFX file: $($pfxFile): $_"
-            }
-        }
-        else {
-            Write-Log "No existing PFX file found: $pfxFile"
-        }
-
         # get the certificate from the key vault
-
-        Write-Log "Getting the $CertificateName certificate from key vault $VaultName to export it to PFX file $pfxFile..."
+        Write-Log "Certificate $($CertificateName): getting the certificate from key vault $VaultName to export it to PFX file $pfxFile..."
         try {
             $certBase64 = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertificateName -AsPlainText
         }
@@ -422,19 +407,35 @@ function New-CertificateRequest {
         # test exportability of private key
         if (-not $x509Cert.HasPrivateKey) {
             $x509Cert = $null
-            throw "Error exporting certificate $CertificateName to PFX file: the private key is not present!"
+            throw "Error exporting certificate $CertificateName to PFX file: the private key is not available!"
         }
-        Write-Log "Private key is present for certificate $CertificateName."
+        Write-Log "Certificate $($CertificateName): private key is available."
 
         try {
             $x509cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Pfx) | Out-Null
-            Write-Log "Private key is present and exportable for certificate $CertificateName."
+            Write-Log "Certificate $($CertificateName): private key is exportable."
         }
         catch {
             $x509Cert = $null
             throw "Error exporting certificate $CertificateName to PFX file: the private key is present but not exportable!"
         }
 
+        # remove the PFX file if it already exists, to ensure we always export a fresh copy
+        if (Test-Path -Path $pfxFile) {
+            Write-Log "Removing existing PFX file: $pfxFile"
+            try {
+                Remove-Item -Path $pfxFile -Force
+            }
+            catch {
+                $x509Cert = $null
+                throw "Error removing existing PFX file: $($pfxFile): $_"
+            }
+        }
+        else {
+            Write-Log "No existing PFX file found: $pfxFile"
+        }
+
+        # do the actual export to PFX file
         try {
             Export-PfxCertificate -Cert $x509Cert -FilePath $pfxFile -ProtectTo $PfxProtectTo -ErrorAction Stop | Out-Null
         }
@@ -450,7 +451,7 @@ function New-CertificateRequest {
             throw "Error exporting certificate to PFX file: $pfxFile does not exist after export!"
         }
 
-        Write-Log "Certificate exported to PFX file: $pfxFile"
+        Write-Log "Certificate $CertificateName exported to PFX file $pfxFile"
     }
 }
 
