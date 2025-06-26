@@ -381,22 +381,65 @@ function New-CertificateRequest {
         }
 
         Write-Log "Target folder for PFX verified for PfxProtectTo $($PfxProtectTo): $PfxTargetFolder"
-
-        # download the certificate to a local file in the target folder
         $pfxFile = Join-Path -Path $PfxTargetFolder -ChildPath "$($CertificateName).pfx"
-        Write-Log "Exporting the $CertificateName certificate to PFX file: $pfxFile"
+
+        # remove the PFX file if it already exists, to ensure we always export a fresh copy
+        if (Test-Path -Path $pfxFile) {
+            Write-Log "Removing existing PFX file: $pfxFile"
+            try {
+                Remove-Item -Path $pfxFile -Force
+            }
+            catch {
+                throw "Error removing existing PFX file: $($pfxFile): $_"
+            }
+        }
+        else {
+            Write-Log "No existing PFX file found: $pfxFile"
+        }
+
+        # get the certificate from the key vault
+
+        Write-Log "Getting the $CertificateName certificate from key vault $VaultName to export it to PFX file $pfxFile..."
         try {
             $certBase64 = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertificateName -AsPlainText
-            $certBytes = [Convert]::FromBase64String($certBase64)
-            $x509Cert = New-Object Security.Cryptography.X509Certificates.X509Certificate2($certBytes, $null, [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
-            Export-PfxCertificate -Cert $x509Cert -FilePath $pfxFile -ProtectTo $PfxProtectTo -ErrorAction Stop | Out-Null
+        }
+        catch {
+            throw "Error getting certificate $CertificateName from key vault $($VaultName): $_"
+        }
+
+        if ([string]::IsNullOrEmpty($certBase64)) {
+            throw "Error getting certificate $CertificateName from key vault $($VaultName): the certificate is empty!"
+        }
+
+        # convert the base64 string to a byte array and create an X509Certificate2 object
+        $certBytes = [Convert]::FromBase64String($certBase64)
+        $certBase64 = $null
+        $x509Cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($certBytes,[string]::Empty,[System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
+        $certBytes = $null
+
+        # test exportability of private key
+        if (-not $x509Cert.HasPrivateKey) {
+            $x509Cert = $null
+            throw "Error exporting certificate $CertificateName to PFX file: the private key is not present!"
+        }
+        Write-Log "Private key is present for certificate $CertificateName."
+
+        try {
+            $x509cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Pfx) | Out-Null
+            Write-Log "Private key is present and exportable for certificate $CertificateName."
+        }
+        catch {
+            $x509Cert = $null
+            throw "Error exporting certificate $CertificateName to PFX file: the private key is present but not exportable!"
+        }
+
+        try {
+                Export-PfxCertificate -Cert $x509Cert -FilePath $pfxFile -ProtectTo $PfxProtectTo -ErrorAction Stop | Out-Null
         }
         catch {
             throw "Error exporting certificate to PFX protecting it to $($PfxProtectTo): $_"
         }
         finally {
-            $certBase64 = $null
-            $certBytes = $null
             $x509Cert = $null
         }
 
