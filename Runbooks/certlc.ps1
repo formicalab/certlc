@@ -91,25 +91,11 @@ Set-StrictMode -Version 1.0
 # Ensure the script stops on errors so that try/catch can be used to handle them
 $ErrorActionPreference = "Stop"
 
-###################
-# STATIC SETTINGS #
-###################
+###################################
+# STATIC SETTINGS AND GLOBAL VARS #
+###################################
 
-$Version = "1.0"                        # version of the script - must match specversion in the webhook body
-
-$AutomationAccountName = "aa-shared-neu-001"        # automation account used to run the script and to store the variables
-$AutomationAccountRG = "rg-shared-neu-001"          # resource group of the automation account
-
-# TODO: where possible, use automation variables instead (see renewcertviakv.ps1). Sample usage:
-#$CA = (Get-AzAutomationVariable -ResourceGroupName $automationAccountRG -AutomationAccountName $automationAccountName -name "certlc-ca").Value
-$CA = "flazdc03.formicalab.casa\SubCA"      # Issuing CA server (must be in the form <servername>\<CAname>)
-$PfxRootFolder = "C:\Temp"                  # root of folder tree where the PFX files will be downloaded
-
-####################
-# GLOBAL VARIABLES #
-####################
-
-$jobId = $null         # we will use job id as correlation ID for the log entry, or a new guid if running locally
+$Version = "1.0"       # version of the script - must match specversion in the webhook body
 
 #########################
 # FUNCTIONS - Write-Log #
@@ -211,7 +197,7 @@ function New-CertificateRenewalRequest {
     # Now we have all the details to create the renew request.
     # Renew actually uses same code as New-CertificateRequest, so we can reuse it.
     # Exceptions will be caught directly in the main section of the script
-     New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxProtectTo $PfxProtectTo
+    New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxProtectTo $PfxProtectTo
 }
 
 ######################################
@@ -395,24 +381,73 @@ function New-CertificateRequest {
         }
 
         Write-Log "Target folder for PFX verified for PfxProtectTo $($PfxProtectTo): $PfxTargetFolder"
-
-        # download the certificate to a local file in the target folder
         $pfxFile = Join-Path -Path $PfxTargetFolder -ChildPath "$($CertificateName).pfx"
-        Write-Log "Exporting the $CertificateName certificate to PFX file: $pfxFile"
+
+        # remove the PFX file if it already exists, to ensure we always export a fresh copy
+        if (Test-Path -Path $pfxFile) {
+            Write-Log "Removing existing PFX file: $pfxFile"
+            try {
+                Remove-Item -Path $pfxFile -Force
+            }
+            catch {
+                throw "Error removing existing PFX file: $($pfxFile): $_"
+            }
+        }
+        else {
+            Write-Log "No existing PFX file found: $pfxFile"
+        }
+
+        # get the certificate from the key vault
+
+        Write-Log "Getting the $CertificateName certificate from key vault $VaultName to export it to PFX file $pfxFile..."
         try {
             $certBase64 = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertificateName -AsPlainText
-            $certBytes = [Convert]::FromBase64String($certBase64)
-            $x509Cert = New-Object Security.Cryptography.X509Certificates.X509Certificate2($certBytes, $null, [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
-            Export-PfxCertificate -Cert $x509Cert -FilePath $pfxFile -ProtectTo $PfxProtectTo | Out-Null
+        }
+        catch {
+            throw "Error getting certificate $CertificateName from key vault $($VaultName): $_"
+        }
+
+        if ([string]::IsNullOrEmpty($certBase64)) {
+            throw "Error getting certificate $CertificateName from key vault $($VaultName): the certificate is empty!"
+        }
+
+        # convert the base64 string to a byte array and create an X509Certificate2 object
+        $certBytes = [Convert]::FromBase64String($certBase64)
+        $certBase64 = $null
+        $x509Cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($certBytes,[string]::Empty,[System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
+        $certBytes = $null
+
+        # test exportability of private key
+        if (-not $x509Cert.HasPrivateKey) {
+            $x509Cert = $null
+            throw "Error exporting certificate $CertificateName to PFX file: the private key is not present!"
+        }
+        Write-Log "Private key is present for certificate $CertificateName."
+
+        try {
+            $x509cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Pfx) | Out-Null
+            Write-Log "Private key is present and exportable for certificate $CertificateName."
+        }
+        catch {
+            $x509Cert = $null
+            throw "Error exporting certificate $CertificateName to PFX file: the private key is present but not exportable!"
+        }
+
+        try {
+                Export-PfxCertificate -Cert $x509Cert -FilePath $pfxFile -ProtectTo $PfxProtectTo -ErrorAction Stop | Out-Null
         }
         catch {
             throw "Error exporting certificate to PFX protecting it to $($PfxProtectTo): $_"
         }
         finally {
-            $certBase64 = $null
-            $certBytes = $null
             $x509Cert = $null
         }
+
+        # check if the PFX file was created successfully
+        if (-not (Test-Path -Path $pfxFile)) {
+            throw "Error exporting certificate to PFX file: $pfxFile does not exist after export!"
+        }
+
         Write-Log "Certificate exported to PFX file: $pfxFile"
     }
 }
@@ -453,9 +488,45 @@ elseif ($env:AZUREPS_HOST_ENVIRONMENT -eq "AzureAutomation") {
     throw $msg
 }
 else {
-    # We are in a local environment
-    $jobId = [guid]::NewGuid().ToString()
-    Write-Log "Runbook running with locally-generated job id $jobId in local environment on $($env:COMPUTERNAME)."
+    # We are in a local environment - not supported anymore because we cannot get the encrypted variables from the automation account in this case
+    $msg = "Runbook running in a local environment. This runbook must be executed by a hybrid worker instead!"
+    Write-Log $msg -Level "Error"
+    throw $msg
+}
+
+# Automation account variables
+# Note: since they are encrypted, you must use the internal cmdlet Get-AutomationVariable to retrieve them, not Get-AzAutomationVariable
+
+try {
+    # Get the CA from the automation account variable
+    $CA = Get-AutomationVariable -Name "certlc-ca"
+}
+catch {
+    $msg = "Error getting automation account variable 'certlc-ca'. Ensure the variable exists in the automation account!"
+    Write-Log $msg -Level "Error"
+    throw $msg
+}
+# Ensure the CA variable is not empty
+if ([string]::IsNullOrEmpty($CA)) {
+    $msg = "The automation account variable 'certlc-ca' is empty!"
+    Write-Log $msg -Level "Error"
+    throw $msg
+}
+
+try {
+    # Get the PfxRootFolder from the automation account variable
+    $PfxRootFolder = Get-AutomationVariable -Name "certlc-pfxrootfolder"
+}
+catch {
+    $msg = "Error getting automation account variable 'certlc-pfxrootfolder'. Ensure the variable exists in the automation account!"
+    Write-Log $msg -Level "Error"
+    throw $msg
+}
+# Ensure the PfxRootFolder variable is not empty
+if ([string]::IsNullOrEmpty($PfxRootFolder)) {
+    $msg = "The automation account variable 'certlc-pfxrootfolder' is empty!"
+    Write-Log $msg -Level "Error"
+    throw $msg
 }
 
 # Check if we have the jsonRequestBody parameter
@@ -583,7 +654,7 @@ switch ($requestBody.type) {
 
         # invoke renewal
         try {
-            New-CertificateRenewalRequest -VaultName $VaultName -CertificateName $CertificateName -CA $CA
+            New-CertificateRenewalRequest -VaultName $VaultName -CertificateName $CertificateName -CA $CA -pfxRootFolder $PfxRootFolder
         }
         catch {
             $msg = "Error processing certificate renew request: $_"
@@ -636,14 +707,6 @@ switch ($requestBody.type) {
         # CertificateTemplate: presence and non-empty check
         if ([string]::IsNullOrEmpty($CertificateTemplate)) {
             $msg = "Missing or empty mandatory parameter: 'data.CertificateTemplate' in request body!"
-            Write-Log $msg -Level "Error"
-            throw $msg
-        }
-
-        # CertificateTemplate: existence in AD check
-        $tmpl = Get-CertificateTemplate -Name $CertificateTemplate -ErrorAction SilentlyContinue
-        if ($null -eq $tmpl) {
-            $msg = "Template $($CertificateTemplate) not found in AD! Check its name."
             Write-Log $msg -Level "Error"
             throw $msg
         }
