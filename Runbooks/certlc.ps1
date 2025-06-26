@@ -91,23 +91,14 @@ Set-StrictMode -Version 1.0
 # Ensure the script stops on errors so that try/catch can be used to handle them
 $ErrorActionPreference = "Stop"
 
-###################
-# STATIC SETTINGS #
-###################
+###################################
+# STATIC SETTINGS AND GLOBAL VARS #
+###################################
 
 $Version = "1.0"                        # version of the script - must match specversion in the webhook body
 
 $AutomationAccountName = "aa-shared-neu-001"        # automation account used to run the script and to store the variables
 $AutomationAccountRG = "rg-shared-neu-001"          # resource group of the automation account
-
-# TODO: where possible, use automation variables instead (see renewcertviakv.ps1). Sample usage:
-#$CA = (Get-AzAutomationVariable -ResourceGroupName $automationAccountRG -AutomationAccountName $automationAccountName -name "certlc-ca").Value
-$CA = "flazdc03.formicalab.casa\SubCA"      # Issuing CA server (must be in the form <servername>\<CAname>)
-$PfxRootFolder = "C:\PFX_Repo"                  # root of folder tree where the PFX files will be downloaded
-
-####################
-# GLOBAL VARIABLES #
-####################
 
 $jobId = $null         # we will use job id as correlation ID for the log entry, or a new guid if running locally
 
@@ -420,6 +411,27 @@ function New-CertificateRequest {
 #################################
 # MAIN - modules and parameters #
 #################################
+
+# automation account variables
+try {
+    # Get the CA from the automation account variable
+    $CA = (Get-AzAutomationVariable -ResourceGroupName $automationAccountRG -AutomationAccountName $automationAccountName -name "certlc-ca").Value
+}
+catch {
+    $msg = "Error getting automation account variable 'certlc-ca'. Ensure the variable exists in the automation account $automationAccountName in resource group $automationAccountRG."
+    Write-Log $msg -Level "Error"
+    throw $msg
+}
+
+try {
+    # Get the PfxRootFolder from the automation account variable
+    $PfxRootFolder = (Get-AzAutomationVariable -ResourceGroupName $automationAccountRG -AutomationAccountName $automationAccountName -name "certlc-pfxrootfolder").Value
+}
+catch {
+    $msg = "Error getting automation account variable 'certlc-pfxrootfolder'. Ensure the variable exists in the automation account $automationAccountName in resource group $automationAccountRG."
+    Write-Log $msg -Level "Error"
+    throw $msg
+}
 
 # Connect to Azure. Ensures we do not inherit an AzContext, since we are using a system-assigned identity for login
 $null = Disable-AzContextAutosave -Scope Process
