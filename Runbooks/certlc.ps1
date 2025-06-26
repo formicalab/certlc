@@ -103,7 +103,7 @@ $AutomationAccountRG = "rg-shared-neu-001"          # resource group of the auto
 # TODO: where possible, use automation variables instead (see renewcertviakv.ps1). Sample usage:
 #$CA = (Get-AzAutomationVariable -ResourceGroupName $automationAccountRG -AutomationAccountName $automationAccountName -name "certlc-ca").Value
 $CA = "flazdc03.formicalab.casa\SubCA"      # Issuing CA server (must be in the form <servername>\<CAname>)
-$PfxRootFolder = "C:\Temp"                  # root of folder tree where the PFX files will be downloaded
+$PfxRootFolder = "C:\PFX_Repo"                  # root of folder tree where the PFX files will be downloaded
 
 ####################
 # GLOBAL VARIABLES #
