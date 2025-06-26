@@ -652,14 +652,6 @@ switch ($requestBody.type) {
             throw $msg
         }
 
-        # CertificateTemplate: existence in AD check
-        $tmpl = Get-CertificateTemplate -Name $CertificateTemplate -ErrorAction SilentlyContinue
-        if ($null -eq $tmpl) {
-            $msg = "Template $($CertificateTemplate) not found in AD! Check its name."
-            Write-Log $msg -Level "Error"
-            throw $msg
-        }
-
         # CertificateSubject: presence and non-empty check
         if ([string]::IsNullOrEmpty($CertificateSubject)) {
             $msg = "Missing or empty mandatory parameter: 'data.CertificateSubject' in request body!"
