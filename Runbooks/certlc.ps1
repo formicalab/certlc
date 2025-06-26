@@ -389,7 +389,7 @@ function New-CertificateRequest {
             $certBase64 = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertificateName -AsPlainText
             $certBytes = [Convert]::FromBase64String($certBase64)
             $x509Cert = New-Object Security.Cryptography.X509Certificates.X509Certificate2($certBytes, $null, [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
-            Export-PfxCertificate -Cert $x509Cert -FilePath $pfxFile -ProtectTo $PfxProtectTo | Out-Null
+            Export-PfxCertificate -Cert $x509Cert -FilePath $pfxFile -ProtectTo $PfxProtectTo -ErrorAction Stop
         }
         catch {
             throw "Error exporting certificate to PFX protecting it to $($PfxProtectTo): $_"
