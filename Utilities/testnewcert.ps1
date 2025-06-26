@@ -14,11 +14,14 @@ Set-StrictMode -Version 1.0
 # Variables
 $storageAccountName = "flazstfnsharedneu001"
 $queueName = "certlc"
-$AutomationWebhookUrl = "https://<automationaccounturl>/webhooks?token=<url>"
+$AutomationWebhookUrl = "https://70cf67fa-9b4f-4a13-97c5-0c099a08c2df.webhook.ne.azure-automation.net/webhooks?token=pr3drGvacMp3tjlQIdnuvHTLG3KDwKxo74nu6dX%2bTYE%3d"
 $AutomationAccountName = "aa-shared-neu-001"
 $ResourceGroupName = "rg-shared-neu-001"
 $HybridWorkerGroupName = "hwg-shared-neu-001"
 $RunbookName = "certlc"
+$VaultName = "flazkv-shared-neu-001"
+$CertificateTemplate = "Flab-ShortWebServer"
+$PfxProtectTo = "formicalab\\marcello"
 
 <#
 
@@ -56,16 +59,16 @@ $json = @"
   "time": "$(Get-Date -Format 'yyyy-MM-ddTHH:mm:ss.fffffffZ' -AsUTC)",
   "data": {
     "Id": "Ticket01",
-    "VaultName": "flazkv-shared-neu-001",
+    "VaultName": "$vaultName",
     "ObjectType": "Certificate",
     "ObjectName": "$certName",
-    "CertificateTemplate": "Flab-ShortWebServer",
+    "CertificateTemplate": "$certificateTemplate",
     "CertificateSubject": "CN=www.example.com",
     "CertificateDnsNames": [
       "www.example.com",
       "api.example.com"
     ],
-    "PfxProtectTo": "formicalab\\marcello"
+    "PfxProtectTo": "$PfxProtectTo"
   }
 }
 "@
@@ -104,7 +107,7 @@ elseif ($UseWebhook) {
 
   try {
     $response = Invoke-RestMethod -Uri $AutomationWebhookUrl -Method Post -Body $json -ContentType 'application/json'
-    Write-Host "Webhook invoked successfully. Response status: $($response.StatusCode)"
+    Write-Host "Webhook invoked successfully, job id is $($response.JobIds)"
   }
   catch {
     if ($_.ErrorDetails.Message) {
@@ -134,7 +137,7 @@ else {
     Start-Sleep -Seconds 5
     $job = Get-AzAutomationJob -Id $res.JobId -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName
   }
-    Write-Host "Runbook job status: $($job.Status)"
+  Write-Host "Runbook job status: $($job.Status)"
 
   # write the output of the runbook
   Write-Host "Runbook output:"
