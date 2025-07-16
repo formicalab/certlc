@@ -1,3 +1,28 @@
+<#
+.SYNOPSIS
+  This script tests the new certificate request functionality of CertLC by sending a request to the queue or invoking a runbook via webhook.
+
+.DESCRIPTION
+  This script creates a JSON message for a new certificate request and sends it to either an Azure
+  Storage Queue or invokes an Azure Automation Runbook via a webhook. It can also directly start a runbook
+  on a hybrid worker group. The script allows for testing the new certificate request functionality in CertLC.
+
+  The JSON message structure is defined in the script, and it includes fields such as the certificate name,
+  vault name, certificate template, subject, DNS names, and the user or group to protect the PFX file to.
+
+.EXAMPLE
+  .\testnewcert.ps1 -CertName "TestCert" -UseQueue
+  This command sends a new certificate request for "TestCert" to the Azure Storage Queue specified in the script.
+
+  .\testnewcert.ps1 -CertName "TestCert" -UseWebhook
+  This command invokes the Azure Automation Runbook via webhook for the new certificate request for "TestCert".
+
+  .\testnewcert.ps1 -CertName "TestCert"
+  This command directly starts the runbook for the new certificate request for "TestCert" on the hybrid worker group.
+#>
+
+#Requires -PSEdition Core
+
 [CmdletBinding()]
 param (
   [Parameter(Mandatory = $true)]
