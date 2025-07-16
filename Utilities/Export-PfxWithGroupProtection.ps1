@@ -10,6 +10,8 @@
 #>
 
 #Requires -PSEdition Core
+using module Az.KeyVault
+
 
 param(
     [Parameter(Mandatory)]
@@ -36,42 +38,42 @@ $Cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate
 # Add native interop helpers
 if (-not ('Win32Native' -as [type])) {
     Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
+        using System;
+        using System.Runtime.InteropServices;
 
-public static class Win32Native
-{
-    [StructLayout(LayoutKind.Sequential)]
-    public struct BLOB
-    {
-        public uint cbData;
-        public IntPtr pbData;
-    }
+        public static class Win32Native
+        {
+            [StructLayout(LayoutKind.Sequential)]
+            public struct BLOB
+            {
+                public uint cbData;
+                public IntPtr pbData;
+            }
 
-    [DllImport("ncrypt.dll", CharSet = CharSet.Unicode)]
-    public static extern int NCryptCreateProtectionDescriptor(
-        string descriptor, uint flags, out IntPtr hDesc);
+            [DllImport("ncrypt.dll", CharSet = CharSet.Unicode)]
+            public static extern int NCryptCreateProtectionDescriptor(
+                string descriptor, uint flags, out IntPtr hDesc);
 
-    [DllImport("ncrypt.dll")]
-    public static extern int NCryptCloseProtectionDescriptor(IntPtr hDesc);
+            [DllImport("ncrypt.dll")]
+            public static extern int NCryptCloseProtectionDescriptor(IntPtr hDesc);
 
-    [DllImport("crypt32.dll", CharSet = CharSet.Ansi, SetLastError = true)]
-    public static extern IntPtr CertOpenStore(
-        string storeProvider, uint encoding, IntPtr hCryptProv,
-        uint flags, IntPtr pvPara);
+            [DllImport("crypt32.dll", CharSet = CharSet.Ansi, SetLastError = true)]
+            public static extern IntPtr CertOpenStore(
+                string storeProvider, uint encoding, IntPtr hCryptProv,
+                uint flags, IntPtr pvPara);
 
-    [DllImport("crypt32.dll", SetLastError = true)]
-    public static extern bool CertAddCertificateContextToStore(
-        IntPtr hStore, IntPtr pCert, uint disp, IntPtr ppOut);
+            [DllImport("crypt32.dll", SetLastError = true)]
+            public static extern bool CertAddCertificateContextToStore(
+                IntPtr hStore, IntPtr pCert, uint disp, IntPtr ppOut);
 
-    [DllImport("crypt32.dll", SetLastError = true)]
-    public static extern bool CertCloseStore(IntPtr hStore, uint flags);
+            [DllImport("crypt32.dll", SetLastError = true)]
+            public static extern bool CertCloseStore(IntPtr hStore, uint flags);
 
-    [DllImport("crypt32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern bool PFXExportCertStoreEx(
-        IntPtr hStore, ref BLOB pfx,
-        string password, IntPtr pvPara, uint flags);
-}
+            [DllImport("crypt32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+            public static extern bool PFXExportCertStoreEx(
+                IntPtr hStore, ref BLOB pfx,
+                string password, IntPtr pvPara, uint flags);
+        }
 '@
 }
 
