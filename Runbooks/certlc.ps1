@@ -208,9 +208,6 @@ function Export-PfxWithGroupProtection {
     Write-Log "Export-PfxWithGroupProtection: protection descriptor handle: $hDesc"
 
     try {
-        # Wrap the handle in an IntPtr buffer
-        $pvPara = [Runtime.InteropServices.Marshal]::AllocHGlobal([IntPtr]::Size)
-        [Runtime.InteropServices.Marshal]::WriteIntPtr($pvPara, $hDesc)
 
         # Create memory store
         $store = [Win32Native]::CertOpenStore('Memory', 0, [IntPtr]::Zero, 0x2000, [IntPtr]::Zero)
@@ -221,50 +218,65 @@ function Export-PfxWithGroupProtection {
 
         try {
 
-            # generate a random password for the PFX (as per documentation, if not used the API should generate one, but it seems it does not and uses empty or "0" as passwords)
-            $password = [System.Convert]::ToBase64String([System.Security.Cryptography.RandomNumberGenerator]::GetBytes(40))
-
-            # Query size of PFX so that we know how much buffer to allocate (pass 1)
-            $blob = New-Object Win32Native+BLOB
-            $flags = 0x0004 -bor 0x0010 -bor 0x0020  # EXPORT_PRIVATE_KEYS | INCLUDE_EXTENDED_PROPERTIES | PROTECT_TO_DOMAIN_SIDS
-
-            if (-not [Win32Native]::PFXExportCertStoreEx($store, [ref]$blob, $password, $pvPara, $flags)) {
-                throw ('Export-PfxWithGroupProtection:: size query failed: 0x{0:X}' -f [Runtime.InteropServices.Marshal]::GetLastWin32Error())
+            # Add the cert to the memory store
+            if (-not [Win32Native]::CertAddCertificateContextToStore($store, $Cert.Handle, 3, [IntPtr]::Zero)) {
+                throw "Export-PfxWithGroupProtection: CertAddCertificateContextToStore failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
             }
-            Write-Log "Export-PfxWithGroupProtection: PFX size will be: $($blob.cbData) bytes"
+            Write-Host 'Export-PfxWithGroupProtection: certificate added to memory store.'
 
-            # allocate memory for the PFX data (pass 2)
-            $blob.pbData = [Runtime.InteropServices.Marshal]::AllocHGlobal($blob.cbData)
+            # Wrap the handle in an IntPtr buffer
+            $pvPara = [Runtime.InteropServices.Marshal]::AllocHGlobal([IntPtr]::Size)
+            [Runtime.InteropServices.Marshal]::WriteIntPtr($pvPara, $hDesc)
 
-            # do export to the memory store
             try {
+
+                # generate a random password for the PFX (as per documentation, if not used the API should generate one, but it seems it does not and uses empty or "0" as passwords)
+                $password = [System.Convert]::ToBase64String([System.Security.Cryptography.RandomNumberGenerator]::GetBytes(40))
+
+                # Query size of PFX so that we know how much buffer to allocate (pass 1)
+                $blob = New-Object Win32Native+BLOB
+                $flags = 0x0004 -bor 0x0010 -bor 0x0020  # EXPORT_PRIVATE_KEYS | INCLUDE_EXTENDED_PROPERTIES | PROTECT_TO_DOMAIN_SIDS
+
                 if (-not [Win32Native]::PFXExportCertStoreEx($store, [ref]$blob, $password, $pvPara, $flags)) {
-                    throw ('Export-PfxWithGroupProtection: export to memory store failed: 0x{0:X}' -f [Runtime.InteropServices.Marshal]::GetLastWin32Error())
+                    throw ('Export-PfxWithGroupProtection:: size query failed: 0x{0:X}' -f [Runtime.InteropServices.Marshal]::GetLastWin32Error())
                 }
-                Write-Log 'Export-PfxWithGroupProtection: export to memory store successful.'
+                Write-Log "Export-PfxWithGroupProtection: PFX size will be: $($blob.cbData) bytes"
 
-                $password = $null  # clear the password variable to avoid keeping it in memory
+                # allocate memory for the PFX data (pass 2)
+                $blob.pbData = [Runtime.InteropServices.Marshal]::AllocHGlobal($blob.cbData)
 
-                # save the file
-                $bytes = New-Object byte[] $blob.cbData
-                [Runtime.InteropServices.Marshal]::Copy($blob.pbData, $bytes, 0, $blob.cbData)
-                [System.IO.File]::WriteAllBytes($PfxFile, $bytes)
-                Write-Log "Export-PfxWithGroupProtection: PFX exported to file: $PfxFile"
+                # do export to the memory store
+                try {
+                    if (-not [Win32Native]::PFXExportCertStoreEx($store, [ref]$blob, $password, $pvPara, $flags)) {
+                        throw ('Export-PfxWithGroupProtection: export to memory store failed: 0x{0:X}' -f [Runtime.InteropServices.Marshal]::GetLastWin32Error())
+                    }
+                    Write-Log 'Export-PfxWithGroupProtection: export to memory store successful.'
+
+                    $password = $null  # clear the password variable to avoid keeping it in memory
+
+                    # save the file
+                    $bytes = New-Object byte[] $blob.cbData
+                    [Runtime.InteropServices.Marshal]::Copy($blob.pbData, $bytes, 0, $blob.cbData)
+                    [System.IO.File]::WriteAllBytes($PfxFile, $bytes)
+                    Write-Log "Export-PfxWithGroupProtection: PFX exported to file: $PfxFile"
+                }
+                finally {
+                    # free the allocated memory for PFX data
+                    [Runtime.InteropServices.Marshal]::FreeHGlobal($blob.pbData)
+                }
             }
             finally {
-                # free the allocated memory for PFX data
-                [Runtime.InteropServices.Marshal]::FreeHGlobal($blob.pbData)
+                # free the IntPtr buffer
+                [Runtime.InteropServices.Marshal]::FreeHGlobal($pvPara)
             }
         }
         finally {
             # close the memory store
             [Win32Native]::CertCloseStore($store, 0) | Out-Null
-
-            # free the IntPtr buffer
-            [Runtime.InteropServices.Marshal]::FreeHGlobal($pvPara)
         }      
     }
     finally {
+        # free the protection descriptor handle
         [Win32Native]::NCryptCloseProtectionDescriptor($hDesc) | Out-Null
     }
 }
@@ -546,7 +558,7 @@ function New-CertificateRequest {
         # convert the base64 string to a byte array and create an X509Certificate2 object
         $certBytes = [Convert]::FromBase64String($certBase64)
         $certBase64 = $null
-        $x509Cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($certBytes, [string]::Empty, "Exportable")
+        $x509Cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($certBytes, [string]::Empty, 'Exportable')
         # $x509Cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($certBytes, [string]::Empty, [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
         $certBytes = $null
 
