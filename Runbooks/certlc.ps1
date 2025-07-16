@@ -222,7 +222,7 @@ function Export-PfxWithGroupProtection {
             if (-not [Win32Native]::CertAddCertificateContextToStore($store, $Cert.Handle, 3, [IntPtr]::Zero)) {
                 throw "Export-PfxWithGroupProtection: CertAddCertificateContextToStore failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
             }
-            Write-Host 'Export-PfxWithGroupProtection: certificate added to memory store.'
+            Write-Log 'Export-PfxWithGroupProtection: certificate added to memory store.'
 
             # Wrap the handle in an IntPtr buffer
             $pvPara = [Runtime.InteropServices.Marshal]::AllocHGlobal([IntPtr]::Size)
