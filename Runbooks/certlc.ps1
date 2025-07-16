@@ -221,11 +221,14 @@ function Export-PfxWithGroupProtection {
 
         try {
 
+            # generate a random password for the PFX (as per documentation, if not used the API should generate one, but it seems it does not and uses empty or "0" as passwords)
+            $password = [System.Convert]::ToBase64String([System.Security.Cryptography.RandomNumberGenerator]::GetBytes(40))
+
             # Query size of PFX so that we know how much buffer to allocate (pass 1)
             $blob = New-Object Win32Native+BLOB
             $flags = 0x0004 -bor 0x0010 -bor 0x0020  # EXPORT_PRIVATE_KEYS | INCLUDE_EXTENDED_PROPERTIES | PROTECT_TO_DOMAIN_SIDS
 
-            if (-not [Win32Native]::PFXExportCertStoreEx($store, [ref]$blob, [IntPtr]::Zero, $pvPara, $flags)) {
+            if (-not [Win32Native]::PFXExportCertStoreEx($store, [ref]$blob, $password, $pvPara, $flags)) {
                 throw ('Export-PfxWithGroupProtection:: size query failed: 0x{0:X}' -f [Runtime.InteropServices.Marshal]::GetLastWin32Error())
             }
             Write-Log "Export-PfxWithGroupProtection: PFX size will be: $($blob.cbData) bytes"
@@ -235,10 +238,12 @@ function Export-PfxWithGroupProtection {
 
             # do export to the memory store
             try {
-                if (-not [Win32Native]::PFXExportCertStoreEx($store, [ref]$blob, [IntPtr]::Zero, $pvPara, $flags)) {
+                if (-not [Win32Native]::PFXExportCertStoreEx($store, [ref]$blob, $password, $pvPara, $flags)) {
                     throw ('Export-PfxWithGroupProtection: export to memory store failed: 0x{0:X}' -f [Runtime.InteropServices.Marshal]::GetLastWin32Error())
                 }
                 Write-Log 'Export-PfxWithGroupProtection: export to memory store successful.'
+
+                $password = $null  # clear the password variable to avoid keeping it in memory
 
                 # save the file
                 $bytes = New-Object byte[] $blob.cbData

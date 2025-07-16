@@ -33,7 +33,7 @@ $ErrorActionPreference = 'Stop'
 Write-Host 'Getting certificate from Key Vault...'
 $certBase64 = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertName -AsPlainText
 $secretBytes = [Convert]::FromBase64String($certbase64)
-$Cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($secretBytes, '', 'Exportable')
+$Cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($secretBytes, [string]::Empty, "Exportable")
 
 # Add native interop helpers
 if (-not ('Win32Native' -as [type])) {
@@ -114,7 +114,10 @@ try {
             $blob = New-Object Win32Native+BLOB
             $flags = 0x0004 -bor 0x0010 -bor 0x0020  # EXPORT_PRIVATE_KEYS | INCLUDE_EXTENDED_PROPERTIES | PROTECT_TO_DOMAIN_SIDS
 
-            if (-not [Win32Native]::PFXExportCertStoreEx($store, [ref]$blob, [IntPtr]::Zero, $pvPara, $flags)) {
+            # generate a random password for the PFX (as per documentation, if not used the API should generate one, but it seems it does not and uses empty or "0" as passwords)
+            $password = [System.Convert]::ToBase64String([System.Security.Cryptography.RandomNumberGenerator]::GetBytes(40))
+
+            if (-not [Win32Native]::PFXExportCertStoreEx($store, [ref]$blob, $password, $pvPara, $flags)) {
                 throw ("Size query failed: 0x{0:X}" -f [Runtime.InteropServices.Marshal]::GetLastWin32Error())
             }
             Write-Host "PFX size: $($blob.cbData) bytes"
@@ -122,7 +125,7 @@ try {
             # 7. Allocate, export (pass 2), save
             $blob.pbData = [Runtime.InteropServices.Marshal]::AllocHGlobal($blob.cbData)
             try {
-                if (-not [Win32Native]::PFXExportCertStoreEx($store, [ref]$blob, [IntPtr]::Zero, $pvPara, $flags)) {
+                if (-not [Win32Native]::PFXExportCertStoreEx($store, [ref]$blob, $password, $pvPara, $flags)) {
                     throw ("Export failed: 0x{0:X}" -f [Runtime.InteropServices.Marshal]::GetLastWin32Error())
                 }
                 Write-Host 'PFX export successful.'
