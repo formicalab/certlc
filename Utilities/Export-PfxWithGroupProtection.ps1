@@ -6,7 +6,7 @@
     -VaultName: Name of the Key Vault containing the certificate.
     -CertName: Name of the certificate in the Key Vault.
     -ProtectTo: Array of SIDs to protect the PFX to.
-    -OutFile: Path to save the exported PFX file.
+    -PfxFile: Path to save the exported PFX file.
 #>
 
 #Requires -PSEdition Core
@@ -24,7 +24,7 @@ param(
     [string[]]$ProtectTo,
 
     [Parameter(Mandatory)]
-    [string]$OutFile
+    [string]$PfxFile
 )
 
 Set-StrictMode -Version 1
@@ -132,8 +132,8 @@ try {
 
                 $bytes = New-Object byte[] $blob.cbData
                 [Runtime.InteropServices.Marshal]::Copy($blob.pbData, $bytes, 0, $blob.cbData)
-                [System.IO.File]::WriteAllBytes($OutFile, $bytes)
-                Write-Host "✅ PFX written to $Out"
+                [System.IO.File]::WriteAllBytes($PfxFile, $bytes)
+                Write-Host "✅ PFX written to $PfxFile"
             }
             finally {
                 [Runtime.InteropServices.Marshal]::FreeHGlobal($blob.pbData)
