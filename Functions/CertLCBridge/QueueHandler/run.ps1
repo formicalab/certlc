@@ -36,6 +36,28 @@ Set-StrictMode -Version 1.0
 # Ensure the script stops on errors
 $ErrorActionPreference = "Stop"
 
+# Explicitly load Az.Automation module (it seems that the function runtime does not load it automatically)
+Import-Module Az.Automation
+
+# Ensure we only connect if needed - this is normally done at cold start by profile.ps1 but we want to ensure the context is valid
+try {
+    $context = Get-AzContext
+
+    if (-not $context -or -not $context.Account -or $context.Account.Id -eq "NotLoggedIn") {
+        Write-Warning "No valid Azure context found. Attempting Identity-based login..."
+        Disable-AzContextAutosave -Scope Process | Out-Null
+        Connect-AzAccount -Identity -ErrorAction Stop | Out-Null
+        Write-Information "Identity-based login succeeded."
+    }
+    else {
+        Write-Information "Using existing Azure context: $($context.Account.Id)"
+    }
+}
+catch {
+    throw "Failed to verify or establish Azure login context: $_"
+}
+
+
 # check if $QueueItem is a string, if so, something went wrong with the JSON deserialization
 if ($QueueItem -is [string]) {
   Write-Error "Queue item is a string, expected a PowerShell object. This usually means the JSON deserialization failed. Check the string: $QueueItem"
