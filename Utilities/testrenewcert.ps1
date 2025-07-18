@@ -1,18 +1,39 @@
+<#
+
+.SYNOPSIS
+  This script tests the certificate RENEW request functionality of CertLC by sending a request to the queue, emulating the queue message normally received from the Event Grid subscription.
+
+.DESCRIPTION
+  This script sends a test message to the specified Azure Storage Queue, using the same message structure expected by the CertLC application for certificate renewal requests.
+  The message is sent in base64 format to ensure compatibility with the queue's requirements.
+
+.EXAMPLE
+  .\testrenewcert.ps1 -StorageAccountName "storageaccountname" -QueueName "queuename" -CertName "mycert" -VaultName "keyvaultname"
+
+  Send a new certificate renewal request to Azure Storage Queue
+
+#>
+
+#Requires -PSEdition Core
+
+
 [CmdletBinding()]
 param (
-    [Parameter(Mandatory = $true)]
-    [string] $CertName
+  [Parameter(Mandatory = $true)]
+  [string] $StorageAccountName,
+
+  [Parameter(Mandatory = $true)]
+  [string] $QueueName = 'certlc',
+
+  [Parameter(Mandatory = $true)]
+  [string] $CertName,
+
+  [Parameter(Mandatory = $true)]
+  [string] $VaultName
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 1.0
-
-# Variables
-$storageAccountName = "flazstfnsharedneu001"
-$queueName = "certlc"
-
-# Create a storage context
-$ctx = New-AzStorageContext -StorageAccountName $storageAccountName
 
 <#
 
@@ -39,18 +60,18 @@ For new certificate requests, the body has a structure like this:
 
 #>
 
-# Define the JSON message emulating what arrives from the queue
+# Define the JSON message emulating what arrives from the queue. Note that version, NBF, EXP, source are ignored
 $json = @"
 {
   "id": "$(New-Guid)",
-  "source": "/subscriptions/4a570962-701a-475e-bf5b-8dc76ec748ff/resourceGroups/rg-shared-neu-001/providers/Microsoft.KeyVault/vaults/flazkv-shared-neu-001",
+  "source": "/subscriptions/4a570962-701a-475e-bf5b-8dc76ec748ff/resourceGroups/rg-shared-neu-001/providers/Microsoft.KeyVault/vaults/$vaultName",
   "specversion": "1.0",
   "type": "Microsoft.KeyVault.CertificateNearExpiry",
   "subject": "$certName",
   "time": "$(Get-Date -Format 'yyyy-MM-ddTHH:mm:ss.fffffffZ' -AsUTC)",
   "data": {
-    "Id": "https://flazkv-shared-neu-001.vault.azure.net/certificates/mycert05/7983b04bd0534cb0bf57e6b27c00f3bd",
-    "VaultName": "flazkv-shared-neu-001",
+    "Id": "https://$vaultName.vault.azure.net/certificates/$certName/7983b04bd0534cb0bf57e6b27c00f3bd",
+    "VaultName": "$vaultName",
     "ObjectType": "Certificate",
     "ObjectName": "$certName",
     "Version": "7983b04bd0534cb0bf57e6b27c00f3bd",
@@ -60,16 +81,27 @@ $json = @"
 }
 "@
 
-$queue = Get-AzStorageQueue -Name $QueueName -Context $ctx
-Write-Host ("Queued messages (approx.): " + $queue.ApproximateMessageCount)
+Write-Host "Using queue '$QueueName'" 
 
-$queueClient = $queue.QueueClient
+# Create a storage context
+Write-Host "Creating storage context for account '$StorageAccountName' containing the queue '$QueueName'..."
+$ctx = New-AzStorageContext -StorageAccountName $storageAccountName
+
+# Get the queue and check current messages
+Write-Host "Checking queue '$QueueName' for existing messages..."
+$queue = Get-AzStorageQueue -Name $QueueName -Context $ctx
+Write-Host ('Queued messages (approx.): ' + $queue.ApproximateMessageCount)
 
 # Send the message in base64 format
 $base64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($json))
+$queueClient = $queue.QueueClient
 
-$queueClient.SendMessage($base64)
-
-Write-Host "Message sent to queue '$queueName'."
-
+try {
+  Write-Host "Sending the message to queue '$QueueName'..."
+  $queueClient.SendMessage($base64)
+  Write-Host "Message sent to queue '$queueName'."
+}
+catch {
+  Write-Error "Failed to send request to the queue. $_"
+}
 
