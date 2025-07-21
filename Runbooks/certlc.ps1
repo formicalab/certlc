@@ -281,6 +281,38 @@ function Export-PfxWithGroupProtection {
     }
 }
 
+########################################
+# FUNCTIONS - Find-TemplateNameFromOid #
+########################################
+
+<#
+Find-TemplateNameFromOid: find the certificate template name by OID.
+This function queries the Active Directory Certificate Services configuration to find the template name associated with a given OID.
+This is used in the New-CertificateRenewalRequest function to get the template name from the certificate OID.
+#>
+
+function Find-TemplateNameFromOid {
+    param (
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$oid
+    )
+
+    $rootDse = [ADSI]"LDAP://RootDSE"
+    $configDN = $rootDse.configurationNamingContext
+    $searchRoot = "LDAP://CN=Certificate Templates,CN=Public Key Services,CN=Services,$configDN"
+    $entry = [ADSI]$searchRoot
+    $searcher = New-Object DirectoryServices.DirectorySearcher $entry
+    $searcher.Filter = "(&(objectClass=pKICertificateTemplate)(msPKI-Cert-Template-OID=$oid))"
+    $searcher.PropertiesToLoad.Add("name") | Out-Null
+    $result = $searcher.FindOne()
+    if ($null -eq $result) {
+        return [string]::Empty
+    }
+    return $result.Properties["name"][0]
+}
+
+
 #############################################
 # FUNCTIONS - New-CertificateRenewalRequest #
 #############################################
@@ -328,22 +360,39 @@ function New-CertificateRenewalRequest {
     }
 
     # get the OID of the Certificate Template
-    $oid = $cert.Certificate.Extensions | Where-Object { $_.Oid.FriendlyName -eq 'Certificate Template Information' }
-    if ($null -eq $oid) {
-        throw 'Error getting OID from certificate: Certificate Template Information not found.'
+    $templateExtension = $cert.Certificate.Extensions | Where-Object { $_.Oid.FriendlyName -eq 'Certificate Template Information' }
+    if ($null -eq $templateExtension) {
+        throw 'Error getting template information from certificate: the Certificate Template Information extensions was not found.'
     }
-    # convert in a string like:
-    # Template=Flab-ShortWebServer(1.3.6.1.4.1.311.21.8.15431357.2613787.6440092.16459852.14380503.11.12399345.16691736), Major Version Number=100, Minor Version Number=5
-    $oid = $oid.Format(0)
+    # $templateExtension.Format($false) returns a string like:
+    # - Template=Flab-ShortWebServer(1.3.6.1.4.1.311.21.8.15431357.2613787.6440092.16459852.14380503.11.12399345.16691736), Major Version Number=100, Minor Version Number=5
+    # - Template=1.3.6.1.4.1.311.21.8.15431357.2613787.6440092.16459852.14380503.11.12399345.16691736, Major Version Number=100, Minor Version Number=5
+    $asn = $templateExtension.Format($false)
 
-    # extract the template name and the ASN.1 values using regex
-    $CertificateTemplate = $oid -replace '.*Template=(.*)\(.*\).*', '$1'
-    $CertificateTemplateASN = $oid -replace '.*\((.*)\).*', '$1'
+    # extract the OID using a regex working for both cases
+    $regex = [regex]'(?<=Template=(?:[^\(]*\()?)(\d+(?:\.\d+)+)'
+    if (-not $regex.IsMatch($asn)) {
+        throw "Error getting OID from certificate: Template OID not found in string: $asn"
+    }
+    $oid = $regex.Match($asn).Value
+
+    # lookup the template name using the OID
+    try {
+        Write-Log "Looking up template name for OID: $oid"
+        $certificateTemplate = Find-TemplateNameFromOid -Oid $oid    
+    }
+    catch {
+        throw "Error getting OID from certificate: Find-TemplateNameFromOidAttribute failed for OID: $($oid): $_"
+    }
+    if ([string]::IsNullOrEmpty($certificateTemplate)) {
+        throw "Error getting OID from certificate: Template name not found for OID: $oid"
+    }
+    Write-Log "Template name found for OID $($oid) is: $certificateTemplate"
 
     # get PfxProtectTo from the certificate tags
     $PfxProtectTo = $cert.Tags['PfxProtectTo']
 
-    Write-Log "Certificate $CertificateName found in vault $($VaultName): Subject: $CertificateSubject, Template: $CertificateTemplate ($CertificateTemplateASN), PfxProtectTo: $PfxProtectTo"
+    Write-Log "Certificate $CertificateName found in vault $($VaultName): Subject: $CertificateSubject, Template: $certificateTemplate ($oid), PfxProtectTo: $PfxProtectTo"
     if ($null -eq $CertificateDnsNames) {
         Write-Log 'Certificate DNS Names: N/A'
     }
@@ -354,7 +403,7 @@ function New-CertificateRenewalRequest {
     # Now we have all the details to create the renew request.
     # Renew actually uses same code as New-CertificateRequest, so we can reuse it.
     # Exceptions will be caught directly in the main section of the script
-    New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxProtectTo $PfxProtectTo
+    New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $certificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxProtectTo $PfxProtectTo
 }
 
 ######################################
