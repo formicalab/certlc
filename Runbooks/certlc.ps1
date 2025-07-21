@@ -281,21 +281,20 @@ function Export-PfxWithGroupProtection {
     }
 }
 
-########################################
-# FUNCTIONS - Find-TemplateNameFromOid #
-########################################
+#################################
+# FUNCTIONS - Find-TemplateName #
+#################################
 
 <#
-Find-TemplateNameFromOid: find the certificate template name by OID.
-This function queries the Active Directory Certificate Services configuration to find the template name associated with a given OID.
-This is used in the New-CertificateRenewalRequest function to get the template name from the certificate OID.
+Find-TemplateName: find the certificate template name by OID or CN or DisplayName.
+This function queries the Active Directory Certificate Services configuration to find the template name associated with a given OID or CN or DisplayName.
 #>
 
-function Find-TemplateNameFromOid {
+function Find-TemplateName {
     param (
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
-        [string]$oid
+        [string]$cnOrDisplayNameOrOid
     )
 
     $rootDse = [ADSI]"LDAP://RootDSE"
@@ -303,7 +302,7 @@ function Find-TemplateNameFromOid {
     $searchRoot = "LDAP://CN=Certificate Templates,CN=Public Key Services,CN=Services,$configDN"
     $entry = [ADSI]$searchRoot
     $searcher = New-Object DirectoryServices.DirectorySearcher $entry
-    $searcher.Filter = "(&(objectClass=pKICertificateTemplate)(msPKI-Cert-Template-OID=$oid))"
+    $searcher.Filter = "(&(objectClass=pKICertificateTemplate)(|(cn=$cnOrDisplayNameOrOid)(displayName=$cnOrDisplayNameOrOid)(msPKI-Cert-Template-OID=$cnOrDisplayNameOrOid)))"
     $searcher.PropertiesToLoad.Add("name") | Out-Null
     $result = $searcher.FindOne()
     if ($null -eq $result) {
@@ -311,7 +310,6 @@ function Find-TemplateNameFromOid {
     }
     return $result.Properties["name"][0]
 }
-
 
 #############################################
 # FUNCTIONS - New-CertificateRenewalRequest #
@@ -334,17 +332,17 @@ function New-CertificateRenewalRequest {
     )
 
     # before processing the request, we need to obtain the other certificate details, such as template, subject, and DNS names
-    Write-Log "Getting additional certificate details for $CertificateName from key vault $VaultName..."
+    Write-Log "Renew: Getting additional certificate details for $CertificateName from key vault $VaultName..."
     $cert = $null
     try {
         $cert = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName
     }
     catch {
-        throw "Error getting certificate details for $CertificateName from vault $($VaultName): $_"
+        throw "Renew: Error getting certificate details for $CertificateName from vault $($VaultName): $_"
     }
 
     if ($null -eq $cert) {
-        throw "Error getting certificate details for $CertificateName from vault $($VaultName): empty response! Certificate may not exist in the vault."
+        throw "Renew: Error getting certificate details for $CertificateName from vault $($VaultName): empty response! Certificate may not exist in the vault."
     }
 
     # get the certificate subject
@@ -362,7 +360,7 @@ function New-CertificateRenewalRequest {
     # get the OID of the Certificate Template
     $templateExtension = $cert.Certificate.Extensions | Where-Object { $_.Oid.FriendlyName -eq 'Certificate Template Information' }
     if ($null -eq $templateExtension) {
-        throw 'Error getting template information from certificate: the Certificate Template Information extensions was not found.'
+        throw 'Renew: Error getting template information from certificate: the Certificate Template Information extensions was not found.'
     }
     # $templateExtension.Format($false) returns a string like:
     # - Template=Flab-ShortWebServer(1.3.6.1.4.1.311.21.8.15431357.2613787.6440092.16459852.14380503.11.12399345.16691736), Major Version Number=100, Minor Version Number=5
@@ -372,38 +370,39 @@ function New-CertificateRenewalRequest {
     # extract the OID using a regex working for both cases
     $regex = [regex]'(?<=Template=(?:[^\(]*\()?)(\d+(?:\.\d+)+)'
     if (-not $regex.IsMatch($asn)) {
-        throw "Error getting OID from certificate: Template OID not found in string: $asn"
+        throw "Renew: Error getting OID from certificate: Template OID not found in string: $asn"
     }
     $oid = $regex.Match($asn).Value
 
     # lookup the template name using the OID
     try {
-        Write-Log "Looking up template name for OID: $oid"
-        $certificateTemplate = Find-TemplateNameFromOid -Oid $oid    
+        Write-Log "Renew: Looking up template name for OID: $oid"
+        $certificateTemplateName = Find-TemplateName -cnOrDisplayNameOrOid $oid
     }
     catch {
-        throw "Error getting OID from certificate: Find-TemplateNameFromOidAttribute failed for OID: $($oid): $_"
+        throw "Renew: Error getting OID from certificate: Find-TemplateName failed for OID: $($oid): $_"
     }
-    if ([string]::IsNullOrEmpty($certificateTemplate)) {
-        throw "Error getting OID from certificate: Template name not found for OID: $oid"
+    if ([string]::IsNullOrEmpty($certificateTemplateName)) {
+        throw "Renew: Error getting OID from certificate: Template name not found in Active Directory for OID: $oid"
     }
-    Write-Log "Template name found for OID $($oid) is: $certificateTemplate"
+    Write-Log "Renew: Template name found for OID $($oid) is: $certificateTemplateName"
 
     # get PfxProtectTo from the certificate tags
     $PfxProtectTo = $cert.Tags['PfxProtectTo']
 
-    Write-Log "Certificate $CertificateName found in vault $($VaultName): Subject: $CertificateSubject, Template: $certificateTemplate ($oid), PfxProtectTo: $PfxProtectTo"
+    Write-Log "Renew: Certificate $CertificateName found in vault $($VaultName): Subject: $CertificateSubject, Template: $certificateTemplateName ($oid), PfxProtectTo: $PfxProtectTo"
     if ($null -eq $CertificateDnsNames) {
-        Write-Log 'Certificate DNS Names: N/A'
+        Write-Log 'Renew: Certificate DNS Names: N/A'
     }
     else {
-        Write-Log "Certificate DNS Names: $($CertificateDnsNames -join ', ')"
+        Write-Log "Renew: Certificate DNS Names: $($CertificateDnsNames -join ', ')"
     }
 
     # Now we have all the details to create the renew request.
     # Renew actually uses same code as New-CertificateRequest, so we can reuse it.
     # Exceptions will be caught directly in the main section of the script
-    New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $certificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxProtectTo $PfxProtectTo
+    Write-Log "Renew: got all required information to process the certificate renewal request for $CertificateName in vault $VaultName"
+    New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplateName $certificateTemplateName -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxProtectTo $PfxProtectTo
 }
 
 ######################################
@@ -424,7 +423,7 @@ function New-CertificateRequest {
 
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
-        [string]$CertificateTemplate,
+        [string]$CertificateTemplateName,
 
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
@@ -441,16 +440,16 @@ function New-CertificateRequest {
         [string]$PfxProtectTo
     )
 
-    # create certificate - if a previous request is in progress, reuse it
+    # create certificate CSR - if a previous request is in progress, reuse it
     $csr = $null
     try {
         $op = Get-AzKeyVaultCertificateOperation -VaultName $VaultName -Name $CertificateName | Where-Object { $_.Status -eq 'inProgress' }
         if ($null -ne $op) {
-            Write-Log "Certificate request is already in progress for this certificate: $CertificateName; reusing the existing request." -Level 'Warning'
+            Write-Log "KeyVault: Certificate request is already in progress in $VaultName for this certificate: $CertificateName; reusing the existing request." -Level 'Warning'
             $csr = $op.CertificateSigningRequest
         }
         else {
-            Write-Log "Creating a new CSR for certificate $CertificateName in key vault $VaultName..."
+            Write-Log "KeyVault: Creating a new CSR for certificate $CertificateName in key vault $VaultName..."
             if ($null -ne $CertificateDnsNames) {
                 # create a new CSR with the DNS names
                 $Policy = New-AzKeyVaultCertificatePolicy -SecretContentType 'application/x-pkcs12' -SubjectName $CertificateSubject -IssuerName 'Unknown' -DnsName $CertificateDnsNames
@@ -459,12 +458,12 @@ function New-CertificateRequest {
                 # create a new CSR without DNS names
                 $Policy = New-AzKeyVaultCertificatePolicy -SecretContentType 'application/x-pkcs12' -SubjectName $CertificateSubject -IssuerName 'Unknown'
             }
-            $result = Add-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -CertificatePolicy $Policy -Tag @{ 'PfxProtectTo' = $PfxProtectTo }
+            $result = Add-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -CertificatePolicy $Policy -Tag @{ 'PfxProtectTo' = $PfxProtectTo; 'CertificateTemplateName' = $CertificateTemplateName }
             $csr = $result.CertificateSigningRequest
         }
     }
     catch {
-        throw "Error generating CSR in Key Vault: $_"
+        throw "KeyVault: Error generating CSR in Key Vault: $_"
     }
 
     # see https://www.sysadmins.lv/blog-en/introducing-to-certificate-enrollment-apis-part-3-certificate-request-submission-and-response-installation.aspx
@@ -477,35 +476,35 @@ function New-CertificateRequest {
     # CR_OUT_BASE64 = 0x1,
     # CR_OUT_BINARY = 0x2
 
-    Write-Log "Sending request to the CA $CA..."
+    Write-Log "CA: Sending request to the CA $CA using template $($CertificateTemplateName) for certificate $CertificateName..."
     try {
         $CertRequest = New-Object -ComObject CertificateAuthority.Request
-        $CertRequestStatus = $CertRequest.Submit(0x1, $csr, "CertificateTemplate:$($CertificateTemplate)", $CA)
+        $CertRequestStatus = $CertRequest.Submit(0x1, $csr, "CertificateTemplate:$($CertificateTemplateName)", $CA)
 
         # status is described in https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-wcce/c084a3e3-4df3-4a28-9a3b-6b08487b04f3?redirectedfrom=MSDN
 
         switch ($CertRequestStatus) {
             2 {
-                throw "Request was denied. Check the CA $CA for details."
+                throw "CA: Request was denied. Check the CA $CA for details."
             }
             3 {
-                Write-Log 'Certificate Request submitted successfully.'
+                Write-Log "CA: Certificate Request for $CertificateName submitted successfully."
                 # https://learn.microsoft.com/en-us/windows/win32/api/certcli/nf-certcli-icertrequest-getcertificate?redirectedfrom=MSDN
                 # 0 = CR_OUT_BASE64HEADER (BASE64 format with begin/end header - this is how the key vault expects the certificate in order to perform a merge)
                 $CertEncoded = $CertRequest.GetCertificate(0x0)
-                Write-Log "Certificate received from CA $CA"
+                Write-Log "CA: Certificate received from CA $CA"
             }
             5 {
-                throw "Request to CA $CA is pending. This is not expected since this runbook can only process completed requests. Review the certiicate template and CA configuration to ensure that certificates are immediately issued."
+                throw "CA: Request to $CA is pending. This is not expected since this runbook can only process completed requests. Review the certiicate template and CA configuration to ensure that certificates are immediately issued."
             }
             default {
-                throw "Request to CA $CA failed with status $($CertRequestStatus). Check codes in https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-wcce/c084a3e3-4df3-4a28-9a3b-6b08487b04f3?redirectedfrom=MSDN"
+                throw "CA: Request to $CA failed with status $($CertRequestStatus). Check codes in https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-wcce/c084a3e3-4df3-4a28-9a3b-6b08487b04f3?redirectedfrom=MSDN"
             }
         }
 
     }
     catch {
-        throw "Error submitting request to the CA $($CA): $_"
+        throw "CA: Error submitting request to $($CA): $_"
     }
 
     # we need to save the certificate in a temporary file because the Import-AzKeyVaultCertificate cmdlet does not accept a base64 string as input
@@ -513,32 +512,32 @@ function New-CertificateRequest {
     Set-Content -Path $CertEncodedFile -Value $CertEncoded
 
     # import the certificate into the key vault
-    Write-Log "Importing the certificate $CertificateName into the key vault $VaultName..."
+    Write-Log "KeyVault: Importing the certificate $CertificateName into the key vault $VaultName..."
     try {
         $newCert = Import-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -FilePath $CertEncodedFile
         if ($null -eq $newCert) {
-            throw 'Error importing certificate into the key vault: Import-AzKeyVaultCertificate returned null!'
+            throw 'KeyVault: Error importing certificate into the key vault: Import-AzKeyVaultCertificate returned null!'
         }
     }
     catch {
-        throw "Error importing certificate into the key vault: $_"
+        throw "KeyVault: Error importing certificate $CertificateName into the key vault $($VaultName): $_"
     }
     finally {
         Remove-Item -Path $CertEncodedFile -Force -ErrorAction SilentlyContinue
     }
-    Write-Log 'Certificate imported into the key vault.'
+    Write-Log "KeyVault: Certificate $CertificateName imported into the key vault $($VaultName)."
 
     # if required, download the certificate to a local file in the pfx folder
     if ([string]::IsNullOrEmpty($PfxProtectTo)) {
-        Write-Log 'PfxProtectTo is not specified, skipping PFX export.'
+        Write-Log 'PFX: PfxProtectTo is not specified, skipping PFX export.'
     }
     else {
         # create the root folder if it does not exist
         if (-not (Test-Path -Path $PfxRootFolder)) {
-            Write-Log "Creating the PFX root folder: $PfxRootFolder"
+            Write-Log "PFX: Creating the PFX root folder: $PfxRootFolder"
             New-Item -Path $PfxRootFolder -ItemType Directory -Force | Out-Null
         }
-        Write-Log "PFX root folder verified: $PfxRootFolder"
+        Write-Log "PFX: Root folder verified: $PfxRootFolder"
 
         # determine per-user or per-group folder name from $PfxProtectTo
         $principal = $null
@@ -557,7 +556,7 @@ function New-CertificateRequest {
 
         # create the target folder if it does not exist
         if (-not (Test-Path -Path $PfxTargetFolder)) {
-            Write-Log "Creating the target folder for PFX: $PfxTargetFolder"
+            Write-Log "PFX: Creating the target folder for PFX: $PfxTargetFolder"
             New-Item -Path $PfxTargetFolder -ItemType Directory -Force | Out-Null
 
             try {
@@ -581,27 +580,27 @@ function New-CertificateRequest {
                 $acl.SetAccessRule($userRule)
 
                 Set-Acl -Path $PfxTargetFolder -AclObject $acl
-                Write-Log "ACL set on target folder for PFX: $($PfxTargetFolder): Administrators & SYSTEM FullControl, $PfxProtectTo Read+Execute"
+                Write-Log "PFX: ACL set on target folder for PFX: $($PfxTargetFolder): Administrators & SYSTEM FullControl, $PfxProtectTo Read+Execute"
             }
             catch {
-                throw "Error setting permissions on the target folder for PFX $($PfxTargetFolder): $_"
+                throw "PFX: Error setting permissions on the target folder for PFX $($PfxTargetFolder): $_"
             }
         }
 
-        Write-Log "Target folder for PFX verified for PfxProtectTo $($PfxProtectTo): $PfxTargetFolder"
+        Write-Log "PFX: Target folder for PFX verified for PfxProtectTo $($PfxProtectTo): $PfxTargetFolder"
         $pfxFile = Join-Path -Path $PfxTargetFolder -ChildPath "$($CertificateName).pfx"
 
         # get the certificate from the key vault
-        Write-Log "Certificate $($CertificateName): getting the certificate from key vault $VaultName to export it to PFX file $pfxFile..."
+        Write-Log "PFX: Certificate $($CertificateName): getting the certificate from key vault $VaultName to export it to PFX file $pfxFile..."
         try {
             $certBase64 = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertificateName -AsPlainText
         }
         catch {
-            throw "Error getting certificate $CertificateName from key vault $($VaultName): $_"
+            throw "PFX: Error getting certificate $CertificateName from key vault $($VaultName): $_"
         }
 
         if ([string]::IsNullOrEmpty($certBase64)) {
-            throw "Error getting certificate $CertificateName from key vault $($VaultName): the certificate is empty!"
+            throw "PFX: Error getting certificate $CertificateName from key vault $($VaultName): the certificate is empty!"
         }
 
         # convert the base64 string to a byte array and create an X509Certificate2 object
@@ -614,32 +613,32 @@ function New-CertificateRequest {
         # test exportability of private key
         if (-not $x509Cert.HasPrivateKey) {
             $x509Cert = $null
-            throw "Error exporting certificate $CertificateName to PFX file: the private key is not available!"
+            throw "PFX: Error exporting certificate $CertificateName to PFX file: the private key is not available!"
         }
-        Write-Log "Certificate $($CertificateName): private key is available."
+        Write-Log "PFX: Certificate $($CertificateName): private key is available."
 
         try {
             $x509cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Pfx) | Out-Null
-            Write-Log "Certificate $($CertificateName): private key is exportable."
+            Write-Log "PFX: Certificate $($CertificateName): private key is exportable."
         }
         catch {
             $x509Cert = $null
-            throw "Error exporting certificate $CertificateName to PFX file: the private key is present but not exportable!"
+            throw "PFX: Error exporting certificate $CertificateName to PFX file: the private key is present but not exportable!"
         }
 
         # remove the PFX file if it already exists, to ensure we always export a fresh copy
         if (Test-Path -Path $pfxFile) {
-            Write-Log "Removing existing PFX file: $pfxFile"
+            Write-Log "PFX: Removing existing PFX file: $pfxFile"
             try {
                 Remove-Item -Path $pfxFile -Force
             }
             catch {
                 $x509Cert = $null
-                throw "Error removing existing PFX file: $($pfxFile): $_"
+                throw "PFX: Error removing existing PFX file: $($pfxFile): $_"
             }
         }
         else {
-            Write-Log "No existing PFX file found: $pfxFile"
+            Write-Log "PFX: No existing PFX file found: $pfxFile"
         }
 
         # do the actual export to PFX file
@@ -664,7 +663,7 @@ function New-CertificateRequest {
             Export-PfxWithGroupProtection -Cert $x509Cert -ProtectTo $PfxProtectTo -PfxFile $pfxFile
         }
         catch {
-            throw "Error exporting certificate to PFX protecting it to $($PfxProtectTo): $_"
+            throw "PFX: Error exporting certificate to PFX protecting it to $($PfxProtectTo): $_"
         }
         finally {
             $x509Cert = $null
@@ -672,10 +671,10 @@ function New-CertificateRequest {
 
         # check if the PFX file was created successfully
         if (-not (Test-Path -Path $pfxFile)) {
-            throw "Error exporting certificate to PFX file: $pfxFile does not exist after export!"
+            throw "PFX: Error exporting certificate to PFX file: $pfxFile does not exist after export!"
         }
 
-        Write-Log "Certificate $CertificateName exported to PFX file $pfxFile"
+        Write-Log "PFX: Certificate $CertificateName exported to PFX file $pfxFile"
     }
 }
 
@@ -838,27 +837,27 @@ else {
 
 # check version
 if ([string]::IsNullOrEmpty($requestBody.specversion)) {
-    $msg = "Missing or empty mandatory parameter: 'specversion' in request body!"
+    $msg = "Validation: Missing or empty mandatory parameter: 'specversion' in request body!"
     Write-Log $msg -Level 'Error'
     throw $msg
 }
 if ($requestBody.specversion -ne $Version) {
-    $msg = "The version specified in the request, $($requestBody.specversion), does not match the script version $Version!"
+    $msg = "Validation: The version specified in the request, $($requestBody.specversion), does not match the script version $Version!"
     Write-Log $msg -Level 'Error'
     throw $msg
 }
 else {
-    Write-Log "specversion: $($requestBody.specversion)"
+    Write-Log "Validation: specversion: $($requestBody.specversion)"
 }
 
 # process requests based on type
 if ([string]::IsNullOrEmpty($requestBody.type)) {
-    $msg = "Missing or empty mandatory parameter: 'type' in request body!"
+    $msg = "Validation: Missing or empty mandatory parameter: 'type' in request body!"
     Write-Log $msg -Level 'Error'
     throw $msg
 }
 else {
-    Write-Log "Request type: $($requestBody.type)"
+    Write-Log "Validation: request type: $($requestBody.type)"
 }
 
 switch ($requestBody.type) {
@@ -872,11 +871,11 @@ switch ($requestBody.type) {
         # start formal validation of mandatory parameters:
 
         if ([string]::IsNullOrEmpty($VaultName)) {
-            throw "Missing or empty mandatory parameter: 'VaultName'!"
+            throw "Validation (renewal): Missing or empty mandatory parameter: 'VaultName'!"
         }
 
         if ([string]::IsNullOrEmpty($CertificateName)) {
-            throw "Missing or empty mandatory parameter: 'ObjectName'!"
+            throw "Validation (renewal): Missing or empty mandatory parameter: 'ObjectName'!"
         }
 
         # invoke renewal
@@ -884,7 +883,7 @@ switch ($requestBody.type) {
             New-CertificateRenewalRequest -VaultName $VaultName -CertificateName $CertificateName -CA $CA
         }
         catch {
-            $msg = "Error processing certificate renew request: $_"
+            $msg = "Renewal: Error processing certificate renew request: $_"
             Write-Log $msg -Level 'Error'
             throw $msg
         }
@@ -904,14 +903,14 @@ switch ($requestBody.type) {
 
         # VaultName
         if ([string]::IsNullOrEmpty($VaultName)) {
-            $msg = "Missing or empty mandatory parameter: 'data.VaultName' in request body!"
+            $msg = "Validation (new request): Missing or empty mandatory parameter: 'data.VaultName' in request body!"
             Write-Log $msg -Level 'Error'
             throw $msg
         }
 
         # CertificateName: presence and non-empty check
         if ([string]::IsNullOrEmpty($CertificateName)) {
-            $msg = "Missing or empty mandatory parameter: 'data.CertificateName' in request body!"
+            $msg = "Validation (new request): Missing or empty mandatory parameter: 'data.CertificateName' in request body!"
             Write-Log $msg -Level 'Error'
             throw $msg
         }
@@ -921,66 +920,81 @@ switch ($requestBody.type) {
             $deletedCert = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -InRemovedState
         }
         catch {
-            $msg = "Error checking for deleted certificate: $_"
+            $msg = "Validation (new request): Error checking for deleted certificate: $_"
             Write-Log $msg -Level 'Error'
             throw $msg
         }
         if (($null -ne $deletedCert) -and ($null -ne $deletedCert.DeletedDate)) {
-            $msg = "Certificate $CertificateName is already in the key vault and in deleted state since $($deletedCert.DeletedDate). It must be purged before creating a new one; otherwise specify a different certificate name."
+            $msg = "Validation (new request): Certificate $CertificateName is already in the key vault and in deleted state since $($deletedCert.DeletedDate). It must be purged before creating a new one; otherwise specify a different certificate name."
             Write-Log $msg -Level 'Error'
             throw $msg
         }
 
         # CertificateTemplate: presence and non-empty check
         if ([string]::IsNullOrEmpty($CertificateTemplate)) {
-            $msg = "Missing or empty mandatory parameter: 'data.CertificateTemplate' in request body!"
+            $msg = "Validation (new request): Missing or empty mandatory parameter: 'data.CertificateTemplate' in request body!"
+            Write-Log $msg -Level 'Error'
+            throw $msg
+        }
+
+        # CertificateTemplate: check if the template exists in AD; caller may have specified the template name (CN) or the display name or the OID. We need the 'name' attribute
+        try {
+            $CertificateTemplateName = Find-TemplateName -cnOrDisplayNameOrOid $CertificateTemplate
+        }
+        catch {
+            $msg = "Validation (new request): Error finding template name for certificate template: $_"
+            Write-Log $msg -Level 'Error'
+            throw $msg
+        }
+        if ([string]::IsNullOrEmpty($CertificateTemplateName)) {
+            $msg = "Validation (new request): Certificate template $($CertificateTemplate) not found in Active Directory! Ensure the template exists and is published in the CA."
             Write-Log $msg -Level 'Error'
             throw $msg
         }
 
         # CertificateSubject: presence and non-empty check
         if ([string]::IsNullOrEmpty($CertificateSubject)) {
-            $msg = "Missing or empty mandatory parameter: 'data.CertificateSubject' in request body!"
+            $msg = "Validation (new request): Missing or empty mandatory parameter: 'data.CertificateSubject' in request body!"
             Write-Log $msg -Level 'Error'
             throw $msg
         }
 
         # DnsNames (optional, but if specified, must be an array)
         if ($CertificateDnsNames -and $CertificateDnsNames -isnot [array]) {
-            $msg = "Parameter 'CertificateDnsNames' is not an array!"
+            $msg = "Validation (new request): Parameter 'CertificateDnsNames' is not an array!"
             Write-Log $msg -Level 'Error'
             throw $msg
         }
 
         # remove all escape backslashes from PfxProtectTo, ensuring that only one backslash is present
         if ($PfxProtectTo -and $PfxProtectTo -match '\\') {
-            Write-Log "PfxProtectTo contains backslashes: $PfxProtectTo"
+            Write-Log "Validation (new request): PfxProtectTo contains backslashes: $PfxProtectTo"
             # replace multiple backslashes with a single one
             $PfxProtectTo = $PfxProtectTo -replace '\\+', '\'
-            Write-Log "PfxProtectTo after removing extra backslashes: $PfxProtectTo"
+            Write-Log "Validation (new request): PfxProtectTo after removing extra backslashes: $PfxProtectTo"
         }
 
         # end of validation. Now process the new certificate request
 
         if ($null -ne $CertificateDnsNames) {
-            Write-Log "Performing new certificate request for certificate $CertificateName using vault $VaultName, template $CertificateTemplate, subject $CertificateSubject, DNS names $($CertificateDnsNames -join ', ')..."
+            Write-Log "New Request: Performing new certificate request for certificate $CertificateName using vault $VaultName, template $CertificateTemplateName, subject $CertificateSubject, DNS names $($CertificateDnsNames -join ', ')..."
         }
         else {
-            Write-Log "Performing new certificate request for certificate $CertificateName using vault $VaultName, template $CertificateTemplate, subject $CertificateSubject..."
+            Write-Log "New Request: Performing new certificate request for certificate $CertificateName using vault $VaultName, template $CertificateTemplateName, subject $CertificateSubject..."
         }
 
         try {
-            New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplate $CertificateTemplate -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxProtectTo $PfxProtectTo
+            New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplateName $CertificateTemplateName -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxProtectTo $PfxProtectTo
         }
         catch {
-            $msg = "Error processing new certificate request: $_"
+            $msg = "New Request: Error processing new certificate request: $_"
             Write-Log $msg -Level 'Error'
             throw $msg
         }
     }
 
     default {
-        $msg = "Unknown request type: $($requestBody.type). Supported values are: Microsoft.KeyVault.CertificateNearExpiry, CertLC.NewCertificateRequest!"
+        $msg = "Validation: Unknown request type: $($requestBody.type). Supported values are: Microsoft.KeyVault.CertificateNearExpiry, CertLC.NewCertificateRequest!"
         Write-Log $msg -Level 'Error'
         throw $msg
     }
