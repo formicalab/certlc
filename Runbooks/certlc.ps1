@@ -76,6 +76,26 @@ For new certificate requests, the body has a structure like this:
   }
 }
 
+For certificate revocation requests, the body has a structure like this:
+
+{
+  "id": "<event identifier, free field>",
+  "source": "<free field, can be used to identify the requestor>",
+  "specversion": "1.0",
+  "type": "CertLC.CertificateRevocationRequest",
+  "subject": "<name of the new certificate>",
+  "time": "<event time, using format: 2025-06-08T19:52:25.1524887Z>",
+  "data": {
+    "Id": "<request id, free field>",
+    "VaultName": "<key vault name>",
+    "ObjectType": "Certificate",
+    "ObjectName": "<name of the new certificate>",
+    "RevocationReason": 1,  # see https://learn.microsoft.com/en-us/windows/win32/api/certadm/nf-certadm-icertadmin-revokecertificate for possible values
+  }
+}
+
+
+
 You can also pass the RequestBody parameter explicitly, which must be a JSON string with the same structure as above.
 In this case, use the Start-AzAutomationRunbook cmdlet to start the runbook, passing the jsonRequestBody parameter:
 
@@ -135,7 +155,7 @@ function Export-PfxWithGroupProtection {
     to create a protection descriptor and export the PFX file.
     The exported PFX file can be protected to multiple SIDs (users or groups).
 
-    Note: this function is used in the New-CertificateRequest function to export the certificate
+    Note: this function is used in the New-CertificateCreationRequest function to export the certificate
     #>
 
     param (
@@ -297,18 +317,18 @@ function Find-TemplateName {
         [string]$cnOrDisplayNameOrOid
     )
 
-    $rootDse = [ADSI]"LDAP://RootDSE"
+    $rootDse = [ADSI]'LDAP://RootDSE'
     $configDN = $rootDse.configurationNamingContext
     $searchRoot = "LDAP://CN=Certificate Templates,CN=Public Key Services,CN=Services,$configDN"
     $entry = [ADSI]$searchRoot
     $searcher = New-Object DirectoryServices.DirectorySearcher $entry
     $searcher.Filter = "(&(objectClass=pKICertificateTemplate)(|(cn=$cnOrDisplayNameOrOid)(displayName=$cnOrDisplayNameOrOid)(msPKI-Cert-Template-OID=$cnOrDisplayNameOrOid)))"
-    $searcher.PropertiesToLoad.Add("name") | Out-Null
+    $searcher.PropertiesToLoad.Add('name') | Out-Null
     $result = $searcher.FindOne()
     if ($null -eq $result) {
         return [string]::Empty
     }
-    return $result.Properties["name"][0]
+    return $result.Properties['name'][0]
 }
 
 #############################################
@@ -399,19 +419,19 @@ function New-CertificateRenewalRequest {
     }
 
     # Now we have all the details to create the renew request.
-    # Renew actually uses same code as New-CertificateRequest, so we can reuse it.
+    # Renew actually uses same code as New-CertificateCreationRequest, so we can reuse it.
     # Exceptions will be caught directly in the main section of the script
     Write-Log "Renew: got all required information to process the certificate renewal request for $CertificateName in vault $VaultName"
-    New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplateName $certificateTemplateName -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxProtectTo $PfxProtectTo
+    New-CertificateCreationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplateName $certificateTemplateName -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxProtectTo $PfxProtectTo
 }
 
-######################################
-# FUNCTIONS - New-CertificateRequest #
-######################################
+##############################################
+# FUNCTIONS - New-CertificateCreationRequest #
+##############################################
 
-# New-CertificateRequest: create a new certificate request
+# New-CertificateCreationRequest: create a new certificate request
 
-function New-CertificateRequest {
+function New-CertificateCreationRequest {
     param (
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
@@ -678,6 +698,73 @@ function New-CertificateRequest {
     }
 }
 
+################################################
+# FUNCTIONS - New-CertificateRevocationRequest #
+################################################
+
+function New-CertificateRevocationRequest {
+    param (
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$VaultName,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$CertificateName,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateRange(0, 6)]
+        [Int64]$RevocationReason
+    )
+
+    # get the certificate from the key vault
+    Write-Log "KeyVault: Certificate $($CertificateName): getting the certificate from key vault $VaultName to obtain details..."
+    try {
+        $certBase64 = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertificateName -AsPlainText
+    }
+    catch {
+        throw "KeyVault: Error getting certificate $CertificateName from key vault $($VaultName): $_"
+    }
+
+    if ([string]::IsNullOrEmpty($certBase64)) {
+        throw "KeyVault: Error getting certificate $CertificateName from key vault $($VaultName): the certificate is empty!"
+    }
+
+    # convert the base64 string to a byte array and create an X509Certificate2 object
+    $certBytes = [Convert]::FromBase64String($certBase64)
+    $certBase64 = $null
+    $x509Cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($certBytes, [string]::Empty, 'Exportable')
+    # $x509Cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($certBytes, [string]::Empty, [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
+        
+    # save the serial number
+    $serialNumber = $x509Cert.SerialNumber
+
+    # cleanup objects that are no longer needed
+    $x509Cert = $null      
+    $certBytes = $null
+
+    Write-Log "CA: Sending revocation request for certificate $CertificateName to the CA $CA using reason $($RevocationReason)..."
+
+    try {
+        $CertAdmin = New-Object -ComObject CertificateAuthority.Admin
+        $certadmin.RevokeCertificate($CA, $serialNumber, $RevocationReason, 0)  # final 0 = revoke immediately. See https://learn.microsoft.com/en-us/windows/win32/api/certadm/nf-certadm-icertadmin-revokecertificate
+    }
+    catch {
+        throw "CA: Error revoking certificate $CertificateName in CA $($CA): $_"
+    }
+    Write-Log "CA: Certificate $CertificateName revoked successfully in CA $($CA)."
+
+    # remove the certificate from the key vault
+    Write-Log "KeyVault: Removing certificate $CertificateName from key vault $($VaultName)..."
+    try {
+        Remove-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -Force
+    }
+    catch {
+        throw "KeyVault: Error removing certificate $CertificateName from key vault $($VaultName): $_"
+    }
+    Write-Log "KeyVault: Certificate $CertificateName removed from key vault $($VaultName)."
+}
+
 #################################
 # MAIN - modules and parameters #
 #################################
@@ -837,7 +924,7 @@ else {
 
 # check version
 if ([string]::IsNullOrEmpty($requestBody.specversion)) {
-    $msg = "Validation: Missing or empty mandatory parameter: 'specversion' in request body!"
+    $msg = "Validation: Missing or empty mandatory string parameter: 'specversion' in request body!"
     Write-Log $msg -Level 'Error'
     throw $msg
 }
@@ -852,7 +939,7 @@ else {
 
 # process requests based on type
 if ([string]::IsNullOrEmpty($requestBody.type)) {
-    $msg = "Validation: Missing or empty mandatory parameter: 'type' in request body!"
+    $msg = "Validation: Missing or empty mandatory string parameter: 'type' in request body!"
     Write-Log $msg -Level 'Error'
     throw $msg
 }
@@ -871,11 +958,11 @@ switch ($requestBody.type) {
         # start formal validation of mandatory parameters:
 
         if ([string]::IsNullOrEmpty($VaultName)) {
-            throw "Validation (renewal): Missing or empty mandatory parameter: 'VaultName'!"
+            throw "Validation (renewal): Missing or empty mandatory string parameter: 'VaultName'!"
         }
 
         if ([string]::IsNullOrEmpty($CertificateName)) {
-            throw "Validation (renewal): Missing or empty mandatory parameter: 'ObjectName'!"
+            throw "Validation (renewal): Missing or empty mandatory string parameter: 'ObjectName'!"
         }
 
         # invoke renewal
@@ -901,16 +988,16 @@ switch ($requestBody.type) {
 
         # start formal validation of mandatory parameters:
 
-        # VaultName
+        # VaultName: presence and non-empty check
         if ([string]::IsNullOrEmpty($VaultName)) {
-            $msg = "Validation (new request): Missing or empty mandatory parameter: 'data.VaultName' in request body!"
+            $msg = "Validation (new request): Missing or empty mandatory string parameter: 'data.VaultName' in request body!"
             Write-Log $msg -Level 'Error'
             throw $msg
         }
 
         # CertificateName: presence and non-empty check
         if ([string]::IsNullOrEmpty($CertificateName)) {
-            $msg = "Validation (new request): Missing or empty mandatory parameter: 'data.CertificateName' in request body!"
+            $msg = "Validation (new request): Missing or empty mandatory string parameter: 'data.CertificateName' in request body!"
             Write-Log $msg -Level 'Error'
             throw $msg
         }
@@ -932,7 +1019,7 @@ switch ($requestBody.type) {
 
         # CertificateTemplate: presence and non-empty check
         if ([string]::IsNullOrEmpty($CertificateTemplate)) {
-            $msg = "Validation (new request): Missing or empty mandatory parameter: 'data.CertificateTemplate' in request body!"
+            $msg = "Validation (new request): Missing or empty mandatory string parameter: 'data.CertificateTemplate' in request body!"
             Write-Log $msg -Level 'Error'
             throw $msg
         }
@@ -954,7 +1041,7 @@ switch ($requestBody.type) {
 
         # CertificateSubject: presence and non-empty check
         if ([string]::IsNullOrEmpty($CertificateSubject)) {
-            $msg = "Validation (new request): Missing or empty mandatory parameter: 'data.CertificateSubject' in request body!"
+            $msg = "Validation (new request): Missing or empty mandatory string parameter: 'data.CertificateSubject' in request body!"
             Write-Log $msg -Level 'Error'
             throw $msg
         }
@@ -984,7 +1071,7 @@ switch ($requestBody.type) {
         }
 
         try {
-            New-CertificateRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplateName $CertificateTemplateName -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxProtectTo $PfxProtectTo
+            New-CertificateCreationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplateName $CertificateTemplateName -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -PfxProtectTo $PfxProtectTo
         }
         catch {
             $msg = "New Request: Error processing new certificate request: $_"
@@ -993,8 +1080,64 @@ switch ($requestBody.type) {
         }
     }
 
+    'CertLC.CertificateRevocationRequest' {
+
+        # get required parameters
+        $VaultName = $requestBody.data.VaultName
+        $CertificateName = $requestBody.data.ObjectName
+        $RevocationReason = $requestBody.data.RevocationReason
+
+        # VaultName: presence and non-empty check
+        if ([string]::IsNullOrEmpty($VaultName)) {
+            $msg = "Validation (revocation request): Missing or empty mandatory string parameter: 'data.VaultName' in request body!"
+            Write-Log $msg -Level 'Error'
+            throw $msg
+        }
+
+        # CertificateName: presence and non-empty check
+        if ([string]::IsNullOrEmpty($CertificateName)) {
+            $msg = "Validation (revocation request): Missing or empty mandatory string parameter: 'data.CertificateName' in request body!"
+            Write-Log $msg -Level 'Error'
+            throw $msg
+        }
+
+        # RevocationReason: see https://learn.microsoft.com/en-us/windows/win32/api/certadm/nf-certadm-icertadmin-revokecertificate
+        # 0 = CRL_REASON_UNSPECIFIED,
+        # 1 = CRL_REASON_KEY_COMPROMISE,
+        # 2 = CRL_REASON_CA_COMPROMISE,
+        # 3 = CRL_REASON_AFFILIATION_CHANGED,
+        # 4 = CRL_REASON_SUPERSEDED,
+        # 5 = CRL_REASON_CESSATION_OF_OPERATION,
+        # 6 = CRL_REASON_CERTIFICATE_HOLD
+
+        if ((-not $RevocationReason) -or ($RevocationReason -isnot [Int64])) {
+            $msg = "Validation (revocation request): Missing mandatory integer parameter: 'data.RevocationReason' in request body!"
+            Write-Log $msg -Level 'Error'
+            throw $msg
+        }
+
+        if ($RevocationReason -notin 0, 1, 2, 3, 4, 5, 6) {
+            $msg = "Validation (revocation request): Invalid integer value for 'data.RevocationReason' in request body! Supported values are: 0, 1, 2, 3, 4, 5, 6. See https://learn.microsoft.com/en-us/windows/win32/api/certadm/nf-certadm-icertadmin-revokecertificate for value descriptions."
+            Write-Log $msg -Level 'Error'
+            throw $msg
+        }
+
+        # end of validation. Now process the certificate revocation request
+
+        Write-Log "Revocation Request: Performing certificate revocation request for certificate $CertificateName using vault $VaultName with reason $RevocationReason..."
+        try {
+            New-CertificateRevocationRequest -VaultName $VaultName -CertificateName $CertificateName -RevocationReason $RevocationReason
+        }
+        catch {
+            $msg = "Revocation Request: Error processing certificate revocation request: $_"
+            Write-Log $msg -Level 'Error'
+            throw $msg
+        }
+
+    }
+
     default {
-        $msg = "Validation: Unknown request type: $($requestBody.type). Supported values are: Microsoft.KeyVault.CertificateNearExpiry, CertLC.NewCertificateRequest!"
+        $msg = "Validation: Unknown request type: $($requestBody.type). Supported values are: Microsoft.KeyVault.CertificateNearExpiry, CertLC.NewCertificateRequest, CertLC.CertificateRevocationRequest!"
         Write-Log $msg -Level 'Error'
         throw $msg
     }
