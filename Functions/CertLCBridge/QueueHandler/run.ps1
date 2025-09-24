@@ -37,7 +37,7 @@ Set-StrictMode -Version 1.0
 $ErrorActionPreference = "Stop"
 
 # Explicitly load Az.Automation module (it seems that the function runtime does not load it automatically)
-Import-Module Az.Automation
+# Import-Module Az.Automation
 
 # Ensure we only connect if needed - this is normally done at cold start by profile.ps1 but we want to ensure the context is valid
 try {
