@@ -94,7 +94,7 @@ For new certificate requests, the body has a structure like this:
     "VaultName": "<key vault name>",
     "ObjectType": "Certificate",
     "ObjectName": "<name of the new certificate>",
-    "RevocationReason": <reason code>
+    "RevocationReason": "<reason code>"
   }
 }
 
@@ -113,7 +113,7 @@ $json = @"
     "VaultName": "$vaultName",
     "ObjectType": "Certificate",
     "ObjectName": "$certName",
-    "RevocationReason": $RevocationReason
+    "RevocationReason": "$($RevocationReason)"
   }
 }
 "@

@@ -90,7 +90,7 @@ For certificate revocation requests, the body has a structure like this:
     "VaultName": "<key vault name>",
     "ObjectType": "Certificate",
     "ObjectName": "<name of the new certificate>",
-    "RevocationReason": 1,  # see https://learn.microsoft.com/en-us/windows/win32/api/certadm/nf-certadm-icertadmin-revokecertificate for possible values
+    "RevocationReason": "1",  # see https://learn.microsoft.com/en-us/windows/win32/api/certadm/nf-certadm-icertadmin-revokecertificate for possible values
   }
 }
 
@@ -1085,7 +1085,7 @@ switch ($requestBody.type) {
         # get required parameters
         $VaultName = $requestBody.data.VaultName
         $CertificateName = $requestBody.data.ObjectName
-        $RevocationReason = $requestBody.data.RevocationReason
+        $RevocationReasonString = $requestBody.data.RevocationReason
 
         # VaultName: presence and non-empty check
         if ([string]::IsNullOrEmpty($VaultName)) {
@@ -1101,6 +1101,25 @@ switch ($requestBody.type) {
             throw $msg
         }
 
+        # RevocationReason: presence and integer check
+        $RevocationReason = $null
+        if (-not [string]::IsNullOrEmpty($RevocationReasonString)) {
+            # try to convert to integer
+            try {
+                $RevocationReason = [Int64]::Parse($RevocationReasonString)
+            }
+            catch {
+                $msg = "Validation (revocation request): Invalid integer value for 'data.RevocationReason' in request body!"
+                Write-Log $msg -Level 'Error'
+                throw $msg
+            }
+        }
+        else {
+            $msg = "Validation (revocation request): Missing or empty mandatory string parameter: 'data.RevocationReason' in request body!"
+            Write-Log $msg -Level 'Error'
+            throw $msg
+        }
+
         # RevocationReason: see https://learn.microsoft.com/en-us/windows/win32/api/certadm/nf-certadm-icertadmin-revokecertificate
         # 0 = CRL_REASON_UNSPECIFIED,
         # 1 = CRL_REASON_KEY_COMPROMISE,
@@ -1109,12 +1128,6 @@ switch ($requestBody.type) {
         # 4 = CRL_REASON_SUPERSEDED,
         # 5 = CRL_REASON_CESSATION_OF_OPERATION,
         # 6 = CRL_REASON_CERTIFICATE_HOLD
-
-        if ((-not $RevocationReason) -or ($RevocationReason -isnot [Int64])) {
-            $msg = "Validation (revocation request): Missing mandatory integer parameter: 'data.RevocationReason' in request body!"
-            Write-Log $msg -Level 'Error'
-            throw $msg
-        }
 
         if ($RevocationReason -notin 0, 1, 2, 3, 4, 5, 6) {
             $msg = "Validation (revocation request): Invalid integer value for 'data.RevocationReason' in request body! Supported values are: 0, 1, 2, 3, 4, 5, 6. See https://learn.microsoft.com/en-us/windows/win32/api/certadm/nf-certadm-icertadmin-revokecertificate for value descriptions."
