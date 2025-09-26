@@ -72,30 +72,37 @@ if ($Request.Body) {
 
 Write-Information ('OutboundTester invocation {0} method={1}' -f $invocationId, $method)
 
+# Get my local IP addresses
+$myLocalIps = [System.Net.Dns]::GetHostAddresses([System.Net.Dns]::GetHostName()) |
+  Where-Object AddressFamily -eq InterNetwork |
+  Select-Object -ExpandProperty IPAddressToString
+Write-Information "OutboundTester: local IPs $myLocalIps"
+
 # Get public IP
-$myIp = $null
-$myIpError = $null
+$myPublicIp = $null
+$myPublicIpError = $null
 try {
-    $myIp = (Invoke-RestMethod -Uri 'http://ifconfig.me/ip' -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop).ToString().Trim()
-    Write-Information "OutboundTester: public IP $myIp"
+    $myPublicIp = (Invoke-RestMethod -Uri 'http://ifconfig.me/ip' -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop).ToString().Trim()
+    Write-Information "OutboundTester: public IP $myPublicIp"
 }
 catch {
-    $myIpError = $_.Exception.Message
-    Write-Warning "OutboundTester: $myIpError"
+    $myPublicIpError = $_.Exception.Message
+    Write-Warning "OutboundTester: $myPublicIpError"
 }
 
 # construct the response payload including ip and notes
 $responsePayload = [PSCustomObject]@{
-    invocationId = $invocationId
-    timestampUtc = $utcNow
-    method       = $method
-    headers      = $headers
-    query        = $query
-    body         = $bodyObj
-    rawBody      = $rawBody
-    myIp         = $myIp
-    myIpError    = $myIpError
-    notes        = @()
+    invocationId    = $invocationId
+    timestampUtc    = $utcNow
+    method          = $method
+    headers         = $headers
+    query           = $query
+    body            = $bodyObj
+    rawBody         = $rawBody
+    myLocalIps      = $myLocalIps
+    myPublicIp      = $myPublicIp
+    myPublicIpError = $myPublicIpError
+    notes           = @()
 }
 
 # Associate values to output bindings by calling 'Push-OutputBinding'.
