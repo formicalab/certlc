@@ -1,0 +1,71 @@
+// -------------------------------
+// Step 1: Get all output events for the job (children)
+// -------------------------------
+let JobStreamOutputs = AzureDiagnostics
+| where Category == "JobStreams"
+| where Resource =~ "{AutomationAccount:name}"
+| where RunbookName_s =~ tostring(split("{Runbook:name}", "/")[-1])
+| where StreamType_s == "Output"
+| extend JobIdStr = tostring(JobId_g)
+| extend ParsedMessage = parse_json(ResultDescription)
+| extend ChildMessage = tostring(ParsedMessage.message),
+         ChildSection = tostring(ParsedMessage.section)
+| project 
+    JobIdStr,
+    Time = TimeGenerated,
+    ChildMessage,
+    ChildSection,
+    Id = strcat(JobIdStr, "-", format_datetime(TimeGenerated, 'yyyyMMddHHmmssfff')),
+    ParentId = JobIdStr,
+    Name = strcat("📝 Output at ", format_datetime(TimeGenerated, 'HH:mm:ss')),
+    Kind = "Output",
+    FinalResult = "📝";
+
+// -------------------------------
+// Step 1b: Compute last output per job (for parent)
+// -------------------------------
+let LastOutputPerJob = JobStreamOutputs
+| summarize arg_max(Time, ChildMessage, ChildSection) by JobIdStr
+| project 
+    JobIdStr,
+    LastTime = Time,
+    LastChildMessage = ChildMessage,
+    LastChildSection = ChildSection;
+
+// -------------------------------
+// Step 2: Summarize final job status per JobId (parents)
+// -------------------------------
+let JobLogSummary = AzureDiagnostics
+| where Category == "JobLogs"
+| where Resource =~ "{AutomationAccount:name}"
+| where RunbookName_s =~ tostring(split("{Runbook:name}", "/")[-1])
+| summarize arg_max(TimeGenerated, ResultType) by JobId_g
+| extend JobIdStr = tostring(JobId_g)
+| join kind=leftouter LastOutputPerJob on JobIdStr
+| project 
+    Id = JobIdStr,
+    ParentId = "",
+    Name = strcat("📦 Job ", JobIdStr),
+    Kind = "Job",
+    FinalResult = case(
+        tolower(ResultType) == "completed", "success",
+        tolower(ResultType) == "failed", "failed",
+        ResultType
+    ),
+    Time = LastTime,                 // last child output time
+    Message = LastChildMessage,      // bubble up last message
+    Section = LastChildSection;      // bubble up last section
+
+// -------------------------------
+// Step 3: Union parents + children and sort
+// -------------------------------
+union 
+(
+    JobLogSummary
+    | project Id, ParentId, Name, Kind, FinalResult, Time, Section, Message
+),
+(
+    JobStreamOutputs
+    | project Id, ParentId, Name, Kind, FinalResult, Time, Section = ChildSection, Message = ChildMessage
+)
+| order by Time desc, ParentId asc, Time asc

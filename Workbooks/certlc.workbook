@@ -1,0 +1,212 @@
+{
+  "version": "Notebook/1.0",
+  "items": [
+    {
+      "type": 9,
+      "content": {
+        "version": "KqlParameterItem/1.0",
+        "parameters": [
+          {
+            "id": "222f9a3c-4c8c-4fd4-b2c1-d1a76012c456",
+            "version": "KqlParameterItem/1.0",
+            "name": "LogAnalyticsWorkspace",
+            "label": "Log Analytics Workspace",
+            "type": 5,
+            "isRequired": true,
+            "query": "where type =~ 'microsoft.operationalinsights/workspaces'\r\n| project id, name\r\n| order by name desc",
+            "crossComponentResources": [
+              "value::all"
+            ],
+            "typeSettings": {
+              "additionalResourceOptions": []
+            },
+            "queryType": 1,
+            "resourceType": "microsoft.resourcegraph/resources",
+            "value": "/subscriptions/4a570962-701a-475e-bf5b-8dc76ec748ff/resourceGroups/rg-sentinel-itn-001/providers/Microsoft.OperationalInsights/workspaces/log-sentinel-itn-001"
+          },
+          {
+            "id": "c4ac2502-0074-4ee6-ac9c-58d49516cfff",
+            "version": "KqlParameterItem/1.0",
+            "name": "AutomationAccount",
+            "label": "Automation Account",
+            "type": 5,
+            "isRequired": true,
+            "query": "where type =~ 'Microsoft.Automation/AutomationAccounts'\r\n| project id, name\r\n| order by name desc",
+            "crossComponentResources": [
+              "value::all"
+            ],
+            "typeSettings": {
+              "additionalResourceOptions": [],
+              "showDefault": false
+            },
+            "timeContext": {
+              "durationMs": 86400000
+            },
+            "queryType": 1,
+            "resourceType": "microsoft.resourcegraph/resources",
+            "value": "/subscriptions/4a570962-701a-475e-bf5b-8dc76ec748ff/resourceGroups/rg-shared-neu-001/providers/Microsoft.Automation/automationAccounts/aa-shared-neu-001"
+          },
+          {
+            "id": "e75fbcd5-8b96-4b46-a2b1-87d92b2036ec",
+            "version": "KqlParameterItem/1.0",
+            "name": "Runbook",
+            "type": 5,
+            "isRequired": true,
+            "query": "where type =~ 'microsoft.automation/automationaccounts/runbooks'\r\n| where id startswith \"{AutomationAccount}\"\r\n| project id, name\r\n| order by name desc",
+            "crossComponentResources": [
+              "value::all"
+            ],
+            "typeSettings": {
+              "additionalResourceOptions": [],
+              "showDefault": false
+            },
+            "queryType": 1,
+            "resourceType": "microsoft.resourcegraph/resources",
+            "value": "/subscriptions/4a570962-701a-475e-bf5b-8dc76ec748ff/resourceGroups/rg-shared-neu-001/providers/Microsoft.Automation/automationAccounts/aa-shared-neu-001/runbooks/certlc"
+          },
+          {
+            "id": "a46ac1ec-5965-4af4-8750-49ace0d90f8d",
+            "version": "KqlParameterItem/1.0",
+            "name": "TimeRange",
+            "label": "Time Range",
+            "type": 4,
+            "isRequired": true,
+            "typeSettings": {
+              "selectableValues": [
+                {
+                  "durationMs": 300000
+                },
+                {
+                  "durationMs": 900000
+                },
+                {
+                  "durationMs": 1800000
+                },
+                {
+                  "durationMs": 3600000
+                },
+                {
+                  "durationMs": 14400000
+                },
+                {
+                  "durationMs": 43200000
+                },
+                {
+                  "durationMs": 86400000
+                },
+                {
+                  "durationMs": 172800000
+                },
+                {
+                  "durationMs": 259200000
+                },
+                {
+                  "durationMs": 604800000
+                },
+                {
+                  "durationMs": 1209600000
+                },
+                {
+                  "durationMs": 2419200000
+                },
+                {
+                  "durationMs": 2592000000
+                },
+                {
+                  "durationMs": 5184000000
+                },
+                {
+                  "durationMs": 7776000000
+                }
+              ]
+            },
+            "value": {
+              "durationMs": 86400000
+            }
+          }
+        ],
+        "style": "pills",
+        "queryType": 0,
+        "resourceType": "microsoft.resourcegraph/resources"
+      },
+      "name": "parameters - 0"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "// -------------------------------\n// Step 1: Get all output events for the job (children)\n// -------------------------------\nlet JobStreamOutputs = AzureDiagnostics\n| where Category == \"JobStreams\"\n| where Resource =~ \"{AutomationAccount:name}\"\n| where RunbookName_s =~ tostring(split(\"{Runbook:name}\", \"/\")[-1])\n| where StreamType_s == \"Output\"\n| extend JobIdStr = tostring(JobId_g)\n| extend ParsedMessage = parse_json(ResultDescription)\n| extend ChildMessage = tostring(ParsedMessage.message),\n         ChildSection = tostring(ParsedMessage.section)\n| project \n    JobIdStr,\n    Time = TimeGenerated,\n    ChildMessage,\n    ChildSection,\n    Id = strcat(JobIdStr, \"-\", format_datetime(TimeGenerated, 'yyyyMMddHHmmssfff')),\n    ParentId = JobIdStr,\n    Name = strcat(\"📝 Output at \", format_datetime(TimeGenerated, 'HH:mm:ss')),\n    Kind = \"Output\",\n    FinalResult = \"📝\";\n\n// -------------------------------\n// Step 1b: Compute last output per job (for parent)\n// -------------------------------\nlet LastOutputPerJob = JobStreamOutputs\n| summarize arg_max(Time, ChildMessage, ChildSection) by JobIdStr\n| project \n    JobIdStr,\n    LastTime = Time,\n    LastChildMessage = ChildMessage,\n    LastChildSection = ChildSection;\n\n// -------------------------------\n// Step 2: Summarize final job status per JobId (parents)\n// -------------------------------\nlet JobLogSummary = AzureDiagnostics\n| where Category == \"JobLogs\"\n| where Resource =~ \"{AutomationAccount:name}\"\n| where RunbookName_s =~ tostring(split(\"{Runbook:name}\", \"/\")[-1])\n| summarize arg_max(TimeGenerated, ResultType) by JobId_g\n| extend JobIdStr = tostring(JobId_g)\n| join kind=leftouter LastOutputPerJob on JobIdStr\n| project \n    Id = JobIdStr,\n    ParentId = \"\",\n    Name = strcat(\"📦 Job \", JobIdStr),\n    Kind = \"Job\",\n    FinalResult = case(\n        tolower(ResultType) == \"completed\", \"success\",\n        tolower(ResultType) == \"failed\", \"failed\",\n        ResultType\n    ),\n    Time = LastTime,                 // last child output time\n    Message = LastChildMessage,      // bubble up last message\n    Section = LastChildSection;      // bubble up last section\n\n// -------------------------------\n// Step 3: Union parents + children and sort\n// -------------------------------\nunion \n(\n    JobLogSummary\n    | project Id, ParentId, Name, Kind, FinalResult, Time, Section, Message\n),\n(\n    JobStreamOutputs\n    | project Id, ParentId, Name, Kind, FinalResult, Time, Section = ChildSection, Message = ChildMessage\n)\n| order by Time desc, ParentId asc, Time asc\n",
+        "size": 2,
+        "showAnalytics": true,
+        "title": "Job History",
+        "noDataMessageStyle": 4,
+        "timeContextFromParameter": "TimeRange",
+        "showRefreshButton": true,
+        "showExportToExcel": true,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "crossComponentResources": [
+          "{LogAnalyticsWorkspace}"
+        ],
+        "visualization": "table",
+        "showExpandCollapseGrid": true,
+        "gridSettings": {
+          "formatters": [
+            {
+              "columnMatch": "Id",
+              "formatter": 5
+            },
+            {
+              "columnMatch": "ParentId",
+              "formatter": 5
+            },
+            {
+              "columnMatch": "FinalResult",
+              "formatter": 11
+            },
+            {
+              "columnMatch": "Message_datetime",
+              "formatter": 5
+            },
+            {
+              "columnMatch": "Section_datetime",
+              "formatter": 5
+            },
+            {
+              "columnMatch": "OutputTime",
+              "formatter": 6,
+              "dateFormat": {
+                "showUtcTime": null,
+                "formatName": "shortDateTimeNoMsPattern"
+              }
+            },
+            {
+              "columnMatch": "FinalTime",
+              "formatter": 6,
+              "formatOptions": {
+                "aggregation": "Max"
+              },
+              "dateFormat": {
+                "showUtcTime": null,
+                "formatName": "shortDateTimeNoMsPattern"
+              }
+            }
+          ],
+          "rowLimit": 1000,
+          "filter": true,
+          "hierarchySettings": {
+            "idColumn": "Id",
+            "parentColumn": "ParentId",
+            "treeType": 0,
+            "expanderColumn": "FinalResult"
+          }
+        }
+      },
+      "name": "Jobs"
+    }
+  ],
+  "fallbackResourceIds": [
+    "azure monitor"
+  ],
+  "$schema": "https://github.com/Microsoft/Application-Insights-Workbooks/blob/master/schema/workbook.json"
+}
