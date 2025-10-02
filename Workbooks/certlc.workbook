@@ -132,6 +132,14 @@
       "name": "parameters - 0"
     },
     {
+      "type": 1,
+      "content": {
+        "json": "Use the **Search** field below to look for specific jobs, messages, certificate names, etc.",
+        "style": "info"
+      },
+      "name": "text - 2"
+    },
+    {
       "type": 3,
       "content": {
         "version": "KqlItem/1.0",

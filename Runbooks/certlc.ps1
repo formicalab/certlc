@@ -870,20 +870,20 @@ function New-CertificateRevocationRequest {
     Write-Log -Section 'New-CertificateRevocationRequest' -Message "KeyVault: Certificate $CertificateName removed from key vault $($VaultName)."
 }
 
-#################################
-# MAIN - modules and parameters #
-#################################
+####################
+# MAIN DISPATCHER  #
+####################
 
 # Connect to Azure. Ensures we do not inherit an AzContext, since we are using a system-assigned identity for login
 $null = Disable-AzContextAutosave -Scope Process
 
 # Connect using a Managed Service Identity
-Write-Log -Section 'Main' -Message 'Connecting to Azure using default identity...'
+Write-Log -Section 'Dispatcher' -Message 'Connecting to Azure using default identity...'
 try {
     $AzureConnection = (Connect-AzAccount -Identity).context
 }
 catch {
-    Invoke-LogAndThrow -Section 'Main' -Message 'There is no system-assigned user identity.' -Inner $_.Exception
+    Invoke-LogAndThrow -Section 'Dispatcher' -Message 'There is no system-assigned user identity.' -Inner $_.Exception
 }
 
 # set context
@@ -894,16 +894,16 @@ Set-AzContext -SubscriptionName $AzureConnection.Subscription -DefaultProfile $A
 if ($env:AZUREPS_HOST_ENVIRONMENT -eq 'AzureAutomation/') {
     # We are in a Hybrid Runbook Worker
     $jobId = $env:PSPrivateMetadata
-    Write-Log -Section 'Main' -Message "Runbook running with job id $jobId on hybrid worker $($env:COMPUTERNAME)."
+    Write-Log -Section 'Dispatcher' -Message "Runbook running with job id $jobId on hybrid worker $($env:COMPUTERNAME)."
 }
 elseif ($env:AZUREPS_HOST_ENVIRONMENT -eq 'AzureAutomation') {
     # We are in Azure Automation
     $jobId = $PSPrivateMetadata.JobId
-    Invoke-LogAndThrow -Section 'Main' -Message "Runbook running with job id $jobId in Azure Automation. This runbook must be executed by a hybrid worker instead!"
+    Invoke-LogAndThrow -Section 'Dispatcher' -Message "Runbook running with job id $jobId in Azure Automation. This runbook must be executed by a hybrid worker instead!"
 }
 else {
     # We are in a local environment - not supported anymore because we cannot get the encrypted variables from the automation account in this case
-    Invoke-LogAndThrow -Section 'Main' -Message 'Runbook running in a local environment. This runbook must be executed by a hybrid worker instead!'
+    Invoke-LogAndThrow -Section 'Dispatcher' -Message 'Runbook running in a local environment. This runbook must be executed by a hybrid worker instead!'
 }
 
  # TODO: decide if we want to use $jobId as correlation id in the logs
@@ -915,17 +915,17 @@ try {
     # Get the CA from the automation account variable
     $CA = Get-AutomationVariable -Name 'certlc-ca'
 }
-catch { Invoke-LogAndThrow -Section 'Main' -Message "Error getting automation account variable 'certlc-ca'. Ensure the variable exists in the automation account!" -Inner $_.Exception }
+catch { Invoke-LogAndThrow -Section 'Dispatcher' -Message "Error getting automation account variable 'certlc-ca'. Ensure the variable exists in the automation account!" -Inner $_.Exception }
 # Ensure the CA variable is not empty
-if ([string]::IsNullOrEmpty($CA)) { Invoke-LogAndThrow -Section 'Main' -Message "The automation account variable 'certlc-ca' is empty!" }
+if ([string]::IsNullOrEmpty($CA)) { Invoke-LogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-ca' is empty!" }
 
 try {
     # Get the PfxRootFolder from the automation account variable
     $PfxRootFolder = Get-AutomationVariable -Name 'certlc-pfxrootfolder'
 }
-catch { Invoke-LogAndThrow -Section 'Main' -Message "Error getting automation account variable 'certlc-pfxrootfolder'. Ensure the variable exists in the automation account!" -Inner $_.Exception }
+catch { Invoke-LogAndThrow -Section 'Dispatcher' -Message "Error getting automation account variable 'certlc-pfxrootfolder'. Ensure the variable exists in the automation account!" -Inner $_.Exception }
 # Ensure the PfxRootFolder variable is not empty
-if ([string]::IsNullOrEmpty($PfxRootFolder)) { Invoke-LogAndThrow -Section 'Main' -Message "The automation account variable 'certlc-pfxrootfolder' is empty!" }
+if ([string]::IsNullOrEmpty($PfxRootFolder)) { Invoke-LogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-pfxrootfolder' is empty!" }
 
 # Check if we have the jsonRequestBody parameter
 if ([string]::IsNullOrEmpty($jsonRequestBody)) {
@@ -933,9 +933,9 @@ if ([string]::IsNullOrEmpty($jsonRequestBody)) {
     # No explicit RequestBody parameter, so we will use WebhookData
     # Try to parse the webhook data
 
-    if ([string]::IsNullOrEmpty($WebhookData)) { Invoke-LogAndThrow -Section 'Main' -Message 'Both RequestBody and WebhookData parameters are missing or empty! Call the runbook from a webhook or pass the RequestBody parameter explicitly with Start-AzAutomationRunbook!' }
+    if ([string]::IsNullOrEmpty($WebhookData)) { Invoke-LogAndThrow -Section 'Dispatcher' -Message 'Both RequestBody and WebhookData parameters are missing or empty! Call the runbook from a webhook or pass the RequestBody parameter explicitly with Start-AzAutomationRunbook!' }
 
-    Write-Log -Section 'Main' -Message "WebhookData received is: $($WebhookData)"
+    Write-Log -Section 'Dispatcher' -Message "WebhookData received is: $($WebhookData)"
 
     <#
 
@@ -961,7 +961,7 @@ if ([string]::IsNullOrEmpty($jsonRequestBody)) {
         # - After RequestBody there is an array:  RequestBody:[{...}] or "RequestBody":[{...},{...}]
         # The regex properly handles nested JSON objects, checking that braces are balanced.
 
-        Write-Log -Section 'Main' -Message 'Failed to parse WebhookData as JSON. Attempting to extract RequestBody using regex...' -Level 'Warning'
+        Write-Log -Section 'Dispatcher' -Message 'Failed to parse WebhookData as JSON. Attempting to extract RequestBody using regex...' -Level 'Warning'
 
         if ($WebhookData -match '"?RequestBody"?\s*:\s*((?:{([^{}]|(?<open>{)|(?<-open>}))*(?(open)(?!))})|(?:\[([^\[\]]|(?<open>\[)|(?<-open>\]))*(?(open)(?!))\]))') {
             $jsonRequestBody = $matches[1]
@@ -969,39 +969,37 @@ if ([string]::IsNullOrEmpty($jsonRequestBody)) {
                 $RequestBody = ConvertFrom-Json -InputObject $jsonRequestBody -Depth 10
             }
             catch {
-                Invoke-LogAndThrow -Section 'Main' -Message 'Failed to parse WebhookData.RequestBody using regex' -Inner $_.Exception
+                Invoke-LogAndThrow -Section 'Dispatcher' -Message 'Failed to parse WebhookData.RequestBody using regex' -Inner $_.Exception
             }
         }
-        else { Invoke-LogAndThrow -Section 'Main' -Message 'WebhookData.RequestBody not recognized using regex!' }
+        else { Invoke-LogAndThrow -Section 'Dispatcher' -Message 'WebhookData.RequestBody not recognized using regex!' }
     }
 
-    if ([string]::IsNullOrEmpty($requestBody)) { Invoke-LogAndThrow -Section 'Main' -Message 'WebhookData.RequestBody is empty! Ensure the runbook is called from a webhook!' }
+    if ([string]::IsNullOrEmpty($requestBody)) { Invoke-LogAndThrow -Section 'Dispatcher' -Message 'WebhookData.RequestBody is empty! Ensure the runbook is called from a webhook!' }
 }
 
 else {
     # parse the jsonRequestBody parameter as JSON
-    Write-Log -Section 'Main' -Message "jsonRequestBody received is: $($jsonRequestBody)"
+    Write-Log -Section 'Dispatcher' -Message "jsonRequestBody received is: $($jsonRequestBody)"
     try {
         $requestBody = ConvertFrom-Json -InputObject $jsonRequestBody -Depth 10
     }
-    catch { Invoke-LogAndThrow -Section 'Main' -Message 'Failed to parse jsonRequestBody parameter as JSON' -Inner $_.Exception }
+    catch { Invoke-LogAndThrow -Section 'Dispatcher' -Message 'Failed to parse jsonRequestBody parameter as JSON' -Inner $_.Exception }
 }
 
 # now that we have a valid requestBody object, check some fields and detect request type
 
 # check version
-if ([string]::IsNullOrEmpty($requestBody.specversion)) { Invoke-LogAndThrow -Section 'Validation' -Message "Missing or empty mandatory string parameter: 'specversion' in request body!" }
-if ($requestBody.specversion -ne $Version) { Invoke-LogAndThrow -Section 'Validation' -Message "The version specified in the request, $($requestBody.specversion), does not match the script version $Version!" }
+if ([string]::IsNullOrEmpty($requestBody.specversion)) { Invoke-LogAndThrow -Section 'Dispatcher' -Message "Missing or empty mandatory string parameter: 'specversion' in request body!" }
+if ($requestBody.specversion -ne $Version) { Invoke-LogAndThrow -Section 'Dispatcher' -Message "The version specified in the request, $($requestBody.specversion), does not match the script version $Version!" }
 else {
-    Write-Log -Section 'Main' -Message "specversion: $($requestBody.specversion)"
+    Write-Log -Section 'Dispatcher' -Message "specversion: $($requestBody.specversion)"
 }
 
-if ([string]::IsNullOrEmpty($requestBody.type)) { Invoke-LogAndThrow -Section 'Validation' -Message "Missing or empty mandatory string parameter: 'type' in request body!" }
-else { Write-Log -Section 'Main' -Message "request type: $($requestBody.type)" }
+if ([string]::IsNullOrEmpty($requestBody.type)) { Invoke-LogAndThrow -Section 'Dispatcher' -Message "Missing or empty mandatory string parameter: 'type' in request body!" }
+else { Write-Log -Section 'Dispatcher' -Message "request type: $($requestBody.type)" }
 
-#############################
-# MAIN - DISPATCHER SECTION #
-#############################
+
 
 # Process requests based on type
 
@@ -1014,14 +1012,18 @@ switch ($requestBody.type) {
         $CertificateName = $requestBody.data.ObjectName
 
         # start formal validation of mandatory parameters
-        if ([string]::IsNullOrEmpty($VaultName)) { Invoke-LogAndThrow -Section 'Dispatcher' -Message "Renewal validation: Missing or empty mandatory string parameter: 'VaultName'!" }
-        if ([string]::IsNullOrEmpty($CertificateName)) { Invoke-LogAndThrow -Section 'Dispatcher' -Message "Renewal validation: Missing or empty mandatory string parameter: 'ObjectName'!" }
+        if ([string]::IsNullOrEmpty($VaultName)) { Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Missing or empty mandatory string parameter: 'VaultName'!" }
+        if ([string]::IsNullOrEmpty($CertificateName)) { Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Missing or empty mandatory string parameter: 'ObjectName'!" }
 
         # invoke renewal
+        Write-Log -Section 'Dispatcher.Request' -Message "Performing certificate renewal for certificate $CertificateName in vault $VaultName..."
         try {
             New-CertificateRenewalRequest -VaultName $VaultName -CertificateName $CertificateName -CA $CA
         }
-        catch { Invoke-LogAndThrow -Section 'Dispatcher' -Message 'Renewal invocation: Error processing certificate renew request' -Inner $_.Exception }
+        catch { Invoke-LogAndThrow -Section 'Dispatcher.Request' -Message 'Error processing certificate renew request' -Inner $_.Exception }
+
+        # confirm completion
+        Write-Log -Section 'Dispatcher' -Message "Certificate $CertificateName was successfully renewed."
     }
 
     'CertLC.NewCertificateRequest' {
@@ -1039,12 +1041,12 @@ switch ($requestBody.type) {
 
         # VaultName: presence and non-empty check
         if ([string]::IsNullOrEmpty($VaultName)) {
-            Invoke-LogAndThrow -Section 'Dispatcher' -Message "New request validation: Missing or empty mandatory string parameter: 'data.VaultName' in request body!"
+            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Missing or empty mandatory string parameter: 'data.VaultName' in request body!"
         }
 
         # CertificateName: presence and non-empty check
         if ([string]::IsNullOrEmpty($CertificateName)) {
-            Invoke-LogAndThrow -Section 'Dispatcher' -Message "New request validation: Missing or empty mandatory string parameter: 'data.ObjectName' in request body!"
+            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Missing or empty mandatory string parameter: 'data.ObjectName' in request body!"
         }
 
         # CertificateName: check if the certificate already exists in the key vault
@@ -1052,15 +1054,15 @@ switch ($requestBody.type) {
             $deletedCert = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -InRemovedState
         }
         catch {
-            Invoke-LogAndThrow -Section 'Dispatcher' -Message 'New request validation: Error checking for deleted certificate' -Inner $_.Exception
+            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message 'Error checking for deleted certificate' -Inner $_.Exception
         }
         if (($null -ne $deletedCert) -and ($null -ne $deletedCert.DeletedDate)) {
-            Invoke-LogAndThrow -Section 'Dispatcher' -Message "New request validation: Certificate $CertificateName is deleted since $($deletedCert.DeletedDate). Purge it or use a different name."
+            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Certificate $CertificateName is deleted since $($deletedCert.DeletedDate). Purge it or use a different name."
         }
 
         # CertificateTemplate: presence and non-empty check
         if ([string]::IsNullOrEmpty($CertificateTemplate)) {
-            Invoke-LogAndThrow -Section 'Dispatcher' -Message "New request validation: Missing or empty mandatory string parameter: 'data.CertificateTemplate' in request body!"
+            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Missing or empty mandatory string parameter: 'data.CertificateTemplate' in request body!"
         }
 
         # CertificateTemplate: check if the template exists in AD; caller may have specified the template name (CN) or the display name or the OID. We need the 'name' attribute
@@ -1068,59 +1070,62 @@ switch ($requestBody.type) {
             $CertificateTemplateName = Find-TemplateName -cnOrDisplayNameOrOid $CertificateTemplate
         }
         catch {
-            Invoke-LogAndThrow -Section 'Dispatcher' -Message 'New request validation: Error resolving template name' -Inner $_.Exception
+            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message 'Error resolving template name' -Inner $_.Exception
         }
         if ([string]::IsNullOrEmpty($CertificateTemplateName)) {
-            Invoke-LogAndThrow -Section 'Dispatcher' -Message "New request validation: Certificate template $CertificateTemplate not found in Active Directory!"
+            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Certificate template $CertificateTemplate not found in Active Directory!"
         }
 
         # CertificateSubject: presence and non-empty check
         if ([string]::IsNullOrEmpty($CertificateSubject)) {
-            Invoke-LogAndThrow -Section 'Dispatcher' -Message "New request validation: Missing or empty mandatory string parameter: 'data.CertificateSubject' in request body!"
+            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Missing or empty mandatory string parameter: 'data.CertificateSubject' in request body!"
         }
 
         # DnsNames (optional, but if specified, must be an array)
         if ($CertificateDnsNames -and $CertificateDnsNames -isnot [array]) {
-            Invoke-LogAndThrow -Section 'Dispatcher' -Message "New request validation: Parameter 'CertificateDnsNames' is not an array!"
+            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Parameter 'CertificateDnsNames' is not an array!"
         }
 
         # Hostname
         if ([string]::IsNullOrWhiteSpace($Hostname)) {
-            Invoke-LogAndThrow -Section 'Dispatcher' -Message "New request validation: Missing or empty mandatory string parameter: 'data.Hostname' in request body!"
+            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Missing or empty mandatory string parameter: 'data.Hostname' in request body!"
         }
         $originalHostname = $Hostname
         $Hostname = $Hostname.Trim().ToLower()
         if (-not (Test-HostnameFormat -Hostname $Hostname)) {
-            Invoke-LogAndThrow -Section 'Dispatcher' -Message "New request validation: Hostname '$Hostname' contains invalid characters."
+            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Hostname '$Hostname' contains invalid characters."
         }
         if (-not $originalHostname.Equals($Hostname, 'OrdinalIgnoreCase')) {
-            Write-Log -Section 'Normalize' "Hostname normalized: '$originalHostname' -> '$Hostname'"
+            Write-Log -Section 'Dispatcher.Validation' "Hostname normalized: '$originalHostname' -> '$Hostname'"
         }
 
         # PfxProtectTo
         if (-not $PfxProtectTo) {
-            Invoke-LogAndThrow -Section 'Dispatcher' -Message "New request validation: Missing mandatory parameter 'PfxProtectTo'!"
+            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Missing mandatory parameter 'PfxProtectTo'!"
         }
         $PfxProtectTo = Format-PfxProtectTo -InputValue $PfxProtectTo
         if ($PfxProtectTo.Count -eq 0) {
-            Invoke-LogAndThrow -Section 'Dispatcher' -Message 'New request validation: PfxProtectTo list is empty after normalization!'
+            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message 'PfxProtectTo list is empty after normalization!'
         }
 
         # end of validation. Now process the new certificate request
 
         if ($null -ne $CertificateDnsNames) {
-            Write-Log -Section 'Dispatcher' -Message "New request invocation: performing new certificate request for certificate $CertificateName using vault $VaultName, template $CertificateTemplateName, subject $CertificateSubject, DNS names $($CertificateDnsNames -join ', '), Hostname $Hostname, PfxProtectTo $($PfxProtectTo -join ', ')..."
+            Write-Log -Section 'Dispatcher.Request' -Message "Performing new certificate request for certificate $CertificateName using vault $VaultName, template $CertificateTemplateName, subject $CertificateSubject, DNS names $($CertificateDnsNames -join ', '), Hostname $Hostname, PfxProtectTo $($PfxProtectTo -join ', ')..."
         }
         else {
-            Write-Log -Section 'Dispatcher' -Message "New request invocation: performing new certificate request for certificate $CertificateName using vault $VaultName, template $CertificateTemplateName, subject $CertificateSubject, Hostname $Hostname, PfxProtectTo $($PfxProtectTo -join ', ')..."
+            Write-Log -Section 'Dispatcher.Request' -Message "Performing new certificate request for certificate $CertificateName using vault $VaultName, template $CertificateTemplateName, subject $CertificateSubject, Hostname $Hostname, PfxProtectTo $($PfxProtectTo -join ', ')..."
         }
 
         try {
             New-CertificateCreationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplateName $CertificateTemplateName -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -Hostname $Hostname -PfxProtectTo $PfxProtectTo
         }
         catch {
-            Invoke-LogAndThrow -Section 'Dispatcher' -Message 'New request invocation: Error processing new certificate request' -Inner $_.Exception
+            Invoke-LogAndThrow -Section 'Dispatcher.Request' -Message 'Error processing new certificate request' -Inner $_.Exception
         }
+
+        # confirm completion
+        Write-Log -Section 'Dispatcher' -Message "Certificate $CertificateName was successfully created."
     }
 
     'CertLC.CertificateRevocationRequest' {
@@ -1132,12 +1137,12 @@ switch ($requestBody.type) {
 
         # VaultName: presence and non-empty check
         if ([string]::IsNullOrEmpty($VaultName)) {
-            Invoke-LogAndThrow -Section 'Dispatcher' -Message "Revocation request validation: Missing or empty mandatory string parameter: 'data.VaultName' in request body!"
+            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Missing or empty mandatory string parameter: 'data.VaultName' in request body!"
         }
 
         # CertificateName: presence and non-empty check
         if ([string]::IsNullOrEmpty($CertificateName)) {
-            Invoke-LogAndThrow -Section 'Dispatcher' -Message "Revocation request validation: Missing or empty mandatory string parameter: 'data.ObjectName' in request body!"
+            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Missing or empty mandatory string parameter: 'data.ObjectName' in request body!"
         }
 
         # RevocationReason: presence and integer check
@@ -1147,10 +1152,10 @@ switch ($requestBody.type) {
             try {
                 $RevocationReason = [Int64]::Parse($RevocationReasonString)
             }
-            catch { Invoke-LogAndThrow -Section 'Dispatcher' -Message "Revocation request validation: Invalid integer value for 'data.RevocationReason' in request body!" -Inner $_.Exception }
+            catch { Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Invalid integer value for 'data.RevocationReason' in request body!" -Inner $_.Exception }
         }
         else {
-            Invoke-LogAndThrow -Section 'Dispatcher' -Message "Revocation request validation: Missing or empty mandatory string parameter: 'data.RevocationReason' in request body!"
+            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Missing or empty mandatory string parameter: 'data.RevocationReason' in request body!"
         }
 
         # RevocationReason: see https://learn.microsoft.com/en-us/windows/win32/api/certadm/nf-certadm-icertadmin-revokecertificate
@@ -1166,22 +1171,19 @@ switch ($requestBody.type) {
 
         # end of validation. Now process the certificate revocation request
 
-        Write-Log -Section 'Dispatcher' -Message "Revocation request invocation: performing certificate revocation request for certificate $CertificateName using vault $VaultName with reason $RevocationReason..."
+        Write-Log -Section 'Dispatcher.Request' -Message "Performing certificate revocation request for certificate $CertificateName using vault $VaultName with reason $RevocationReason..."
         try {
             New-CertificateRevocationRequest -VaultName $VaultName -CertificateName $CertificateName -RevocationReason $RevocationReason
         }
         catch {
-            Invoke-LogAndThrow -Section 'Dispatcher' -Message 'Revocation request invocation: Error processing certificate revocation request' -Inner $_.Exception
+            Invoke-LogAndThrow -Section 'Dispatcher.Request' -Message 'Error processing certificate revocation request' -Inner $_.Exception
         }
+
+        # confirm completion
+        Write-Log -Section 'Dispatcher' -Message "Certificate $CertificateName was successfully revoked."
     }
 
     default {
         Invoke-LogAndThrow -Section 'Dispatcher' -Message "Unknown request type: $($requestBody.type). Supported values: Microsoft.KeyVault.CertificateNearExpiry, CertLC.NewCertificateRequest, CertLC.CertificateRevocationRequest."
     }
 }
-
-##############
-# MAIN - end #
-##############
-
-Write-Log -Section 'Main' -Message 'Runbook completed successfully.'
