@@ -110,9 +110,6 @@ Set-StrictMode -Version 1.0
 # Ensure the script stops on errors so that try/catch can be used to handle them
 $ErrorActionPreference = 'Stop'
 
-# Disable ANSI color escape sequences in output so Automation job logs don't contain raw escape codes
-$PSStyle.OutputRendering = 'PlainText'
-
 ###################################
 # STATIC SETTINGS AND GLOBAL VARS #
 ###################################
