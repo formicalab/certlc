@@ -103,10 +103,6 @@ $results = foreach ($certMeta in $certificates) {
         continue
     }
 
-    # Status calculation using UTC
-    $expires = $certDetails.Expires
-    $status = if ($expires -lt $utcNow) { 'Expired' } elseif ($expires -lt $utcNow.AddDays($statusThresholdDays)) { 'Expiring Soon' } else { 'OK' }
-
     # Extract DNS names (SAN) safely each iteration
     $CertificateDnsNames = $null
     $san = $certDetails.Certificate.Extensions | Where-Object { $_.Oid.FriendlyName -eq 'Subject Alternative Name' }
@@ -117,9 +113,8 @@ $results = foreach ($certMeta in $certificates) {
     [PSCustomObject]@{
         Thumbprint = $certDetails.Certificate.Thumbprint
         Name       = $certMeta.Name
-        Status     = $status
         Created    = $certDetails.Created.ToString('o')     # ISO 8601 format required by Azure Monitor
-        Expires    = $expires.ToString('o')                 # ISO 8601 format required by Azure Monitor
+        Expires    = $certDetails.Expires.ToString('o')     # ISO 8601 format required by Azure Monitor
         Subject    = $certDetails.Certificate.Subject
         Template   = $certDetails.Tags['CertificateTemplateName']
         DNSNames   = if ($CertificateDnsNames) { $CertificateDnsNames -join ', ' } else { 'N/A' }
