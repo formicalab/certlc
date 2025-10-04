@@ -71,7 +71,7 @@
             "id": "a46ac1ec-5965-4af4-8750-49ace0d90f8d",
             "version": "KqlParameterItem/1.0",
             "name": "TimeRange",
-            "label": "Time Range (for Logs)",
+            "label": "Time Range",
             "type": 4,
             "isRequired": true,
             "typeSettings": {
@@ -139,12 +139,13 @@
       "content": {
         "version": "LinkItem/1.0",
         "style": "tabs",
+        "tabStyle": "bigger",
         "links": [
           {
             "id": "a2790d48-23fe-40b0-b680-ad7f54faa6c0",
             "cellValue": "selectedTab",
             "linkTarget": "parameter",
-            "linkLabel": "Stats",
+            "linkLabel": "Statistics",
             "subTarget": "1",
             "preText": "Tab 1",
             "style": "link"
@@ -153,7 +154,7 @@
             "id": "9c94a5f2-b4c1-45fc-a223-0c6e42398b17",
             "cellValue": "selectedTab",
             "linkTarget": "parameter",
-            "linkLabel": "Logs",
+            "linkLabel": "Job logs",
             "subTarget": "2",
             "preText": "Tab 2",
             "style": "link"
@@ -168,6 +169,17 @@
         "version": "NotebookGroup/1.0",
         "groupType": "editable",
         "items": [
+          {
+            "type": 1,
+            "content": {
+              "json": "### Use the **Search** field below to look for specific certificates.",
+              "style": "info"
+            },
+            "name": "text - 4",
+            "styleSettings": {
+              "showBorder": true
+            }
+          },
           {
             "type": 9,
             "content": {
@@ -187,13 +199,14 @@
                   ],
                   "isHiddenWhenLocked": true,
                   "timeContext": {
-                    "durationMs": 86400000
+                    "durationMs": 0
                   },
+                  "timeContextFromParameter": "TimeRange",
                   "queryType": 0,
                   "resourceType": "microsoft.operationalinsights/workspaces"
                 }
               ],
-              "style": "above",
+              "style": "formHorizontal",
               "queryType": 0,
               "resourceType": "microsoft.operationalinsights/workspaces"
             },
@@ -202,18 +215,17 @@
           {
             "type": 1,
             "content": {
-              "json": "### Use the **Search** field below to look for specific certificates.\r\n**Last Update:** {LastUpdateFormatted}  \r\n",
-              "style": "info"
+              "json": "**Last refresh:** {LastUpdateFormatted}"
             },
-            "name": "text - 4"
+            "name": "text - 5"
           },
           {
             "type": 3,
             "content": {
               "version": "KqlItem/1.0",
               "query": "let latestCerts = certlc_CL\r\n| summarize arg_max(LastUpdate = TimeGenerated, Name, Subject, Template, Created, Expires) by Name\r\n| extend RawTimeToExpire = Expires - now()  // timespan\r\n| extend Status = case(\r\n    RawTimeToExpire < 0d, \"❌ Expired\",\r\n    RawTimeToExpire < 30d, \"⚠️ Expiring Soon\",\r\n    \"✅ OK\");\r\nlet totalCount = toscalar(latestCerts | summarize count());\r\nlatestCerts\r\n| summarize Count = count() by Status\r\n| extend Total = totalCount\r\n| extend Percentage = round(100.0 * Count / Total, 2)\r\n| project Status, Count, Percentage\r\n| order by Status asc",
-              "size": 4,
-              "title": "Certificate status",
+              "size": 3,
+              "title": "Status of certificates in the key vault",
               "noDataMessageStyle": 4,
               "timeContextFromParameter": "TimeRange",
               "showRefreshButton": true,
@@ -284,6 +296,42 @@
             "styleSettings": {
               "maxWidth": "50%"
             }
+          },
+          {
+            "type": 3,
+            "content": {
+              "version": "KqlItem/1.0",
+              "query": "AzureDiagnostics\r\n| where Category == \"JobLogs\"\r\n| where Resource =~ \"{AutomationAccount:name}\"\r\n| where RunbookName_s =~ tostring(split(\"{Runbook:name}\", \"/\")[-1])\r\n| summarize arg_max(TimeGenerated, ResultType) by JobId_g\r\n| summarize JobCount = count() by ResultType",
+              "size": 3,
+              "title": "Jobs in the time range",
+              "noDataMessageStyle": 4,
+              "timeContextFromParameter": "TimeRange",
+              "showRefreshButton": true,
+              "queryType": 0,
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ],
+              "visualization": "piechart",
+              "chartSettings": {
+                "seriesLabelSettings": [
+                  {
+                    "seriesName": "Completed",
+                    "color": "green"
+                  },
+                  {
+                    "seriesName": "Failed",
+                    "color": "redBright"
+                  },
+                  {
+                    "seriesName": "Suspended",
+                    "color": "orange"
+                  }
+                ]
+              }
+            },
+            "customWidth": "50",
+            "name": "query - 4"
           },
           {
             "type": 3,
@@ -377,7 +425,10 @@
               "json": "### Use the **Search** field below to look for specific jobs, messages, certificate names, etc.",
               "style": "info"
             },
-            "name": "text - 2"
+            "name": "text - 2",
+            "styleSettings": {
+              "showBorder": true
+            }
           },
           {
             "type": 3,
@@ -451,7 +502,7 @@
                     }
                   }
                 ],
-                "rowLimit": 1000,
+                "rowLimit": 5000,
                 "filter": true,
                 "hierarchySettings": {
                   "idColumn": "Id",
