@@ -81,7 +81,12 @@ param (
   [Parameter(Mandatory = $true, ParameterSetName = 'Queue')]
   [Parameter(Mandatory = $true, ParameterSetName = 'Webhook')]
   [Parameter(Mandatory = $true, ParameterSetName = 'Direct')]
-  [string[]] $PfxProtectTo
+  [string[]] $PfxProtectTo,
+
+  [Parameter(ParameterSetName = 'Queue')]
+  [Parameter(ParameterSetName = 'Webhook')]
+  [Parameter(ParameterSetName = 'Direct')]
+  [string[]] $NotifyTo
 )
 
 $ErrorActionPreference = 'Stop'
@@ -109,6 +114,7 @@ For new certificate requests, the body has a structure like this:
     "CertificateDnsNames": [ "<dns name 1>", "<dns name 2>", ... ],  # optional, can be empty
     "Hostname": "<hostname of the server where the certificate will be used>",  # it will be used also as folder name for exported PFX
     "PfxProtectTo": [ "<user or group to protect the PFX file>", "other user/group", ...],  # these principals will be also granted Read+Execute on PFX folder
+    "NotifyTo": [ "<email address to notify>", "other email address", ... ],  # optional, email addresses to notify when the certificate is created
   }
 }
 
@@ -130,20 +136,22 @@ $data = [ordered]@{
     CertificateSubject  = 'CN=www.example.com'
     CertificateDnsNames = @('www.example.com', 'api.example.com')
     Hostname            = $Hostname
-    PfxProtectTo        = $PfxProtectTo   # stays array
+    PfxProtectTo        = $PfxProtectTo
+    NotifyTo            = $NotifyTo
   }
 }
 
 $json = $data | ConvertTo-Json -Depth 6 -Compress
 
-# convert to object and convert back to JSON with -Compress in order to remove any formatting issues
-$jsonObject = $json | ConvertFrom-Json -Depth 10
-$json = $jsonObject | ConvertTo-Json -Depth 10 -Compress
-
 # execution logic based on the parameter set
 switch ($PSCmdlet.ParameterSetName) {
+
   'Queue' {
- 
+
+    #########
+    # QUEUE #
+    #########
+
     Write-Host "Using queue '$QueueName'" 
 
     # Create a storage context
@@ -171,6 +179,10 @@ switch ($PSCmdlet.ParameterSetName) {
 
   'Webhook' {
 
+    ###########
+    # WEBHOOK #
+    ###########
+
     Write-Host 'Using Webhook invocation'
 
     try {
@@ -188,6 +200,10 @@ switch ($PSCmdlet.ParameterSetName) {
 
   }
   'Direct' {
+
+    #############################
+    # DIRECT RUNBOOK INVOCATION #
+    #############################
 
     Write-Host 'Using direct runbook invocation'
 

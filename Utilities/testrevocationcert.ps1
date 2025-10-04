@@ -100,27 +100,23 @@ For new certificate requests, the body has a structure like this:
 
 #>
 
-$json = @"
-{
-  "id": "$(New-Guid)",
-  "source": "testrevocationcert.ps1",
-  "specversion": "1.0",
-  "type": "CertLC.CertificateRevocationRequest",
-  "subject": "$certName",
-  "time": "$(Get-Date -Format 'yyyy-MM-ddTHH:mm:ss.fffffffZ' -AsUTC)",
-  "data": {
-    "Id": "Ticket01",
-    "VaultName": "$vaultName",
-    "ObjectType": "Certificate",
-    "ObjectName": "$certName",
-    "RevocationReason": "$($RevocationReason)"
+$data = [ordered]@{
+  id          = (New-Guid)
+  source      = 'testrevocationcert.ps1'
+  specversion = '1.0'
+  type        = 'CertLC.CertificateRevocationRequest'
+  subject     = $certName
+  time        = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ss.fffffffZ' -AsUTC)
+  data        = [ordered]@{
+    Id               = 'Ticket01'
+    VaultName        = $vaultName
+    ObjectType       = 'Certificate'
+    ObjectName       = $certName
+    RevocationReason = $RevocationReason
   }
 }
-"@
 
-# convert to object and convert back to JSON with -Compress in order to remove any formatting issues
-$jsonObject = $json | ConvertFrom-Json -Depth 10
-$json = $jsonObject | ConvertTo-Json -Depth 10 -Compress
+$json = $data | ConvertTo-Json -Depth 6 -Compress
 
 # execution logic based on the parameter set
 switch ($PSCmdlet.ParameterSetName) {

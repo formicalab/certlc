@@ -74,6 +74,7 @@ For new certificate requests, the body has a structure like this:
     "CertificateDnsNames": [ "<dns name 1>", "<dns name 2>", ... ],  # optional, can be empty
     "Hostname": "<hostname of the server where the certificate will be used>",  # it will be used also as folder name for exported PFX
     "PfxProtectTo": [ "<user or group to protect the PFX file>", "other user/group", ...],  # these principals will be also granted Read+Execute on PFX folder
+    "NotifyTo": [ "<email address to notify>", "other email address", ... ],  # optional, email addresses to notify when the certificate is created
   }
 }
 
@@ -92,6 +93,7 @@ For certificate revocation requests, the body has a structure like this:
     "ObjectType": "Certificate",
     "ObjectName": "<name of the new certificate>",
     "RevocationReason": "1",  # see https://learn.microsoft.com/en-us/windows/win32/api/certadm/nf-certadm-icertadmin-revokecertificate for possible values
+    "NotifyTo": [ "<email address to notify>", "other email address", ... ]  # optional, email addresses to notify when the certificate is revoked
   }
 }
 
@@ -114,21 +116,65 @@ $ErrorActionPreference = 'Stop'
 # STATIC SETTINGS AND GLOBAL VARS #
 ###################################
 
-$Version = '1.0'       # version of the script - must match specversion in the webhook body
+$Version = '1.0'                            # version of the script - must match specversion in the webhook body
 
-#########################
-# FUNCTIONS - Write-Log #
-#########################
+# Unified SMTP / Email templates
+# We maintain only TWO templates with a single placeholder: __CONTENT__
+# 1. $CertificateNotificationEmailBodyHtml -> generic (creation / renewal / revocation / info)
+# 2. $CertificateErrorEmailBodyHtml        -> error (distinct colors + icon)
+#
+# Usage:
+#   $fragment = "<p>Certificate <b>$name</b> renewed successfully.</p>"
+#   $body = $CertificateNotificationEmailBodyHtml.Replace('__CONTENT__',$fragment)
+#   Send-NotificationEmail -Body $body ...
+# For errors, put the formatted error text (plain or HTML) in __CONTENT__.
 
-function Write-Log {
+$CertificateNotificationEmailBodyHtml = @'
+<html>
+    <body style="margin:0;padding:24px;font-family:Segoe UI,Arial,sans-serif;font-size:14px;line-height:1.45;background:#f5f7fa;">
+        <div style="max-width:640px;margin:0 auto;background:#ffffff;border:1px solid #d8e2ec;border-radius:10px;padding:24px;box-shadow:0 4px 14px -4px rgba(0,0,0,.08);">
+            <h2 style="margin:0 0 16px;font-size:20px;font-weight:600;color:#0b5cab;">Certificate Notification</h2>
+            <div style="margin:0 0 20px;">__CONTENT__</div>
+            <hr style="border:0;border-top:1px solid #e2e8f0;margin:20px 0;" />
+            <div style="font-size:11px;color:#5a6b7b;">Automated message • CERTLC</div>
+        </div>
+    </body>
+</html>
+'@
+
+$CertificateErrorEmailBodyHtml = @'
+<html>
+    <body style="margin:0;padding:24px;font-family:Segoe UI,Arial,sans-serif;font-size:14px;line-height:1.45;background:#1e293b;">
+        <div style="max-width:640px;margin:0 auto;background:#fff;border:1px solid #fbbf24;border-left:6px solid #dc2626;border-radius:10px;padding:24px;box-shadow:0 6px 18px -6px rgba(0,0,0,.35);position:relative;overflow:hidden;">
+            <div style="position:absolute;top:-40px;right:-40px;width:160px;height:160px;background:radial-gradient(circle at 30% 30%,rgba(220,38,38,0.45),transparent 70%);"></div>
+            <div style="display:flex;align-items:center;gap:10px;margin:0 0 14px;">
+                <div style="width:42px;height:42px;border-radius:50%;background:#dc2626;display:flex;align-items:center;justify-content:center;box-shadow:0 0 0 4px #fee2e2;">
+                    <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M12 9v4" />
+                        <path d="M12 17h.01" />
+                        <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z" />
+                    </svg>
+                </div>
+                <h2 style="margin:0;font-size:20px;font-weight:600;color:#dc2626;">Certificate Error</h2>
+            </div>
+            <div style="background:#fef2f2;border:1px solid #fee2e2;border-radius:6px;padding:14px 16px;color:#7f1d1d;font-family:Consolas,monospace;font-size:12px;white-space:pre-wrap;overflow:auto;max-height:320px;">__CONTENT__</div>
+            <div style="margin-top:20px;font-size:11px;color:#475569;">Automated error notification • CERTLC</div>
+        </div>
+    </body>
+</html>
+'@
+
+###############################
+# FUNCTIONS - Write-CertLCLog #
+###############################
+
+function Write-CertLCLog {
     <#
         .SYNOPSIS
-            Emit a structured JSON log entry.
+            Emit a structured JSON log entry
         .DESCRIPTION
             Writes a single-line JSON object with standard fields plus optional custom context.
-            Protects reserved keys, filters null/empty context entries, supports adjustable JSON depth.
-        .NOTES
-            Backward compatible: positional Message, optional -Level, existing -CorrelationId.
+
     #>
     [CmdletBinding()]
     param(
@@ -140,7 +186,7 @@ function Write-Log {
         [Parameter()][int]$JsonDepth = 5
     )
 
-    $reservedKeys = 'timestamp','level','message','section','correlationId'
+    $reservedKeys = 'timestamp', 'level', 'message', 'section', 'correlationId'
     $entry = [ordered]@{
         timestamp = (Get-Date).ToString('o')
         level     = $Level
@@ -160,29 +206,64 @@ function Write-Log {
 
     try { $json = $entry | ConvertTo-Json -Compress -Depth $JsonDepth }
     catch {
-        $json = ([ordered]@{ timestamp=(Get-Date).ToString('o'); level='Error'; message='Failed to serialize log entry'; originalMessage=$Message; serializationError=$_.Exception.Message }) | ConvertTo-Json -Compress
+        $json = ([ordered]@{ timestamp = (Get-Date).ToString('o'); level = 'Error'; message = 'Failed to serialize log entry'; originalMessage = $Message; serializationError = $_.Exception.Message }) | ConvertTo-Json -Compress
     }
 
     switch ($Level) {
-        'Error'   { Write-Output $json }    # don't use Write-Error to avoid breaking Automation job log parsing
+        'Error' { Write-Output $json }    # don't use Write-Error to avoid breaking Automation job log parsing
         'Warning' { Write-Warning $json }
         'Verbose' { Write-Verbose $json }
-        default   { Write-Output $json }
+        default { Write-Output $json }
     }
 }
 
-##################################
-# FUNCTIONS - Invoke-LogAndThrow #
-##################################
+######################################
+# FUNCTIONS - Send-NotificationEmail #
+######################################
 
-# Helper to log an error message and throw an exception with optional inner exception
-function Invoke-LogAndThrow {
+function Send-NotificationEmail {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$SmtpServer,
+        [Parameter(Mandatory)][string]$fromAddress,
+        [Parameter(Mandatory)][string[]]$To,
+        [Parameter(Mandatory)][string]$Subject,
+        [Parameter(Mandatory)][string]$Body,
+        [Parameter()][pscredential]$smtpCredential
+    )
+
+    try {
+
+        if ($null -eq $smtpCredential) {
+            # send without authentication
+            Send-MailMessage -SmtpServer $SmtpServer -From $fromAddress -To $To -Subject $Subject -Body $Body -BodyAsHtml:$true -WarningAction:SilentlyContinue
+        }
+        else
+        {
+            # send with authentication
+            Send-MailMessage -SmtpServer $SmtpServer -From $fromAddress -To $To -Subject $Subject -Body $Body -BodyAsHtml:$true -Credential $smtpCredential -WarningAction:SilentlyContinue
+        }
+        
+        Write-CertLCLog -Message "Notification email sent to: $($To -join ', ')" -Section 'Send-NotificationEmail'
+    }
+    catch {
+        # don't throw if email sending fails, just log the error
+        Write-CertLCLog -Level 'Warning' -Message "Error sending notification email to $($To -join ', '): $($_.Exception.Message)" -Section 'Send-NotificationEmail'
+    }
+}
+
+#######################################
+# FUNCTIONS - Write-CertLCLogAndThrow #
+#######################################
+
+function Write-CertLCLogAndThrow {
     <#
         .SYNOPSIS
-            Log an error and throw a terminating exception.
+            Log an error, send an email notification if needed, and throw a terminating exception.
         .DESCRIPTION
             Emits a structured error log (with flattened exception details) and then throws a System.Exception.
-            Backward compatible with prior -Inner usage via alias.
+            If an InnerException is provided, it is included in the log and wrapped in the thrown exception.
+            Sends email notifications to specified addresses if NotifyTo is provided.
     #>
     [CmdletBinding()]
     param(
@@ -190,13 +271,17 @@ function Invoke-LogAndThrow {
         [Parameter(Mandatory)][string]$Section,
         [Parameter()][string]$CorrelationId,
         [Parameter()][Alias('Inner')][System.Exception]$InnerException,
-        [Parameter()][hashtable]$Context
+        [Parameter()][hashtable]$Context,
+        [Parameter()][string[]]$NotifyTo,
+        [Parameter()][string]$SmtpServer,
+        [Parameter()][string]$fromAddress,
+        [Parameter()][pscredential]$SmtpCredential
     )
 
     function Convert-ExceptionToObject {
         param([System.Exception]$Exception, [int]$MaxDepth = 2)
         if (-not $Exception) { return $null }
-        $o = [ordered]@{ type=$Exception.GetType().FullName; message=$Exception.Message }
+        $o = [ordered]@{ type = $Exception.GetType().FullName; message = $Exception.Message }
         if ($Exception.HResult) { $o.hresult = $Exception.HResult }
         if ($Exception.StackTrace) { $o.stackTrace = $Exception.StackTrace }
         if ($Exception.InnerException -and $MaxDepth -gt 0) {
@@ -209,8 +294,29 @@ function Invoke-LogAndThrow {
     if ($Context) { $ctx = @{} + $Context }
     if ($InnerException) { $ctx.exception = Convert-ExceptionToObject -Exception $InnerException }
 
-    Write-Log -Level 'Error' -Message $Message -Section $Section -CorrelationId $CorrelationId -Context $ctx
-    if ($InnerException) { throw ([System.Exception]::new($Message, $InnerException)) }
+    # Send email if needed. Note that we may not have the NotifyTo list in all cases.
+    # For example, for a renewal, if the error occurs before we read the certificate details including the NotifyTo tag, we don't have the To list.
+    # In this case, skip the email sending.
+
+    if ($NotifyTo) {
+        $subject = "Error in CERTLC runbook - $Section"
+        $fragment =  $message.Replace("`n","`n<br/>").Replace("`r","")
+
+        # if we have an inner exception, include its message and type
+        if ($InnerException) {
+            $innerMsg = "Inner Exception: $($InnerException.GetType().FullName): $($InnerException.Message)"
+            $fragment += "<br/><br/>$innerMsg"
+        }
+        $body = $CertificateErrorEmailBodyHtml -replace '__CONTENT__', $fragment
+        Send-NotificationEmail -SmtpServer $SmtpServer -fromAddress $fromAddress -To $NotifyTo -Subject $subject -Body $body -SmtpCredential $SmtpCredential
+    }
+
+    Write-CertLCLog -Level 'Error' -Message $Message -Section $Section -CorrelationId $CorrelationId -Context $ctx
+
+    # Throw a terminating exception
+    if ($InnerException) {
+        throw ([System.Exception]::new($Message, $InnerException))
+    }
     throw ([System.Exception]::new($Message))
 }
 
@@ -220,6 +326,7 @@ function Invoke-LogAndThrow {
 
 # Validate hostname format (simple regex)
 function Test-HostnameFormat {
+    [CmdletBinding()]
     param(
         [Parameter()]
         [string]$Hostname
@@ -237,6 +344,8 @@ function Test-HostnameFormat {
 
 # Format PfxProtectTo array consistently (trim, collapse backslashes, de-dupe case-insensitive)
 function Format-PfxProtectTo {
+    [OutputType([object[]])]
+    [CmdletBinding()]
     param(
         [Parameter()] [object] $InputValue
     )
@@ -274,13 +383,15 @@ function Format-PfxProtectTo {
 
 # Convert PfxProtectTo array to tag-safe string
 function Convert-PfxProtectToForTag {
+    [OutputType([string])]
+    [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [string[]] $Value
     )
 
     if (-not $Value -or $Value.Count -eq 0) { return '' }
-    
+
     # Trim, remove empties, dedupe (case-insensitive), preserve order of first occurrence
     $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $clean = foreach ($v in $Value) {
@@ -297,6 +408,8 @@ function Convert-PfxProtectToForTag {
 
 # Parse tag string into PfxProtectTo array
 function Convert-PfxProtectToFromTag {
+    [OutputType([object[]])]
+    [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [string] $TagValue
@@ -322,7 +435,7 @@ The exported PFX file can be protected to multiple SIDs (users or groups).
 Note: this function is used in the New-CertificateCreationRequest function to export the certificate
 #>
 function Export-PfxWithGroupProtection {
-
+    [CmdletBinding()]
     param (
         [Parameter(Mandatory = $true)]
         [System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert,
@@ -387,7 +500,7 @@ function Export-PfxWithGroupProtection {
     if ($hr) {
         throw 'Export-PfxWithGroupProtection: NCryptCreateProtectionDescriptor failed: 0x{0:X}' -f $hr
     }
-    Write-Log -Section 'Export-PfxWithGroupProtection' "Protection descriptor handle: $hDesc"
+    Write-CertLCLog -Section 'Export-PfxWithGroupProtection' "Protection descriptor handle: $hDesc"
 
     try {
 
@@ -396,7 +509,7 @@ function Export-PfxWithGroupProtection {
         if ($store -eq [IntPtr]::Zero) {
             throw 'Export-PfxWithGroupProtection: CertOpenStore failed: 0x{0:X}' -f [Runtime.InteropServices.Marshal]::GetLastWin32Error()
         }
-        Write-Log -Section 'Export-PfxWithGroupProtection' "Memory store handle: $store"
+        Write-CertLCLog -Section 'Export-PfxWithGroupProtection' "Memory store handle: $store"
 
         try {
 
@@ -404,7 +517,7 @@ function Export-PfxWithGroupProtection {
             if (-not [Win32Native]::CertAddCertificateContextToStore($store, $Cert.Handle, 3, [IntPtr]::Zero)) {
                 throw "Export-PfxWithGroupProtection: CertAddCertificateContextToStore failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
             }
-            Write-Log -Section 'Export-PfxWithGroupProtection' 'Certificate added to memory store.'
+            Write-CertLCLog -Section 'Export-PfxWithGroupProtection' 'Certificate added to memory store.'
 
             # Wrap the handle in an IntPtr buffer
             $pvPara = [Runtime.InteropServices.Marshal]::AllocHGlobal([IntPtr]::Size)
@@ -422,7 +535,7 @@ function Export-PfxWithGroupProtection {
                 if (-not [Win32Native]::PFXExportCertStoreEx($store, [ref]$blob, $password, $pvPara, $flags)) {
                     throw ('Export-PfxWithGroupProtection:: size query failed: 0x{0:X}' -f [Runtime.InteropServices.Marshal]::GetLastWin32Error())
                 }
-                Write-Log -Section 'Export-PfxWithGroupProtection' "PFX size will be: $($blob.cbData) bytes"
+                Write-CertLCLog -Section 'Export-PfxWithGroupProtection' "PFX size will be: $($blob.cbData) bytes"
 
                 # allocate memory for the PFX data (pass 2)
                 $blob.pbData = [Runtime.InteropServices.Marshal]::AllocHGlobal($blob.cbData)
@@ -432,7 +545,7 @@ function Export-PfxWithGroupProtection {
                     if (-not [Win32Native]::PFXExportCertStoreEx($store, [ref]$blob, $password, $pvPara, $flags)) {
                         throw ('Export-PfxWithGroupProtection: export to memory store failed: 0x{0:X}' -f [Runtime.InteropServices.Marshal]::GetLastWin32Error())
                     }
-                    Write-Log -Section 'Export-PfxWithGroupProtection' 'Export to memory store successful.'
+                    Write-CertLCLog -Section 'Export-PfxWithGroupProtection' 'Export to memory store successful.'
 
                     $password = $null  # clear the password variable to avoid keeping it in memory
 
@@ -440,7 +553,7 @@ function Export-PfxWithGroupProtection {
                     $bytes = New-Object byte[] $blob.cbData
                     [Runtime.InteropServices.Marshal]::Copy($blob.pbData, $bytes, 0, $blob.cbData)
                     [System.IO.File]::WriteAllBytes($PfxFile, $bytes)
-                    Write-Log -Section 'Export-PfxWithGroupProtection' "PFX exported to file: $PfxFile"
+                    Write-CertLCLog -Section 'Export-PfxWithGroupProtection' "PFX exported to file: $PfxFile"
                 }
                 finally {
                     # free the allocated memory for PFX data
@@ -455,7 +568,7 @@ function Export-PfxWithGroupProtection {
         finally {
             # close the memory store
             [Win32Native]::CertCloseStore($store, 0) | Out-Null
-        }      
+        }
     }
     finally {
         # free the protection descriptor handle
@@ -473,6 +586,8 @@ This function queries the Active Directory Certificate Services configuration to
 #>
 
 function Find-TemplateName {
+[OutputType([string])]
+    [CmdletBinding()]
     param (
         [Parameter(Mandatory = $true)]
         [string]$cnOrDisplayNameOrOid
@@ -492,106 +607,6 @@ function Find-TemplateName {
     return $result.Properties['name'][0]
 }
 
-#############################################
-# FUNCTIONS - New-CertificateRenewalRequest #
-#############################################
-
-# Renew an existing certificate in Key Vault by creating a new request to the specified CA.
-# The certificate details (template, subject, DNS names) are obtained from the existing certificate in the vault.
-function New-CertificateRenewalRequest {
-    param (
-        [Parameter(Mandatory = $true)][string]$VaultName,
-        [Parameter(Mandatory = $true)][string]$CertificateName,
-        [Parameter(Mandatory = $true)][string]$CA
-    )
-
-    # before processing the request, we need to obtain the other certificate details, such as template, subject, and DNS names
-    Write-Log -Section 'New-CertificateRenewalRequest' -Message "Getting additional certificate details for $CertificateName from key vault $VaultName..."
-    $cert = $null
-    try {
-        $cert = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName
-    }
-    catch {
-        throw [System.Exception]::new("New-CertificateRenewalRequest: Error getting certificate details for $CertificateName from vault $VaultName", $_.Exception)
-    }
-    if ($null -eq $cert) {
-        # Wrap $VaultName to avoid parsing the trailing colon as part of the variable token in some Automation parsing contexts
-        throw [System.Exception]::new("New-CertificateRenewalRequest: Error getting certificate details for $CertificateName from vault $($VaultName): empty response! Certificate may not exist in the vault.")
-    }
-
-    # get the certificate subject
-    $CertificateSubject = $cert.Certificate.Subject
-
-    # get the DNS names from the certificate
-    $CertificateDnsNames = $null
-    $san = $cert.Certificate.Extensions | Where-Object { $_.Oid.FriendlyName -eq 'Subject Alternative Name' }
-    if ($null -ne $san) {
-        # $DNS.Format(0) returns a string like: DNS Name=server01.contoso.com, DNS Name=server01.litware.com.
-        # Transform it into an array of DNS names using regex; remove the "DNS Name=" prefix and split by comma
-        $CertificateDnsNames = ($san.Format(0) -replace 'DNS Name=', '').Split(',').Trim() | Where-Object { $_ -ne '' }
-    }
-
-    # get the OID of the Certificate Template
-    $templateExtension = $cert.Certificate.Extensions | Where-Object { $_.Oid.FriendlyName -eq 'Certificate Template Information' }
-    if ($null -eq $templateExtension) {
-        throw [System.Exception]::new('New-CertificateRenewalRequest: Error getting template information from certificate: the Certificate Template Information extension was not found.')
-    }
-    # $templateExtension.Format($false) returns a string like:
-    # - Template=Flab-ShortWebServer(1.3.6.1.4.1.311.21.8.15431357.2613787.6440092.16459852.14380503.11.12399345.16691736), Major Version Number=100, Minor Version Number=5
-    # - Template=1.3.6.1.4.1.311.21.8.15431357.2613787.6440092.16459852.14380503.11.12399345.16691736, Major Version Number=100, Minor Version Number=5
-    $asn = $templateExtension.Format($false)
-
-    # extract the OID using a regex working for both cases
-    $regex = [regex]'(?<=Template=(?:[^\(]*\()?)(\d+(?:\.\d+)+)'
-    if (-not $regex.IsMatch($asn)) {
-        throw [System.Exception]::new("New-CertificateRenewalRequest: Error getting OID from certificate: Template OID not found in string: $asn")
-    }
-    $oid = $regex.Match($asn).Value
-
-    # lookup the template name using the OID
-    try {
-        Write-Log -Section 'New-CertificateRenewalRequest' "Looking up template name for OID: $oid"
-        $certificateTemplateName = Find-TemplateName -cnOrDisplayNameOrOid $oid
-    }
-    catch { throw [System.Exception]::new("New-CertificateRenewalRequest: Error resolving template name for OID $oid", $_.Exception) }
-    if ([string]::IsNullOrEmpty($certificateTemplateName)) {
-        # Wrap $oid before the colon to ensure unambiguous variable expansion
-        throw [System.Exception]::new("New-CertificateRenewalRequest: Error resolving template name for OID $($oid): template not found in AD.")
-    }
-    Write-Log -Section 'New-CertificateRenewalRequest' -Message "Template name found for OID $($oid) is: $certificateTemplateName"
-
-    # get Hostname from the certificate tags
-    $Hostname = $cert.Tags['Hostname']
-    if ([string]::IsNullOrWhiteSpace($Hostname)) {
-        throw [System.Exception]::new("New-CertificateRenewalRequest: Missing mandatory Hostname tag on certificate $CertificateName in vault $VaultName.")
-    }
-    Write-Log -Section 'New-CertificateRenewalRequest' -Message "Hostname: $Hostname"
-
-    # get PfxProtectTo from the certificate tags
-    $rawPfxProtectTo = $cert.Tags['PfxProtectTo']
-    $PfxProtectTo = Convert-PfxProtectToFromTag -TagValue $rawPfxProtectTo
-    if (-not $PfxProtectTo -or $PfxProtectTo.Count -eq 0) {
-        throw [System.Exception]::new("New-CertificateRenewalRequest: Missing mandatory PfxProtectTo tag on certificate $CertificateName in vault $VaultName.")
-    }
-    Write-Log -Section 'New-CertificateRenewalRequest' -Message "PfxProtectTo principals: $($PfxProtectTo -join ', ')"
-
-    Write-Log -Section 'New-CertificateRenewalRequest' -Message "Certificate $CertificateName details: Subject: $CertificateSubject, Template: $certificateTemplateName ($oid)"
-
-    if ($null -eq $CertificateDnsNames) {
-        Write-Log -Section 'New-CertificateRenewalRequest' -Message 'Certificate DNS Names: N/A'
-    }
-    else {
-        Write-Log -Section 'New-CertificateRenewalRequest' -Message "Certificate DNS Names: $($CertificateDnsNames -join ', ')"
-    }
-
-    # Now we have all the details to create the renew request.
-    # Renew actually uses same code as New-CertificateCreationRequest, so we can reuse it.
-    # Exceptions will be caught directly in the main section of the script
-    Write-Log -Section 'New-CertificateRenewalRequest' -Message "Got all required information to process the certificate renewal request for $CertificateName in vault $VaultName"
-    Write-Log -Section 'New-CertificateRenewalRequest' -Message 'The operation will now continue as a new certificate creation request. See next log entries for details.'
-    New-CertificateCreationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplateName $certificateTemplateName -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -Hostname $Hostname -PfxProtectTo $PfxProtectTo
-}
-
 ##############################################
 # FUNCTIONS - New-CertificateCreationRequest #
 ##############################################
@@ -599,6 +614,7 @@ function New-CertificateRenewalRequest {
 # Create a new certificate request to the specified CA using the provided details.
 # The certificate is created in the specified Key Vault, which generates the private key and CSR.
 function New-CertificateCreationRequest {
+    [CmdletBinding()]
     param (
         [Parameter(Mandatory = $true)][string]$VaultName,
         [Parameter(Mandatory = $true)][string]$CertificateName,
@@ -607,7 +623,8 @@ function New-CertificateCreationRequest {
         [Parameter()][string[]]$CertificateDnsNames,
         [Parameter(Mandatory = $true)][string]$CA,
         [Parameter(Mandatory = $true)][string]$Hostname,
-        [Parameter(Mandatory = $true)][string[]]$PfxProtectTo
+        [Parameter(Mandatory = $true)][string[]]$PfxProtectTo,
+        [Parameter()][string[]]$NotifyTo
     )
 
     # prepare tags for the certificate
@@ -617,6 +634,9 @@ function New-CertificateCreationRequest {
         'CertificateTemplateName' = $CertificateTemplateName
     }
     if ($Hostname) { $tags['Hostname'] = $Hostname }
+    if ($NotifyTo -and $NotifyTo.Count -gt 0) {
+        $tags['NotifyTo'] = ($NotifyTo -join ';')
+    }
 
     # create certificate CSR - if a previous request is in progress, reuse it
     $csr = $null
@@ -625,11 +645,11 @@ function New-CertificateCreationRequest {
     }
     catch { throw [System.Exception]::new('New-CertificateCreationRequest, KeyVault: Error querying existing certificate operation', $_.Exception) }
     if ($null -ne $op) {
-        Write-Log -Section 'New-CertificateCreationRequest' -Message "KeyVault: Certificate request is already in progress in $VaultName for this certificate: $CertificateName; reusing the existing request." -Level 'Warning'
+        Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "KeyVault: Certificate request is already in progress in $VaultName for this certificate: $CertificateName; reusing the existing request." -Level 'Warning'
         $csr = $op.CertificateSigningRequest
     }
     else {
-        Write-Log -Section 'New-CertificateCreationRequest' -Message "Creating a new CSR for certificate $CertificateName in key vault $VaultName..."
+        Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "Creating a new CSR for certificate $CertificateName in key vault $VaultName..."
         if ($null -ne $CertificateDnsNames) {
             $Policy = New-AzKeyVaultCertificatePolicy -SecretContentType 'application/x-pkcs12' -SubjectName $CertificateSubject -IssuerName 'Unknown' -DnsName $CertificateDnsNames
         }
@@ -655,7 +675,7 @@ function New-CertificateCreationRequest {
     # CR_OUT_BASE64 = 0x1,
     # CR_OUT_BINARY = 0x2
 
-    Write-Log -Section 'New-CertificateCreationRequest' -Message "CA: Sending request to the CA $CA using template $($CertificateTemplateName) for certificate $CertificateName..."
+    Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "CA: Sending request to the CA $CA using template $($CertificateTemplateName) for certificate $CertificateName..."
     try {
         $CertRequest = New-Object -ComObject CertificateAuthority.Request
         $CertRequestStatus = $CertRequest.Submit(0x1, $csr, "CertificateTemplate:$CertificateTemplateName", $CA)
@@ -665,14 +685,14 @@ function New-CertificateCreationRequest {
     switch ($CertRequestStatus) {
         2 { throw [System.Exception]::new("New-CertificateCreationRequest: CA: Request was denied. Check the CA $CA for details.") }
         3 {
-            Write-Log -Section 'New-CertificateCreationRequest' -Message "CA: Certificate Request for $CertificateName submitted successfully."
+            Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "CA: Certificate Request for $CertificateName submitted successfully."
             try {
                 $CertEncoded = $CertRequest.GetCertificate(0x0)
             }
             catch {
                 throw [System.Exception]::new("New-CertificateCreationRequest: CA: Error retrieving issued certificate from CA $CA", $_.Exception)
             }
-            Write-Log -Section 'New-CertificateCreationRequest' -Message "Certificate received from CA $CA"
+            Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "Certificate received from CA $CA"
         }
         5 {
             throw [System.Exception]::new("New-CertificateCreationRequest: CA: Request to $CA is pending. This runbook expects immediate issuance. Review template/CA configuration.")
@@ -687,7 +707,7 @@ function New-CertificateCreationRequest {
     Set-Content -Path $CertEncodedFile -Value $CertEncoded
 
     # import the certificate into the key vault
-    Write-Log -Section 'New-CertificateCreationRequest' -Message "KeyVault: Importing the certificate $CertificateName into the key vault $VaultName..."
+    Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "KeyVault: Importing the certificate $CertificateName into the key vault $VaultName..."
     try {
         $newCert = Import-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -FilePath $CertEncodedFile
         if ($null -eq $newCert) {
@@ -701,19 +721,19 @@ function New-CertificateCreationRequest {
         # Always remove temporary file
         Remove-Item -Path $CertEncodedFile -Force -ErrorAction SilentlyContinue
     }
-    Write-Log -Section 'New-CertificateCreationRequest' -Message "KeyVault: Certificate $CertificateName imported into the key vault $($VaultName)."
+    Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "KeyVault: Certificate $CertificateName imported into the key vault $($VaultName)."
 
     # Create root folder if needed
     if (-not (Test-Path -Path $PfxRootFolder)) {
-        Write-Log -Section 'New-CertificateCreationRequest' -Message "PFX: Creating the PFX root folder: $PfxRootFolder"
+        Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Creating the PFX root folder: $PfxRootFolder"
         New-Item -Path $PfxRootFolder -ItemType Directory -Force | Out-Null
     }
-    Write-Log -Section 'New-CertificateCreationRequest' -Message "PFX: Root folder verified: $PfxRootFolder"
+    Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Root folder verified: $PfxRootFolder"
 
     $PfxTargetFolder = Join-Path -Path $PfxRootFolder -ChildPath $Hostname
 
     if (-not (Test-Path -Path $PfxTargetFolder)) {
-        Write-Log -Section 'New-CertificateCreationRequest' -Message "PFX: Creating the target folder for PFX: $PfxTargetFolder"
+        Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Creating the target folder for PFX: $PfxTargetFolder"
         New-Item -Path $PfxTargetFolder -ItemType Directory -Force | Out-Null
     }
 
@@ -743,16 +763,16 @@ function New-CertificateCreationRequest {
         }
 
         Set-Acl -Path $PfxTargetFolder -AclObject $acl
-        Write-Log -Section 'New-CertificateCreationRequest' -Message "PFX: ACL set on target folder (inheritance disabled, custom ACEs only): $PfxTargetFolder"
+        Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: ACL set on target folder (inheritance disabled, custom ACEs only): $PfxTargetFolder"
     }
     catch {
         throw [System.Exception]::new("New-CertificateCreationRequest: PFX: Error setting permissions on $PfxTargetFolder", $_.Exception)
     }
 
     $pfxFile = Join-Path -Path $PfxTargetFolder -ChildPath "$($CertificateName).pfx"
-    Write-Log -Section 'New-CertificateCreationRequest' -Message "PFX: Export path: $pfxFile"
+    Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Export path: $pfxFile"
 
-    Write-Log -Section 'New-CertificateCreationRequest' -Message "PFX: Retrieving secret for $CertificateName from vault $VaultName..."
+    Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Retrieving secret for $CertificateName from vault $VaultName..."
     try {
         $certBase64 = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertificateName -AsPlainText
     }
@@ -777,7 +797,7 @@ function New-CertificateCreationRequest {
     }
 
     if (Test-Path -Path $pfxFile) {
-        Write-Log -Section 'New-CertificateCreationRequest' -Message "PFX: Removing existing file $pfxFile"
+        Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Removing existing file $pfxFile"
         try {
             Remove-Item -Path $pfxFile -Force
         }
@@ -799,7 +819,8 @@ function New-CertificateCreationRequest {
     if (-not (Test-Path -Path $pfxFile)) {
         throw [System.Exception]::new("New-CertificateCreationRequest: PFX: Export did not create $pfxFile")
     }
-    Write-Log -Section 'New-CertificateCreationRequest' -Message "PFX: Certificate $CertificateName exported to $pfxFile"
+
+    Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Certificate $CertificateName exported to $pfxFile"
 }
 
 ################################################
@@ -808,6 +829,7 @@ function New-CertificateCreationRequest {
 
 # Revoke an existing certificate in Key Vault by sending a revocation request to the specified CA.
 function New-CertificateRevocationRequest {
+    [CmdletBinding()]
     param (
         [Parameter(Mandatory = $true)]
         [string]$VaultName,
@@ -821,7 +843,7 @@ function New-CertificateRevocationRequest {
     )
 
     # get the certificate from the key vault
-    Write-Log -Section 'New-CertificateRevocationRequest' -Message "KeyVault: Certificate $($CertificateName): getting the certificate from key vault $VaultName to obtain details..."
+    Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "KeyVault: Certificate $($CertificateName): getting the certificate from key vault $VaultName to obtain details..."
     try {
         $certBase64 = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertificateName -AsPlainText
     }
@@ -837,15 +859,15 @@ function New-CertificateRevocationRequest {
     $certBase64 = $null
     $x509Cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($certBytes, [string]::Empty, 'Exportable')
     # $x509Cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($certBytes, [string]::Empty, [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
-        
+
     # save the serial number
     $serialNumber = $x509Cert.SerialNumber
 
     # cleanup objects that are no longer needed
-    $x509Cert = $null      
+    $x509Cert = $null
     $certBytes = $null
 
-    Write-Log -Section 'New-CertificateRevocationRequest' -Message "CA: Sending revocation request for certificate $CertificateName to the CA $CA using reason $($RevocationReason)..."
+    Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "CA: Sending revocation request for certificate $CertificateName to the CA $CA using reason $($RevocationReason)..."
 
     try {
         $CertAdmin = New-Object -ComObject CertificateAuthority.Admin
@@ -854,33 +876,33 @@ function New-CertificateRevocationRequest {
     catch {
         throw [System.Exception]::new("New-CertificateRevocationRequest: CA: Error revoking certificate $CertificateName in CA $CA", $_.Exception)
     }
-    Write-Log -Section 'New-CertificateRevocationRequest' -Message "CA: Certificate $CertificateName revoked successfully in CA $($CA)."
+    Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "CA: Certificate $CertificateName revoked successfully in CA $($CA)."
 
     # remove the certificate from the key vault
-    Write-Log -Section 'New-CertificateRevocationRequest' -Message "KeyVault: Removing certificate $CertificateName from key vault $($VaultName)..."
+    Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "KeyVault: Removing certificate $CertificateName from key vault $($VaultName)..."
     try {
         Remove-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -Force
     }
     catch {
         throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Error removing certificate $CertificateName from key vault $VaultName", $_.Exception)
     }
-    Write-Log -Section 'New-CertificateRevocationRequest' -Message "KeyVault: Certificate $CertificateName removed from key vault $($VaultName)."
+    Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "KeyVault: Certificate $CertificateName removed from key vault $($VaultName)."
 }
 
-####################
-# MAIN DISPATCHER  #
-####################
+###############
+# DISPATCHER  #
+###############
 
 # Connect to Azure. Ensures we do not inherit an AzContext, since we are using a system-assigned identity for login
 $null = Disable-AzContextAutosave -Scope Process
 
 # Connect using a Managed Service Identity
-Write-Log -Section 'Dispatcher' -Message 'Connecting to Azure using default identity...'
+Write-CertLCLog -Section 'Dispatcher' -Message 'Connecting to Azure using default identity...'
 try {
     $AzureConnection = (Connect-AzAccount -Identity).context
 }
 catch {
-    Invoke-LogAndThrow -Section 'Dispatcher' -Message 'There is no system-assigned user identity.' -Inner $_.Exception
+    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'There is no system-assigned user identity.' -Inner $_.Exception
 }
 
 # set context
@@ -891,19 +913,19 @@ Set-AzContext -SubscriptionName $AzureConnection.Subscription -DefaultProfile $A
 if ($env:AZUREPS_HOST_ENVIRONMENT -eq 'AzureAutomation/') {
     # We are in a Hybrid Runbook Worker
     $jobId = $env:PSPrivateMetadata
-    Write-Log -Section 'Dispatcher' -Message "Runbook running with job id $jobId on hybrid worker $($env:COMPUTERNAME)."
+    Write-CertLCLog -Section 'Dispatcher' -Message "Runbook running with job id $jobId on hybrid worker $($env:COMPUTERNAME)."
 }
 elseif ($env:AZUREPS_HOST_ENVIRONMENT -eq 'AzureAutomation') {
     # We are in Azure Automation
     $jobId = $PSPrivateMetadata.JobId
-    Invoke-LogAndThrow -Section 'Dispatcher' -Message "Runbook running with job id $jobId in Azure Automation. This runbook must be executed by a hybrid worker instead!"
+    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "Runbook running with job id $jobId in Azure Automation. This runbook must be executed by a hybrid worker instead!"
 }
 else {
     # We are in a local environment - not supported anymore because we cannot get the encrypted variables from the automation account in this case
-    Invoke-LogAndThrow -Section 'Dispatcher' -Message 'Runbook running in a local environment. This runbook must be executed by a hybrid worker instead!'
+    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'Runbook running in a local environment. This runbook must be executed by a hybrid worker instead!'
 }
 
- # TODO: decide if we want to use $jobId as correlation id in the logs
+# TODO: decide if we want to use $jobId as correlation id in the logs
 
 # Automation account variables
 # Note: since they are encrypted, you must use the internal cmdlet Get-AutomationVariable to retrieve them, not Get-AzAutomationVariable
@@ -912,17 +934,70 @@ try {
     # Get the CA from the automation account variable
     $CA = Get-AutomationVariable -Name 'certlc-ca'
 }
-catch { Invoke-LogAndThrow -Section 'Dispatcher' -Message "Error getting automation account variable 'certlc-ca'. Ensure the variable exists in the automation account!" -Inner $_.Exception }
+catch { Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "Error getting automation account variable 'certlc-ca'. Ensure the variable exists in the automation account!" -Inner $_.Exception }
 # Ensure the CA variable is not empty
-if ([string]::IsNullOrEmpty($CA)) { Invoke-LogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-ca' is empty!" }
+if ([string]::IsNullOrEmpty($CA)) { Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-ca' is empty!" }
+
+try {
+    # Get the SmtpServer from the automation account variable
+    $SmtpServer = Get-AutomationVariable -Name 'certlc-smtpserver'
+}
+catch { Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "Error getting automation account variable 'certlc-smtpserver'. Ensure the variable exists in the automation account!" -Inner $_.Exception }
+# Ensure the SmtpServer variable is not empty
+if ([string]::IsNullOrEmpty($SmtpServer)) { Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtpserver' is empty!" }
+
+try {
+    # Get the FromAddress from the automation account variable
+    $FromAddress = Get-AutomationVariable -Name 'certlc-smtpfrom'
+}
+catch {
+    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "Error getting automation account variable 'certlc-smtpfrom'. Ensure the variable exists in the automation account!" -Inner $_.Exception
+}
+# Ensure the FromAddress variable is not empty
+if ([string]::IsNullOrEmpty($FromAddress)) {
+    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtpfrom' is empty!"
+}
+
+try {
+    # Get the SMTP user from the automation account variable - optional: if empty, no authentication is used to send email
+    $SmtpUser = Get-AutomationVariable -Name 'certlc-smtpuser'
+}
+catch {
+    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "Error getting automation account variable 'certlc-smtpuser'. Ensure the variable exists in the automation account!" -Inner $_.Exception
+}
+
+try {
+    # Get the SMTP password from the automation account variable - optional: if empty, no authentication is used to send email
+    $SmtpPassword = Get-AutomationVariable -Name 'certlc-smtppassword'
+}
+catch {
+    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "Error getting automation account variable 'certlc-smtppassword'. Ensure the variable exists in the automation account!" -Inner $_.Exception
+}
+
+# prepare the smtp credentials
+if (-not [string]::IsNullOrEmpty($SmtpUser) -and -not [string]::IsNullOrEmpty($SmtpPassword)) {
+    $SmtpSecurePassword = ConvertTo-SecureString -String $SmtpPassword -AsPlainText -Force
+    $SmtpCredential = New-Object System.Management.Automation.PSCredential ($SmtpUser, $SmtpSecurePassword)
+    $SmtpSecurePassword = $null
+    Write-CertLCLog -Section 'Dispatcher' -Message 'SMTP: Authentication will be used to send email.'
+}
+else {
+    $SmtpCredential = $null
+    Write-CertLCLog -Section 'Dispatcher' -Message 'SMTP: No authentication will be used to send email.'
+}
 
 try {
     # Get the PfxRootFolder from the automation account variable
     $PfxRootFolder = Get-AutomationVariable -Name 'certlc-pfxrootfolder'
 }
-catch { Invoke-LogAndThrow -Section 'Dispatcher' -Message "Error getting automation account variable 'certlc-pfxrootfolder'. Ensure the variable exists in the automation account!" -Inner $_.Exception }
+catch {
+    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "Error getting automation account variable 'certlc-pfxrootfolder'. Ensure the variable exists in the automation account!" -Inner $_.Exception
+}
+
 # Ensure the PfxRootFolder variable is not empty
-if ([string]::IsNullOrEmpty($PfxRootFolder)) { Invoke-LogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-pfxrootfolder' is empty!" }
+if ([string]::IsNullOrEmpty($PfxRootFolder)) {
+    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-pfxrootfolder' is empty!"
+}
 
 # Check if we have the jsonRequestBody parameter
 if ([string]::IsNullOrEmpty($jsonRequestBody)) {
@@ -930,9 +1005,11 @@ if ([string]::IsNullOrEmpty($jsonRequestBody)) {
     # No explicit RequestBody parameter, so we will use WebhookData
     # Try to parse the webhook data
 
-    if ([string]::IsNullOrEmpty($WebhookData)) { Invoke-LogAndThrow -Section 'Dispatcher' -Message 'Both RequestBody and WebhookData parameters are missing or empty! Call the runbook from a webhook or pass the RequestBody parameter explicitly with Start-AzAutomationRunbook!' }
+    if ([string]::IsNullOrEmpty($WebhookData)) {
+        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'Both RequestBody and WebhookData parameters are missing or empty! Call the runbook from a webhook or pass the RequestBody parameter explicitly with Start-AzAutomationRunbook!'
+    }
 
-    Write-Log -Section 'Dispatcher' -Message "WebhookData received is: $($WebhookData)"
+    Write-CertLCLog -Section 'Dispatcher' -Message "WebhookData received is: $($WebhookData)"
 
     <#
 
@@ -958,7 +1035,7 @@ if ([string]::IsNullOrEmpty($jsonRequestBody)) {
         # - After RequestBody there is an array:  RequestBody:[{...}] or "RequestBody":[{...},{...}]
         # The regex properly handles nested JSON objects, checking that braces are balanced.
 
-        Write-Log -Section 'Dispatcher' -Message 'Failed to parse WebhookData as JSON. Attempting to extract RequestBody using regex...' -Level 'Warning'
+        Write-CertLCLog -Section 'Dispatcher' -Message 'Failed to parse WebhookData as JSON. Attempting to extract RequestBody using regex...' -Level 'Warning'
 
         if ($WebhookData -match '"?RequestBody"?\s*:\s*((?:{([^{}]|(?<open>{)|(?<-open>}))*(?(open)(?!))})|(?:\[([^\[\]]|(?<open>\[)|(?<-open>\]))*(?(open)(?!))\]))') {
             $jsonRequestBody = $matches[1]
@@ -966,36 +1043,47 @@ if ([string]::IsNullOrEmpty($jsonRequestBody)) {
                 $RequestBody = ConvertFrom-Json -InputObject $jsonRequestBody -Depth 10
             }
             catch {
-                Invoke-LogAndThrow -Section 'Dispatcher' -Message 'Failed to parse WebhookData.RequestBody using regex' -Inner $_.Exception
+                Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'Failed to parse WebhookData.RequestBody using regex' -Inner $_.Exception
             }
         }
-        else { Invoke-LogAndThrow -Section 'Dispatcher' -Message 'WebhookData.RequestBody not recognized using regex!' }
+        else { Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'WebhookData.RequestBody not recognized using regex!' }
     }
 
-    if ([string]::IsNullOrEmpty($requestBody)) { Invoke-LogAndThrow -Section 'Dispatcher' -Message 'WebhookData.RequestBody is empty! Ensure the runbook is called from a webhook!' }
+    if ([string]::IsNullOrEmpty($requestBody)) {
+        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'WebhookData.RequestBody is empty! Ensure the runbook is called from a webhook!'
+    }
 }
 
 else {
     # parse the jsonRequestBody parameter as JSON
-    Write-Log -Section 'Dispatcher' -Message "jsonRequestBody received is: $($jsonRequestBody)"
+    Write-CertLCLog -Section 'Dispatcher' -Message "jsonRequestBody received is: $($jsonRequestBody)"
     try {
         $requestBody = ConvertFrom-Json -InputObject $jsonRequestBody -Depth 10
     }
-    catch { Invoke-LogAndThrow -Section 'Dispatcher' -Message 'Failed to parse jsonRequestBody parameter as JSON' -Inner $_.Exception }
+    catch {
+        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'Failed to parse jsonRequestBody parameter as JSON' -Inner $_.Exception
+    }
 }
 
 # now that we have a valid requestBody object, check some fields and detect request type
 
 # check version
-if ([string]::IsNullOrEmpty($requestBody.specversion)) { Invoke-LogAndThrow -Section 'Dispatcher' -Message "Missing or empty mandatory string parameter: 'specversion' in request body!" }
-if ($requestBody.specversion -ne $Version) { Invoke-LogAndThrow -Section 'Dispatcher' -Message "The version specified in the request, $($requestBody.specversion), does not match the script version $Version!" }
+if ([string]::IsNullOrEmpty($requestBody.specversion)) {
+    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "Missing or empty mandatory string parameter: 'specversion' in request body!"
+}
+if ($requestBody.specversion -ne $Version) {
+    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The version specified in the request, $($requestBody.specversion), does not match the script version $Version!"
+}
 else {
-    Write-Log -Section 'Dispatcher' -Message "specversion: $($requestBody.specversion)"
+    Write-CertLCLog -Section 'Dispatcher' -Message "specversion: $($requestBody.specversion)"
 }
 
-if ([string]::IsNullOrEmpty($requestBody.type)) { Invoke-LogAndThrow -Section 'Dispatcher' -Message "Missing or empty mandatory string parameter: 'type' in request body!" }
-else { Write-Log -Section 'Dispatcher' -Message "request type: $($requestBody.type)" }
-
+if ([string]::IsNullOrEmpty($requestBody.type)) {
+    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "Missing or empty mandatory string parameter: 'type' in request body!"
+}
+else {
+    Write-CertLCLog -Section 'Dispatcher' -Message "request type: $($requestBody.type)"
+}
 
 
 # Process requests based on type
@@ -1004,26 +1092,144 @@ switch ($requestBody.type) {
 
     'Microsoft.KeyVault.CertificateNearExpiry' {
 
+        ######################
+        # DISPATCHER.RENEWAL #
+        ######################
+
         # get parameters
         $VaultName = $requestBody.data.VaultName
         $CertificateName = $requestBody.data.ObjectName
 
-        # start formal validation of mandatory parameters
-        if ([string]::IsNullOrEmpty($VaultName)) { Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Missing or empty mandatory string parameter: 'VaultName'!" }
-        if ([string]::IsNullOrEmpty($CertificateName)) { Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Missing or empty mandatory string parameter: 'ObjectName'!" }
+        # start formal validation of mandatory parameters:
 
-        # invoke renewal
-        Write-Log -Section 'Dispatcher.Request' -Message "Performing certificate renewal for certificate $CertificateName in vault $VaultName..."
-        try {
-            New-CertificateRenewalRequest -VaultName $VaultName -CertificateName $CertificateName -CA $CA
+        # VaultName: presence and non-empty check
+        if ([string]::IsNullOrEmpty($VaultName)) {
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Missing or empty mandatory string parameter: 'VaultName'!"
         }
-        catch { Invoke-LogAndThrow -Section 'Dispatcher.Request' -Message 'Error processing certificate renew request' -Inner $_.Exception }
 
-        # confirm completion
-        Write-Log -Section 'Dispatcher' -Message "Certificate $CertificateName was successfully renewed."
+        # CertificateName: presence and non-empty check
+        if ([string]::IsNullOrEmpty($CertificateName)) {
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Missing or empty mandatory string parameter: 'ObjectName'!"
+        }
+
+        # before processing the request, we need to obtain the other certificate details, such as template, subject, and DNS names
+        Write-CertLCLog -Section 'Dispatcher.Renewal' -Message "Getting additional certificate details for $CertificateName from key vault $VaultName..."
+        $cert = $null
+        try {
+            $cert = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName
+        }
+        catch {
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Error getting certificate details for $CertificateName from vault $VaultName" -Inner $_.Exception
+        }
+        if ($null -eq $cert) {
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Error getting certificate details for $CertificateName from vault $($VaultName): empty response! Certificate may not exist in the vault."
+        }
+
+        # get NotifyTo from the certificate tags (optional)
+        $rawNotifyTo = $cert.Tags['NotifyTo']
+        if ([string]::IsNullOrWhiteSpace($rawNotifyTo)) {
+            $notifyTo = null
+            Write-CertLCLog -Section 'Dispatcher.Renewal' -Message "No NotifyTo addresses found for certificate $CertificateName in vault $VaultName."
+        }
+        else {
+            Write-CertLCLog -Section 'Dispatcher.Renewal' -Message "NotifyTo addresses found for certificate $CertificateName in vault ${VaultName}: $rawNotifyTo"
+            $notifyTo = $rawNotifyTo.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+        }
+
+        # Certificate subject
+        $CertificateSubject = $cert.Certificate.Subject
+
+        # The DNS names from the certificate
+        $CertificateDnsNames = $null
+        $san = $cert.Certificate.Extensions | Where-Object { $_.Oid.FriendlyName -eq 'Subject Alternative Name' }
+        if ($null -ne $san) {
+            # $DNS.Format(0) returns a string like: DNS Name=server01.contoso.com, DNS Name=server01.litware.com.
+            # Transform it into an array of DNS names using regex; remove the "DNS Name=" prefix and split by comma
+            $CertificateDnsNames = ($san.Format(0) -replace 'DNS Name=', '').Split(',').Trim() | Where-Object { $_ -ne '' }
+        }
+
+        # get the OID of the Certificate Template
+        $templateExtension = $cert.Certificate.Extensions | Where-Object { $_.Oid.FriendlyName -eq 'Certificate Template Information' }
+        if ($null -eq $templateExtension) {
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message 'Error getting template information from certificate: the Certificate Template Information extension was not found.' -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+        }
+        # $templateExtension.Format($false) returns a string like:
+        # - Template=Flab-ShortWebServer(1.3.6.1.4.1.311.21.8.15431357.2613787.6440092.16459852.14380503.11.12399345.16691736), Major Version Number=100, Minor Version Number=5
+        # - Template=1.3.6.1.4.1.311.21.8.15431357.2613787.6440092.16459852.14380503.11.12399345.16691736, Major Version Number=100, Minor Version Number=5
+        $asn = $templateExtension.Format($false)
+
+        # extract the OID using a regex working for both cases
+        $regex = [regex]'(?<=Template=(?:[^\(]*\()?)(\d+(?:\.\d+)+)'
+        if (-not $regex.IsMatch($asn)) {
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Error getting OID from certificate: Template OID not found in string: $asn" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+        }
+        $oid = $regex.Match($asn).Value
+
+        # lookup the template name using the OID
+        try {
+            Write-CertLCLog -Section 'Dispatcher.Renewal' "Looking up template name for OID: $oid"
+            $certificateTemplateName = Find-TemplateName -cnOrDisplayNameOrOid $oid
+        }
+        catch {
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Error resolving template name for OID $oid" -Inner $_.Exception -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+        }
+        if ([string]::IsNullOrEmpty($certificateTemplateName)) {
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Error resolving template name for OID $($oid): template not found in AD." -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+        }
+        Write-CertLCLog -Section 'Dispatcher.Renewal' -Message "Template name found for OID $($oid) is: $certificateTemplateName"
+
+        # Hostname from the certificate tags
+        $Hostname = $cert.Tags['Hostname']
+        if ([string]::IsNullOrWhiteSpace($Hostname)) {
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Missing mandatory Hostname tag on certificate $CertificateName in vault $VaultName." -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+        }
+        Write-CertLCLog -Section 'Dispatcher.Renewal' -Message "Hostname: $Hostname"
+
+        # PfxProtectTo from the certificate tags
+        $rawPfxProtectTo = $cert.Tags['PfxProtectTo']
+        $PfxProtectTo = Convert-PfxProtectToFromTag -TagValue $rawPfxProtectTo
+        if (-not $PfxProtectTo -or $PfxProtectTo.Count -eq 0) {
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Missing mandatory PfxProtectTo tag on certificate $CertificateName in vault $VaultName." -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+        }
+        Write-CertLCLog -Section 'Dispatcher.Renewal' -Message "PfxProtectTo principals: $($PfxProtectTo -join ', ')"
+
+        if ($null -eq $CertificateDnsNames) {
+            Write-CertLCLog -Section 'Dispatcher.Renewal' -Message "Certificate $CertificateName details: Subject: $CertificateSubject, Template: $certificateTemplateName ($oid), no DNS names."
+        }
+        else {
+            Write-CertLCLog -Section 'Dispatcher.Renewal' -Message "Certificate $CertificateName details: Subject: $CertificateSubject, Template: $certificateTemplateName ($oid), DNS names: $($CertificateDnsNames -join ', ')"
+        }
+
+        # Now we have all the details to create the renew request.
+        # Renew actually uses same code as New-CertificateCreationRequest, so we can reuse it.
+        # Exceptions will be caught directly in the main section of the script
+        Write-CertLCLog -Section 'Dispatcher.Renewal' -Message "Got all required information to process the certificate renewal request for $CertificateName in vault $VaultName"
+        Write-CertLCLog -Section 'Dispatcher.Renewal' -Message 'The operation will now continue as a new certificate creation request. See next log entries for details.'
+
+        try {
+            New-CertificateCreationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplateName $certificateTemplateName -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -Hostname $Hostname -PfxProtectTo $PfxProtectTo -NotifyTo $NotifyTo
+        }
+        catch {
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message 'Error processing certificate creation request' -Inner $_.Exception -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+        }
+
+        # send notification email if requested
+        if ($NotifyTo) {
+            $subject = "Certificate $CertificateName renewed successfully"
+            $fragment = "A new version of certificate $CertificateName has been successfully renewed in the Key Vault $VaultName."
+            $body = $CertificateNotificationEmailBodyHtml -replace '__CONTENT__', $fragment
+            Send-NotificationEmail -SmtpServer $SmtpServer -FromAddress $fromAddress -To $NotifyTo -Subject $subject -Body $body -SmtpCredential $SmtpCredential
+        }
+
+        # confirm renewal
+        Write-CertLCLog -Section 'Dispatcher.Renewal' -Message "Certificate $CertificateName was successfully renewed."
     }
 
     'CertLC.NewCertificateRequest' {
+
+        #######################
+        # DISPATCHER.CREATION #
+        #######################
 
         # get parameters
         $VaultName = $requestBody.data.VaultName
@@ -1033,17 +1239,23 @@ switch ($requestBody.type) {
         $CertificateDnsNames = $requestBody.data.CertificateDnsNames
         $Hostname = $requestBody.data.Hostname
         $PfxProtectTo = $requestBody.data.PfxProtectTo
+        $NotifyTo = $requestBody.data.NotifyTo
 
         # start formal validation of mandatory parameters:
 
+        # NotifyTo (optional, but if specified, must be an array)
+        if ($NotifyTo -and $NotifyTo -isnot [array]) {
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Parameter 'NotifyTo' is not an array!"
+        }
+
         # VaultName: presence and non-empty check
         if ([string]::IsNullOrEmpty($VaultName)) {
-            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Missing or empty mandatory string parameter: 'data.VaultName' in request body!"
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.VaultName' in request body!" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
         }
 
         # CertificateName: presence and non-empty check
         if ([string]::IsNullOrEmpty($CertificateName)) {
-            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Missing or empty mandatory string parameter: 'data.ObjectName' in request body!"
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.ObjectName' in request body!" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential 
         }
 
         # CertificateName: check if the certificate already exists in the key vault
@@ -1051,15 +1263,15 @@ switch ($requestBody.type) {
             $deletedCert = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -InRemovedState
         }
         catch {
-            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message 'Error checking for deleted certificate' -Inner $_.Exception
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message 'Error checking for deleted certificate' -Inner $_.Exception -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
         }
         if (($null -ne $deletedCert) -and ($null -ne $deletedCert.DeletedDate)) {
-            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Certificate $CertificateName is deleted since $($deletedCert.DeletedDate). Purge it or use a different name."
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Certificate $CertificateName is deleted since $($deletedCert.DeletedDate). Purge it or use a different name." -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
         }
 
         # CertificateTemplate: presence and non-empty check
         if ([string]::IsNullOrEmpty($CertificateTemplate)) {
-            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Missing or empty mandatory string parameter: 'data.CertificateTemplate' in request body!"
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.CertificateTemplate' in request body!" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
         }
 
         # CertificateTemplate: check if the template exists in AD; caller may have specified the template name (CN) or the display name or the OID. We need the 'name' attribute
@@ -1067,65 +1279,77 @@ switch ($requestBody.type) {
             $CertificateTemplateName = Find-TemplateName -cnOrDisplayNameOrOid $CertificateTemplate
         }
         catch {
-            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message 'Error resolving template name' -Inner $_.Exception
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message 'Error resolving template name' -Inner $_.Exception -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
         }
         if ([string]::IsNullOrEmpty($CertificateTemplateName)) {
-            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Certificate template $CertificateTemplate not found in Active Directory!"
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Certificate template $CertificateTemplate not found in Active Directory!" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
         }
 
         # CertificateSubject: presence and non-empty check
         if ([string]::IsNullOrEmpty($CertificateSubject)) {
-            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Missing or empty mandatory string parameter: 'data.CertificateSubject' in request body!"
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.CertificateSubject' in request body!" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
         }
 
         # DnsNames (optional, but if specified, must be an array)
         if ($CertificateDnsNames -and $CertificateDnsNames -isnot [array]) {
-            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Parameter 'CertificateDnsNames' is not an array!"
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Parameter 'CertificateDnsNames' is not an array!" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
         }
 
         # Hostname
         if ([string]::IsNullOrWhiteSpace($Hostname)) {
-            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Missing or empty mandatory string parameter: 'data.Hostname' in request body!"
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.Hostname' in request body!" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
         }
         $originalHostname = $Hostname
         $Hostname = $Hostname.Trim().ToLower()
         if (-not (Test-HostnameFormat -Hostname $Hostname)) {
-            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Hostname '$Hostname' contains invalid characters."
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Hostname '$Hostname' contains invalid characters." -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
         }
         if (-not $originalHostname.Equals($Hostname, 'OrdinalIgnoreCase')) {
-            Write-Log -Section 'Dispatcher.Validation' "Hostname normalized: '$originalHostname' -> '$Hostname'"
+            Write-CertLCLog -Section 'Dispatcher.Creation' "Hostname normalized: '$originalHostname' -> '$Hostname'"
         }
 
         # PfxProtectTo
         if (-not $PfxProtectTo) {
-            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Missing mandatory parameter 'PfxProtectTo'!"
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing mandatory parameter 'PfxProtectTo'!" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
         }
         $PfxProtectTo = Format-PfxProtectTo -InputValue $PfxProtectTo
         if ($PfxProtectTo.Count -eq 0) {
-            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message 'PfxProtectTo list is empty after normalization!'
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message 'PfxProtectTo list is empty after normalization!' -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
         }
 
         # end of validation. Now process the new certificate request
 
         if ($null -ne $CertificateDnsNames) {
-            Write-Log -Section 'Dispatcher.Request' -Message "Performing new certificate request for certificate $CertificateName using vault $VaultName, template $CertificateTemplateName, subject $CertificateSubject, DNS names $($CertificateDnsNames -join ', '), Hostname $Hostname, PfxProtectTo $($PfxProtectTo -join ', ')..."
+            Write-CertLCLog -Section 'Dispatcher.Creation' -Message "Performing new certificate request for certificate $CertificateName using vault $VaultName, template $CertificateTemplateName, subject $CertificateSubject, DNS names $($CertificateDnsNames -join ', '), Hostname $Hostname, PfxProtectTo $($PfxProtectTo -join ', ')..."
         }
         else {
-            Write-Log -Section 'Dispatcher.Request' -Message "Performing new certificate request for certificate $CertificateName using vault $VaultName, template $CertificateTemplateName, subject $CertificateSubject, Hostname $Hostname, PfxProtectTo $($PfxProtectTo -join ', ')..."
+            Write-CertLCLog -Section 'Dispatcher.Creation' -Message "Performing new certificate request for certificate $CertificateName using vault $VaultName, template $CertificateTemplateName, subject $CertificateSubject, Hostname $Hostname, PfxProtectTo $($PfxProtectTo -join ', ')..."
         }
 
         try {
-            New-CertificateCreationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplateName $CertificateTemplateName -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -Hostname $Hostname -PfxProtectTo $PfxProtectTo
+            New-CertificateCreationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplateName $CertificateTemplateName -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -Hostname $Hostname -PfxProtectTo $PfxProtectTo -NotifyTo $NotifyTo
         }
         catch {
-            Invoke-LogAndThrow -Section 'Dispatcher.Request' -Message 'Error processing new certificate request' -Inner $_.Exception
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message 'Error processing new certificate request' -Inner $_.Exception -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
         }
 
-        # confirm completion
-        Write-Log -Section 'Dispatcher' -Message "Certificate $CertificateName was successfully created."
+        # send notification email if requested
+        if ($NotifyTo) {
+            $subject = "Certificate $CertificateName created successfully"
+            $fragment = "A new certificate $CertificateName has been successfully created in the Key Vault $VaultName."
+            $body = $CertificateNotificationEmailBodyHtml -replace '__CONTENT__', $fragment
+            Send-NotificationEmail -SmtpServer $SmtpServer -FromAddress $fromAddress -To $NotifyTo -Subject $subject -Body $body -SmtpCredential $SmtpCredential
+        }
+
+        # confirm creation
+        Write-CertLCLog -Section 'Dispatcher.Creation' -Message "Certificate $CertificateName was successfully created."
     }
 
     'CertLC.CertificateRevocationRequest' {
+
+        #########################
+        # DISPATCHER.REVOCATION #
+        #########################
 
         # get required parameters
         $VaultName = $requestBody.data.VaultName
@@ -1134,12 +1358,12 @@ switch ($requestBody.type) {
 
         # VaultName: presence and non-empty check
         if ([string]::IsNullOrEmpty($VaultName)) {
-            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Missing or empty mandatory string parameter: 'data.VaultName' in request body!"
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "Missing or empty mandatory string parameter: 'data.VaultName' in request body!"
         }
 
         # CertificateName: presence and non-empty check
         if ([string]::IsNullOrEmpty($CertificateName)) {
-            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Missing or empty mandatory string parameter: 'data.ObjectName' in request body!"
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "Missing or empty mandatory string parameter: 'data.ObjectName' in request body!"
         }
 
         # RevocationReason: presence and integer check
@@ -1149,10 +1373,10 @@ switch ($requestBody.type) {
             try {
                 $RevocationReason = [Int64]::Parse($RevocationReasonString)
             }
-            catch { Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Invalid integer value for 'data.RevocationReason' in request body!" -Inner $_.Exception }
+            catch { Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "Invalid integer value for 'data.RevocationReason' in request body!" -Inner $_.Exception }
         }
         else {
-            Invoke-LogAndThrow -Section 'Dispatcher.Validation' -Message "Missing or empty mandatory string parameter: 'data.RevocationReason' in request body!"
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "Missing or empty mandatory string parameter: 'data.RevocationReason' in request body!"
         }
 
         # RevocationReason: see https://learn.microsoft.com/en-us/windows/win32/api/certadm/nf-certadm-icertadmin-revokecertificate
@@ -1164,23 +1388,55 @@ switch ($requestBody.type) {
         # 5 = CRL_REASON_CESSATION_OF_OPERATION,
         # 6 = CRL_REASON_CERTIFICATE_HOLD
 
-        if ($RevocationReason -notin 0, 1, 2, 3, 4, 5, 6) { Invoke-LogAndThrow -Section 'Dispatcher' -Message "Revocation request validation: Invalid integer value for 'data.RevocationReason'. Supported: 0-6." }
+        if ($RevocationReason -notin 0, 1, 2, 3, 4, 5, 6) { Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "Revocation request validation: Invalid integer value for 'data.RevocationReason'. Supported: 0-6." }
+
+        # before processing the request, we need to obtain the other certificate details
+        Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Getting additional certificate details for $CertificateName from key vault $VaultName..."
+        $cert = $null
+        try {
+            $cert = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName
+        }
+        catch {
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "Error getting certificate details for $CertificateName from vault $VaultName" -Inner $_.Exception
+        }
+        if ($null -eq $cert) {
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "Error getting certificate details for $CertificateName from vault $($VaultName): empty response! Certificate may not exist in the vault."
+        }
+
+        # get NotifyTo from the certificate tags (optional)
+        $rawNotifyTo = $cert.Tags['NotifyTo']
+        if ([string]::IsNullOrWhiteSpace($rawNotifyTo)) {
+            $notifyTo = $null
+            Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "No NotifyTo addresses found for certificate $CertificateName in vault $VaultName."
+        }
+        else {
+            Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "NotifyTo addresses found for certificate $CertificateName in vault ${VaultName}: $rawNotifyTo"
+            $notifyTo = $rawNotifyTo.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+        }
 
         # end of validation. Now process the certificate revocation request
 
-        Write-Log -Section 'Dispatcher.Request' -Message "Performing certificate revocation request for certificate $CertificateName using vault $VaultName with reason $RevocationReason..."
+        Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Performing certificate revocation request for certificate $CertificateName using vault $VaultName with reason $RevocationReason..."
         try {
             New-CertificateRevocationRequest -VaultName $VaultName -CertificateName $CertificateName -RevocationReason $RevocationReason
         }
         catch {
-            Invoke-LogAndThrow -Section 'Dispatcher.Request' -Message 'Error processing certificate revocation request' -Inner $_.Exception
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message 'Error processing certificate revocation request' -Inner $_.Exception -NotifyTo $NotifyTo
         }
 
-        # confirm completion
-        Write-Log -Section 'Dispatcher' -Message "Certificate $CertificateName was successfully revoked."
+        # send notification email if requested
+        if ($NotifyTo) {
+            $subject = "Certificate $CertificateName revoked successfully"
+            $fragment = "The certificate $CertificateName has been successfully revoked in CA and deleted from the Key Vault $VaultName."
+            $body = $CertificateNotificationEmailBodyHtml -replace '__CONTENT__', $fragment
+            Send-NotificationEmail -SmtpServer $SmtpServer -FromAddress $fromAddress -To $NotifyTo -Subject $subject -Body $body -smtpCredential $SmtpCredential
+        }
+
+        # confirm revocation
+        Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Certificate $CertificateName was successfully revoked."
     }
 
     default {
-        Invoke-LogAndThrow -Section 'Dispatcher' -Message "Unknown request type: $($requestBody.type). Supported values: Microsoft.KeyVault.CertificateNearExpiry, CertLC.NewCertificateRequest, CertLC.CertificateRevocationRequest."
+        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "Unknown request type: $($requestBody.type). Supported values: Microsoft.KeyVault.CertificateNearExpiry, CertLC.NewCertificateRequest, CertLC.CertificateRevocationRequest."
     }
 }
