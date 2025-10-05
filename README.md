@@ -2,28 +2,28 @@
 
 CertLC is a solution designed to fully automate X.509 certificate lifecycle operations on Azure-connected environments, integrating a Key Vault with a traditional Active Directory Enterprise CA.
 
-* **Generate & Renew Certificates**
-  * Creates **new certificates** on demand.
-  * **Renews** existing certificates before expiry.
-  * All certificates are signed by the Enterprise CA and stored in Key Vault
-  * Certificates are made available inside a secured per-user/per-group folder as protected PFXs (user or group protection - no passwords used) for operator to pick up and install.
-
-* **Azure Key Vault Integration**  
+* **Creation**
+  * Creates new certificates on demand.
   * All private keys are generated and stored inside the target Key Vault.  
+  * All certificates are signed by the Enterprise CA and safely stored in Key Vault
+  * The resulting certificates are also made available inside a secured per-user/per-group folder as protected PFXs (user or group protection - no passwords used) for operator to pick up and install.
+
+* **Renewal**
   * The key vault emits `Microsoft.KeyVault.CertificateNearExpiry` events for certificates near expiration. The event is used to trigger the automatic renewal process.
-
-* **Event Grid** and **Function App**
-
   * An Event Grid System Topic is used to send `Microsoft.KeyVault.CertificateNearExpiry` events to a storage queue
-  * a Function App with queue bindings is used to get the events and forward them to Automation Account, triggering the execution of the new/renewal runbook
+  * a Function App with queue bindings is used to get the events and forward them to Automation Account, triggering the execution of the renewal with the **certlc** runbook
+  * A new certificate version is stored in Key Vault and exported as new PFX
 
-* **Hybrid Worker Execution**  
-  * An Automation Account handles the execution of a runbook on an **Azure Automation Hybrid Worker** 
-  * The runbook manages all the requests to the Enterprise CA and the Key Vault
+* **Revocation**
+  * Revokes the certificate in the CA and deletes it from the key vault
+
+* **Runbook and Hybrid Worker Execution**  
+  * The **certlc** runbook manages all the requests to the Enterprise CA and the Key Vault
+  * The execution is performed by an **Azure Automation Hybrid Worker** able to orchestrate operations towards the CA and the KeyVault
 
 * **Security**  
   * All PaaS resources can have their public endpoint disabled - Private Endpoints are used for all communications 
-  * No service accounts are used: all permissions are assigned to computer accounts and to the system-assigned managed identities of the PaaS resources 
+  * No AD service accounts are used: all permissions are assigned to computer accounts and to the system-assigned managed identities of the PaaS resources 
 
 ## Repository Structure
 

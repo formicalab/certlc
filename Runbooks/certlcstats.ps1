@@ -6,35 +6,28 @@ using module Az.KeyVault
 # CERTLCSTATS  #
 ################
 
-# CERTLCSTATS is a PowerShell runbook that populates certificate statistics from an Azure Key Vault into a Log Analytics workspace.
-# It is part of the CertLC (Certificate Lifecycle) solution
+<#
 
-# The script is designed to be run using PowerShell 7.x
-# Initially based on certlc solution https://learn.microsoft.com/en-us/azure/architecture/example-scenario/certificate-lifecycle/
+CERTLCSTATS is a PowerShell runbook that populates certificate statistics from an Azure Key Vault into a Log Analytics workspace.
+It is part of the CertLC (Certificate Lifecycle) solution
+
+The script is designed to be run using PowerShell 7.x
+Initially based on certlc solution https://learn.microsoft.com/en-us/azure/architecture/example-scenario/certificate-lifecycle/
+
+#>
 
 param(
-    [Parameter(Mandatory = $true)]
-    [ValidateNotNullOrEmpty()]
-    [string] $keyVaultName,
-        
-    [Parameter(Mandatory = $true)]
-    [ValidateNotNullOrEmpty()]
-    [string] $streamName,
-        
-    [Parameter(Mandatory = $true)]
-    [ValidateNotNullOrEmpty()]
-    [string] $immutableId,  # Data Collection Rule immutable ID (GUID)
-
-    [Parameter(Mandatory = $true)]
-    [ValidateNotNullOrEmpty()]
-    [string] $ingestionUrl,
-
     [Parameter(Mandatory = $false)]
     [object] $WebhookData
 )
 
-# Prohibits references to uninitialized variables (Latest enforces more checks than 1.0)
-Set-StrictMode -Version Latest
+<# Strict mode settings 3.0:
+Prohibits references to uninitialized variables. This includes uninitialized variables in strings.
+Prohibits references to non-existent properties of an object.
+Prohibits function calls that use the syntax for calling methods.
+Prohibit out of bounds or unresolvable array indexes.
+#>
+Set-StrictMode -Version 3.0
 
 # Ensure the script stops on errors so that try/catch can be used to handle them
 $ErrorActionPreference = 'Stop'
@@ -43,16 +36,14 @@ $ErrorActionPreference = 'Stop'
 # GLOBAL VARIABLES #
 ####################
 
-$statusThresholdDays = 30   # days before expiration to mark as 'Expiring Soon'
 
 ########
 # MAIN #
 ########
 
-# Connect to Azure. Ensures we do not inherit an AzContext, since we are using a system-assigned identity for login
+# Connect to Azure using the Automation Account's identity.
+# Ensures we do not inherit an AzContext, since we are using a system-assigned identity for login
 $null = Disable-AzContextAutosave -Scope Process
-
-# Connect using a Managed Service Identity
 Write-Output 'Connecting to Azure using default identity...'
 try {
     $AzureConnection = (Connect-AzAccount -Identity).Context
@@ -79,19 +70,44 @@ elseif ($env:AZUREPS_HOST_ENVIRONMENT -eq 'AzureAutomation') {
     throw
 }
 
+# Get the runbook variables from the Automation Account
+# Since they are encrypted, we must use the internal cmdlet Get-AutomationVariable to retrieve them, not Get-AzAutomationVariable
+
+$KeyVaultName = $null
+$StreamName = $null
+$ImmutableId = $null
+$IngestionUrl = $null
+
+Write-Output 'Retrieving runbook variables...'
+
+try {
+    $KeyVaultName = Get-AutomationVariable -Name 'certlc-stats-keyvault'   # Name of the Key Vault to monitor
+    $StreamName = Get-AutomationVariable -Name 'certlc-stats-streamname'   # Name of the stream in the DCR
+    $ImmutableId = Get-AutomationVariable -Name 'certlc-stats-immutableid' # Immutable ID of the Data Collection Rule
+    $IngestionUrl = Get-AutomationVariable -Name 'certlc-stats-ingestionurl' # Ingestion endpoint URL of the Log Analytics workspace
+}
+catch {
+    Write-Output "Error retrieving runbook variables, ensure that the following variables are set: certlc-stats-keyvault, certlc-stats-streamname, certlc-stats-immutableid, certlc-stats-ingestionurl"
+    throw
+}
+
+if (-not $KeyVaultName -or -not $StreamName -or -not $ImmutableId -or -not $IngestionUrl) {
+    Write-Output 'One or more required runbook variables are empty, please check the runbook variable settings.'
+    throw
+}
+
 # Fetch all certificates from the Key Vault
-Write-Output "Fetching certificates from Key Vault $keyVaultName..."
+Write-Output "Fetching certificates from Key Vault $KeyVaultName..."
 # Wrap in array literal so a single returned object is still treated as a collection (avoids null Count edge case)
-$certificates = @(Get-AzKeyVaultCertificate -VaultName $keyVaultName)
+$certificates = @(Get-AzKeyVaultCertificate -VaultName $KeyVaultName)
 $certCount = $certificates.Count
 if (-not $certificates -or $certCount -eq 0) {
-    Write-Output "No certificates found in Key Vault $keyVaultName. Exiting."
+    Write-Output "No certificates found in Key Vault $KeyVaultName. Exiting."
     return
 }
 Write-Output "Found $certCount certificate(s)."
 
 # Prepare output
-$utcNow = [DateTime]::UtcNow
 $results = foreach ($certMeta in $certificates) {
 
     # Fetch full details (required for X.509 Subject / Extensions)
