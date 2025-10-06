@@ -11,17 +11,17 @@
   vault name, certificate template, subject, DNS names, and the user or group to protect the PFX file to.
 
 .EXAMPLE
-  .\testnewcert.ps1 -UseQueue -StorageAccountName "storageaccountname" -QueueName "queuename" -CertName "mycert" -VaultName "keyvaultname" -CertificateTemplate "WebServer" -PfxProtectTo "domain\user"
+  .\testnewcert.ps1 -UseQueue -StorageAccountName "storageaccountname" -QueueName "queuename" -CertName "mycert" -VaultName "keyvaultname" -CertificateTemplate "WebServer" -PfxProtectTo @('domain\user') -Hostname "myhost"
 
   Send a new certificate request to Azure Storage Queue
 
 .EXAMPLE
-  .\testnewcert.ps1 -UseWebhook -AutomationWebhookUrl "https://70cf67fa-9b4f-4a13-....webhook.ne.azure-automation.net/webhooks?token=pr3..." -CertName "mycert" -VaultName "keyvaultname" -CertificateTemplate "WebServer" -PfxProtectTo "domain\user"
+  .\testnewcert.ps1 -UseWebhook -AutomationWebhookUrl "https://70cf67fa-9b4f-4a13-....webhook.ne.azure-automation.net/webhooks?token=pr3..." -CertName "mycert" -VaultName "keyvaultname" -CertificateTemplate "WebServer" -PfxProtectTo @('domain\user') -Hostname "myhost"
 
   Invoke Azure Automation Runbook via webhook
 
 .EXAMPLE
-  .\testnewcert.ps1  -UseDirectRunbookInvocation -AutomationAccountName "aa-shared-neu-001" -AutomationAccountRGName "rg-shared-neu-001" -HybridWorkerGroupName "workergroup001" -RunbookName "certlc" -CertName "mycert" -VaultName "keyvaultname" -CertificateTemplate "WebServer" -PfxProtectTo "domain\user"
+  .\testnewcert.ps1  -UseDirectRunbookInvocation -AutomationAccountName "aa-shared-neu-001" -AutomationAccountRGName "rg-shared-neu-001" -HybridWorkerGroupName "workergroup001" -RunbookName "certlc" -CertName "mycert" -VaultName "keyvaultname" -CertificateTemplate "WebServer" -PfxProtectTo @('domain\user')
   
   Directly start the runbook on a hybrid worker group
 
@@ -71,12 +71,32 @@ param (
   [Parameter(Mandatory = $true, ParameterSetName = 'Queue')]
   [Parameter(Mandatory = $true, ParameterSetName = 'Webhook')]
   [Parameter(Mandatory = $true, ParameterSetName = 'Direct')]
+  [string] $Subject = 'CN=www.example.com',
+
+  [Parameter(Mandatory = $true, ParameterSetName = 'Queue')]
+  [Parameter(Mandatory = $true, ParameterSetName = 'Webhook')]
+  [Parameter(Mandatory = $true, ParameterSetName = 'Direct')]
+  [string[]] $CertificateDnsNames = @('www.example.com', 'api.example.com'),
+
+  [Parameter(Mandatory = $true, ParameterSetName = 'Queue')]
+  [Parameter(Mandatory = $true, ParameterSetName = 'Webhook')]
+  [Parameter(Mandatory = $true, ParameterSetName = 'Direct')]
   [string] $CertificateTemplate,
 
   [Parameter(Mandatory = $true, ParameterSetName = 'Queue')]
   [Parameter(Mandatory = $true, ParameterSetName = 'Webhook')]
   [Parameter(Mandatory = $true, ParameterSetName = 'Direct')]
-  [string] $PfxProtectTo
+  [string] $Hostname,
+
+  [Parameter(Mandatory = $true, ParameterSetName = 'Queue')]
+  [Parameter(Mandatory = $true, ParameterSetName = 'Webhook')]
+  [Parameter(Mandatory = $true, ParameterSetName = 'Direct')]
+  [string[]] $PfxProtectTo,
+
+  [Parameter(ParameterSetName = 'Queue')]
+  [Parameter(ParameterSetName = 'Webhook')]
+  [Parameter(ParameterSetName = 'Direct')]
+  [string[]] $NotifyTo
 )
 
 $ErrorActionPreference = 'Stop'
@@ -101,45 +121,47 @@ For new certificate requests, the body has a structure like this:
     "ObjectName": "<name of the new certificate>",
     "CertificateTemplate": "<certificate template name>",
     "CertificateSubject": "<certificate subject>",
-    "CertificateDnsNames": [ "<dns name 1>", "<dns name 2>" ],  # optional, can be empty
-    "PfxProtectTo": "<user or group to protect the PFX file>",  # optional, can be empty. If not specified, the PFX will not be downloaded
+    "CertificateDnsNames": [ "<dns name 1>", "<dns name 2>", ... ],  # optional, can be empty
+    "Hostname": "<hostname of the server where the certificate will be used>",  # it will be used also as folder name for exported PFX
+    "PfxProtectTo": [ "<user or group to protect the PFX file>", "other user/group", ...],  # these principals will be also granted Read+Execute on PFX folder
+    "NotifyTo": [ "<email address to notify>", "other email address", ... ],  # optional, email addresses to notify when the certificate is created
   }
 }
 
 #>
 
-$json = @"
-{
-  "id": "$(New-Guid)",
-  "source": "testnewcert.ps1",
-  "specversion": "1.0",
-  "type": "CertLC.NewCertificateRequest",
-  "subject": "$certName",
-  "time": "$(Get-Date -Format 'yyyy-MM-ddTHH:mm:ss.fffffffZ' -AsUTC)",
-  "data": {
-    "Id": "Ticket01",
-    "VaultName": "$vaultName",
-    "ObjectType": "Certificate",
-    "ObjectName": "$certName",
-    "CertificateTemplate": "$certificateTemplate",
-    "CertificateSubject": "CN=www.example.com",
-    "CertificateDnsNames": [
-      "www.example.com",
-      "api.example.com"
-    ],
-    "PfxProtectTo": "$PfxProtectTo"
+$data = [ordered]@{
+  id          = (New-Guid)
+  source      = 'testnewcert.ps1'
+  specversion = '1.0'
+  type        = 'CertLC.NewCertificateRequest'
+  subject     = $CertName
+  time        = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ss.fffffffZ' -AsUTC)
+  data        = [ordered]@{
+    Id                  = 'Ticket01'
+    VaultName           = $VaultName
+    ObjectType          = 'Certificate'
+    ObjectName          = $CertName
+    CertificateTemplate = $CertificateTemplate
+    CertificateSubject  = $Subject
+    CertificateDnsNames = $CertificateDnsNames
+    Hostname            = $Hostname
+    PfxProtectTo        = $PfxProtectTo
+    NotifyTo            = $NotifyTo
   }
 }
-"@
 
-# convert to object and convert back to JSON with -Compress in order to remove any formatting issues
-$jsonObject = $json | ConvertFrom-Json -Depth 10
-$json = $jsonObject | ConvertTo-Json -Depth 10 -Compress
+$json = $data | ConvertTo-Json -Depth 6 -Compress
 
 # execution logic based on the parameter set
 switch ($PSCmdlet.ParameterSetName) {
+
   'Queue' {
- 
+
+    #########
+    # QUEUE #
+    #########
+
     Write-Host "Using queue '$QueueName'" 
 
     # Create a storage context
@@ -167,6 +189,10 @@ switch ($PSCmdlet.ParameterSetName) {
 
   'Webhook' {
 
+    ###########
+    # WEBHOOK #
+    ###########
+
     Write-Host 'Using Webhook invocation'
 
     try {
@@ -184,6 +210,10 @@ switch ($PSCmdlet.ParameterSetName) {
 
   }
   'Direct' {
+
+    #############################
+    # DIRECT RUNBOOK INVOCATION #
+    #############################
 
     Write-Host 'Using direct runbook invocation'
 

@@ -1,0 +1,526 @@
+{
+  "version": "Notebook/1.0",
+  "items": [
+    {
+      "type": 9,
+      "content": {
+        "version": "KqlParameterItem/1.0",
+        "parameters": [
+          {
+            "id": "222f9a3c-4c8c-4fd4-b2c1-d1a76012c456",
+            "version": "KqlParameterItem/1.0",
+            "name": "LogAnalyticsWorkspace",
+            "label": "Log Analytics Workspace",
+            "type": 5,
+            "isRequired": true,
+            "query": "where type =~ 'microsoft.operationalinsights/workspaces'\r\n| project id, name\r\n| order by name desc",
+            "crossComponentResources": [
+              "value::all"
+            ],
+            "typeSettings": {
+              "additionalResourceOptions": []
+            },
+            "queryType": 1,
+            "resourceType": "microsoft.resourcegraph/resources",
+            "value": "/subscriptions/4a570962-701a-475e-bf5b-8dc76ec748ff/resourceGroups/rg-sentinel-itn-001/providers/Microsoft.OperationalInsights/workspaces/log-sentinel-itn-001"
+          },
+          {
+            "id": "c4ac2502-0074-4ee6-ac9c-58d49516cfff",
+            "version": "KqlParameterItem/1.0",
+            "name": "AutomationAccount",
+            "label": "Automation Account",
+            "type": 5,
+            "isRequired": true,
+            "query": "where type =~ 'Microsoft.Automation/AutomationAccounts'\r\n| project id, name\r\n| order by name desc",
+            "crossComponentResources": [
+              "value::all"
+            ],
+            "typeSettings": {
+              "additionalResourceOptions": [],
+              "showDefault": false
+            },
+            "timeContext": {
+              "durationMs": 86400000
+            },
+            "queryType": 1,
+            "resourceType": "microsoft.resourcegraph/resources",
+            "value": "/subscriptions/4a570962-701a-475e-bf5b-8dc76ec748ff/resourceGroups/rg-shared-neu-001/providers/Microsoft.Automation/automationAccounts/aa-shared-neu-001"
+          },
+          {
+            "id": "e75fbcd5-8b96-4b46-a2b1-87d92b2036ec",
+            "version": "KqlParameterItem/1.0",
+            "name": "Runbook",
+            "type": 5,
+            "isRequired": true,
+            "query": "where type =~ 'microsoft.automation/automationaccounts/runbooks'\r\n| where id startswith \"{AutomationAccount}\"\r\n| project id, name\r\n| order by name desc",
+            "crossComponentResources": [
+              "value::all"
+            ],
+            "typeSettings": {
+              "additionalResourceOptions": [],
+              "showDefault": false
+            },
+            "queryType": 1,
+            "resourceType": "microsoft.resourcegraph/resources",
+            "value": "/subscriptions/4a570962-701a-475e-bf5b-8dc76ec748ff/resourceGroups/rg-shared-neu-001/providers/Microsoft.Automation/automationAccounts/aa-shared-neu-001/runbooks/certlc"
+          },
+          {
+            "id": "a46ac1ec-5965-4af4-8750-49ace0d90f8d",
+            "version": "KqlParameterItem/1.0",
+            "name": "TimeRange",
+            "label": "Time Range",
+            "type": 4,
+            "isRequired": true,
+            "typeSettings": {
+              "selectableValues": [
+                {
+                  "durationMs": 300000
+                },
+                {
+                  "durationMs": 900000
+                },
+                {
+                  "durationMs": 1800000
+                },
+                {
+                  "durationMs": 3600000
+                },
+                {
+                  "durationMs": 14400000
+                },
+                {
+                  "durationMs": 43200000
+                },
+                {
+                  "durationMs": 86400000
+                },
+                {
+                  "durationMs": 172800000
+                },
+                {
+                  "durationMs": 259200000
+                },
+                {
+                  "durationMs": 604800000
+                },
+                {
+                  "durationMs": 1209600000
+                },
+                {
+                  "durationMs": 2419200000
+                },
+                {
+                  "durationMs": 2592000000
+                },
+                {
+                  "durationMs": 5184000000
+                },
+                {
+                  "durationMs": 7776000000
+                }
+              ]
+            },
+            "value": {
+              "durationMs": 86400000
+            }
+          }
+        ],
+        "style": "pills",
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces"
+      },
+      "name": "parameters - 0"
+    },
+    {
+      "type": 11,
+      "content": {
+        "version": "LinkItem/1.0",
+        "style": "tabs",
+        "tabStyle": "bigger",
+        "links": [
+          {
+            "id": "a2790d48-23fe-40b0-b680-ad7f54faa6c0",
+            "cellValue": "selectedTab",
+            "linkTarget": "parameter",
+            "linkLabel": "Statistics",
+            "subTarget": "1",
+            "preText": "Tab 1",
+            "style": "link"
+          },
+          {
+            "id": "9c94a5f2-b4c1-45fc-a223-0c6e42398b17",
+            "cellValue": "selectedTab",
+            "linkTarget": "parameter",
+            "linkLabel": "Job logs",
+            "subTarget": "2",
+            "preText": "Tab 2",
+            "style": "link"
+          }
+        ]
+      },
+      "name": "tabs"
+    },
+    {
+      "type": 12,
+      "content": {
+        "version": "NotebookGroup/1.0",
+        "groupType": "editable",
+        "items": [
+          {
+            "type": 1,
+            "content": {
+              "json": "### Use the **Search** field below to look for specific certificates.",
+              "style": "info"
+            },
+            "name": "text - 4",
+            "styleSettings": {
+              "showBorder": true
+            }
+          },
+          {
+            "type": 9,
+            "content": {
+              "version": "KqlParameterItem/1.0",
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ],
+              "parameters": [
+                {
+                  "id": "a8e56313-5818-42bc-a09d-d0ceaa1bf690",
+                  "version": "KqlParameterItem/1.0",
+                  "name": "LastUpdateFormatted",
+                  "type": 1,
+                  "query": "certlc_CL\r\n| summarize LastUpdate = max(TimeGenerated)\r\n| extend LastUpdateLocal = LastUpdate + 2h\r\n| project LastUpdateFormatted = format_datetime(LastUpdateLocal, 'yyyy-MM-dd HH:mm:ss')",
+                  "crossComponentResources": [
+                    "{LogAnalyticsWorkspace}"
+                  ],
+                  "isHiddenWhenLocked": true,
+                  "timeContext": {
+                    "durationMs": 0
+                  },
+                  "timeContextFromParameter": "TimeRange",
+                  "queryType": 0,
+                  "resourceType": "microsoft.operationalinsights/workspaces"
+                }
+              ],
+              "style": "formHorizontal",
+              "queryType": 0,
+              "resourceType": "microsoft.operationalinsights/workspaces"
+            },
+            "name": "parameters - 4"
+          },
+          {
+            "type": 3,
+            "content": {
+              "version": "KqlItem/1.0",
+              "query": "let latestCerts = certlc_CL\r\n| summarize arg_max(LastUpdate = TimeGenerated, Name, Subject, Template, Created, Expires) by Name\r\n| extend RawTimeToExpire = Expires - now()  // timespan\r\n| extend Status = case(\r\n    RawTimeToExpire < 0d, \"❌ Expired\",\r\n    RawTimeToExpire < 30d, \"⚠️ Expiring Soon\",\r\n    \"✅ OK\");\r\nlet totalCount = toscalar(latestCerts | summarize count());\r\nlatestCerts\r\n| summarize Count = count() by Status\r\n| extend Total = totalCount\r\n| extend Percentage = round(100.0 * Count / Total, 2)\r\n| project Status, Count, Percentage\r\n| order by Status asc",
+              "size": 3,
+              "title": "Status of certificates in the key vault - Last refreshed: {LastUpdateFormatted}",
+              "noDataMessageStyle": 4,
+              "timeContextFromParameter": "TimeRange",
+              "showRefreshButton": true,
+              "queryType": 0,
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ],
+              "visualization": "piechart",
+              "tileSettings": {
+                "showBorder": false,
+                "titleContent": {
+                  "columnMatch": "Status",
+                  "formatter": 1
+                },
+                "leftContent": {
+                  "columnMatch": "Count",
+                  "formatter": 12,
+                  "formatOptions": {
+                    "palette": "auto"
+                  },
+                  "numberFormat": {
+                    "unit": 17,
+                    "options": {
+                      "maximumSignificantDigits": 3,
+                      "maximumFractionDigits": 2
+                    }
+                  }
+                }
+              },
+              "graphSettings": {
+                "type": 0,
+                "topContent": {
+                  "columnMatch": "Status",
+                  "formatter": 1
+                },
+                "centerContent": {
+                  "columnMatch": "Count",
+                  "formatter": 1,
+                  "numberFormat": {
+                    "unit": 17,
+                    "options": {
+                      "maximumSignificantDigits": 3,
+                      "maximumFractionDigits": 2
+                    }
+                  }
+                }
+              },
+              "chartSettings": {
+                "seriesLabelSettings": [
+                  {
+                    "seriesName": "❌ Expired",
+                    "color": "redBright"
+                  },
+                  {
+                    "seriesName": "⚠️ Expiring Soon",
+                    "color": "yellow"
+                  },
+                  {
+                    "seriesName": "✅ OK",
+                    "color": "green"
+                  }
+                ]
+              }
+            },
+            "customWidth": "50",
+            "name": "query - 4",
+            "styleSettings": {
+              "maxWidth": "50%"
+            }
+          },
+          {
+            "type": 3,
+            "content": {
+              "version": "KqlItem/1.0",
+              "query": "AzureDiagnostics\r\n| where Category == \"JobLogs\"\r\n| where Resource =~ \"{AutomationAccount:name}\"\r\n| where RunbookName_s =~ tostring(split(\"{Runbook:name}\", \"/\")[-1])\r\n| summarize arg_max(TimeGenerated, ResultType) by JobId_g\r\n| summarize JobCount = count() by ResultType",
+              "size": 3,
+              "title": "Jobs executed between {TimeRange:start} and {TimeRange:end}",
+              "noDataMessageStyle": 4,
+              "timeContextFromParameter": "TimeRange",
+              "showRefreshButton": true,
+              "queryType": 0,
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ],
+              "visualization": "piechart",
+              "chartSettings": {
+                "seriesLabelSettings": [
+                  {
+                    "seriesName": "Completed",
+                    "color": "green"
+                  },
+                  {
+                    "seriesName": "Failed",
+                    "color": "redBright"
+                  },
+                  {
+                    "seriesName": "Suspended",
+                    "color": "orange"
+                  },
+                  {
+                    "seriesName": "Created",
+                    "color": "amethyst"
+                  }
+                ]
+              }
+            },
+            "customWidth": "50",
+            "name": "query - 4"
+          },
+          {
+            "type": 3,
+            "content": {
+              "version": "KqlItem/1.0",
+              "query": "certlc_CL\r\n| summarize arg_max(LastUpdate = TimeGenerated, Name, Subject, Template, Created, Expires) by Name\r\n| extend RawTimeToExpire = Expires - now()  // timespan\r\n| extend TimeToExpire = format_timespan(RawTimeToExpire, 'd.hh:mm:ss')  // e.g., \"3.12:45:00\"\r\n| extend Status = case(\r\n    RawTimeToExpire < 0d, \"❌ Expired\",\r\n    RawTimeToExpire < 30d, \"⚠️ Expiring Soon\",\r\n    \"✅ OK\"\r\n)\r\n| order by RawTimeToExpire\r\n| project Status, LastUpdate, Name, Subject, Template, Created, Expires, TimeToExpire",
+              "size": 3,
+              "title": "Details - last refreshed: {LastUpdateFormatted}",
+              "noDataMessageStyle": 4,
+              "timeContextFromParameter": "TimeRange",
+              "showRefreshButton": true,
+              "showExportToExcel": true,
+              "queryType": 0,
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ],
+              "visualization": "table",
+              "showExpandCollapseGrid": true,
+              "gridSettings": {
+                "formatters": [
+                  {
+                    "columnMatch": "LastUpdate",
+                    "formatter": 6,
+                    "formatOptions": {
+                      "customColumnWidthSetting": "20ch"
+                    },
+                    "dateFormat": {
+                      "showUtcTime": null,
+                      "formatName": "shortDateTimeNoMsPattern"
+                    }
+                  },
+                  {
+                    "columnMatch": "Name",
+                    "formatter": 5
+                  },
+                  {
+                    "columnMatch": "Created",
+                    "formatter": 6,
+                    "formatOptions": {
+                      "customColumnWidthSetting": "20ch"
+                    },
+                    "dateFormat": {
+                      "showUtcTime": null,
+                      "formatName": "shortDateTimeNoMsPattern"
+                    }
+                  },
+                  {
+                    "columnMatch": "Expires",
+                    "formatter": 6,
+                    "formatOptions": {
+                      "customColumnWidthSetting": "20ch"
+                    },
+                    "dateFormat": {
+                      "showUtcTime": null,
+                      "formatName": "shortDateTimeNoMsPattern"
+                    }
+                  }
+                ],
+                "rowLimit": 5000,
+                "filter": true,
+                "hierarchySettings": {
+                  "treeType": 1,
+                  "groupBy": [
+                    "Status"
+                  ],
+                  "expandTopLevel": true,
+                  "finalBy": "Name"
+                }
+              }
+            },
+            "name": "query - 1"
+          }
+        ]
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "1"
+      },
+      "name": "grpStats"
+    },
+    {
+      "type": 12,
+      "content": {
+        "version": "NotebookGroup/1.0",
+        "groupType": "editable",
+        "items": [
+          {
+            "type": 1,
+            "content": {
+              "json": "### Use the **Search** field below to look for specific jobs, messages, certificate names, etc.",
+              "style": "info"
+            },
+            "name": "text - 2",
+            "styleSettings": {
+              "showBorder": true
+            }
+          },
+          {
+            "type": 3,
+            "content": {
+              "version": "KqlItem/1.0",
+              "query": "// -------------------------------\n// Step 1: Get all output events for the job (children)\n// -------------------------------\nlet JobStreamOutputs = AzureDiagnostics\n| where Category == \"JobStreams\"\n| where Resource =~ \"{AutomationAccount:name}\"\n| where RunbookName_s =~ tostring(split(\"{Runbook:name}\", \"/\")[-1])\n| where StreamType_s == \"Output\"\n| extend JobIdStr = tostring(JobId_g)\n| extend ParsedMessage = parse_json(ResultDescription)\n| extend ChildMessage = tostring(ParsedMessage.message),\n         ChildSection = tostring(ParsedMessage.section)\n| project \n    JobIdStr,\n    Time = TimeGenerated,\n    ChildMessage,\n    ChildSection,\n    Id = strcat(JobIdStr, \"-\", format_datetime(TimeGenerated, 'yyyyMMddHHmmssfff')),\n    ParentId = JobIdStr,\n    Name = strcat(\"📝 Output at \", format_datetime(TimeGenerated, 'HH:mm:ss')),\n    Kind = \"Output\",\n    FinalResult = \"📝\";\n\n// -------------------------------\n// Step 1b: Compute last output per job (for parent)\n// -------------------------------\nlet LastOutputPerJob = JobStreamOutputs\n| summarize arg_max(Time, ChildMessage, ChildSection) by JobIdStr\n| project \n    JobIdStr,\n    LastTime = Time,\n    LastChildMessage = ChildMessage,\n    LastChildSection = ChildSection;\n\n// -------------------------------\n// Step 2: Summarize final job status per JobId (parents)\n// -------------------------------\nlet JobLogSummary = AzureDiagnostics\n| where Category == \"JobLogs\"\n| where Resource =~ \"{AutomationAccount:name}\"\n| where RunbookName_s =~ tostring(split(\"{Runbook:name}\", \"/\")[-1])\n| summarize arg_max(TimeGenerated, ResultType) by JobId_g\n| extend JobIdStr = tostring(JobId_g)\n| join kind=leftouter LastOutputPerJob on JobIdStr\n| project \n    Id = JobIdStr,\n    ParentId = \"\",\n    Name = strcat(\"📦 Job \", JobIdStr),\n    Kind = \"Job\",\n    FinalResult = case(\n        tolower(ResultType) == \"completed\", \"success\",\n        tolower(ResultType) == \"failed\", \"failed\",\n        ResultType\n    ),\n    Time = LastTime,                 // last child output time\n    Message = LastChildMessage,      // bubble up last message\n    Section = LastChildSection;      // bubble up last section\n\n// -------------------------------\n// Step 3: Union parents + children and sort\n// -------------------------------\nunion \n(\n    JobLogSummary\n    | project Id, ParentId, Name, Kind, FinalResult, Time, Section, Message\n),\n(\n    JobStreamOutputs\n    | project Id, ParentId, Name, Kind, FinalResult, Time, Section = ChildSection, Message = ChildMessage\n)\n| order by Time desc, ParentId asc, Time asc\n",
+              "size": 3,
+              "showAnalytics": true,
+              "title": "Job History",
+              "noDataMessageStyle": 4,
+              "timeContextFromParameter": "TimeRange",
+              "showRefreshButton": true,
+              "showExportToExcel": true,
+              "queryType": 0,
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ],
+              "visualization": "table",
+              "showExpandCollapseGrid": true,
+              "gridSettings": {
+                "formatters": [
+                  {
+                    "columnMatch": "Id",
+                    "formatter": 5
+                  },
+                  {
+                    "columnMatch": "ParentId",
+                    "formatter": 5
+                  },
+                  {
+                    "columnMatch": "FinalResult",
+                    "formatter": 11
+                  },
+                  {
+                    "columnMatch": "Time",
+                    "formatter": 6,
+                    "formatOptions": {
+                      "customColumnWidthSetting": "20ch"
+                    },
+                    "dateFormat": {
+                      "showUtcTime": null,
+                      "formatName": "shortDateTimeNoMsPattern"
+                    }
+                  },
+                  {
+                    "columnMatch": "Message_datetime",
+                    "formatter": 5
+                  },
+                  {
+                    "columnMatch": "Section_datetime",
+                    "formatter": 5
+                  },
+                  {
+                    "columnMatch": "OutputTime",
+                    "formatter": 6,
+                    "dateFormat": {
+                      "showUtcTime": null,
+                      "formatName": "shortDateTimeNoMsPattern"
+                    }
+                  },
+                  {
+                    "columnMatch": "FinalTime",
+                    "formatter": 6,
+                    "formatOptions": {
+                      "aggregation": "Max"
+                    },
+                    "dateFormat": {
+                      "showUtcTime": null,
+                      "formatName": "shortDateTimeNoMsPattern"
+                    }
+                  }
+                ],
+                "rowLimit": 5000,
+                "filter": true,
+                "hierarchySettings": {
+                  "idColumn": "Id",
+                  "parentColumn": "ParentId",
+                  "treeType": 0,
+                  "expanderColumn": "FinalResult"
+                }
+              }
+            },
+            "name": "Jobs"
+          }
+        ]
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "2"
+      },
+      "name": "grpLogs"
+    }
+  ],
+  "fallbackResourceIds": [
+    "Azure Monitor"
+  ],
+  "$schema": "https://github.com/Microsoft/Application-Insights-Workbooks/blob/master/schema/workbook.json"
+}

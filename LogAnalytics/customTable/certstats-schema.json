@@ -1,0 +1,29 @@
+[
+  {
+    "Thumbprint": "E004FED9AC372CD7388A48B6C4880BA80858EE2D",
+    "Name": "cert201",
+    "Created": "2025-10-01T19:35:27Z",
+    "Expires": "2025-10-01T20:25:27Z",
+    "Subject": "CN=www.example.com",
+    "Template": "FlabShortWebServer",
+    "DNSNames": "www.example.com, api.example.com"
+  },
+  {
+    "Thumbprint": "A188ADA85CC1965A598F2B83ECD32AE755ADD46D",
+    "Name": "cert202",
+    "Created": "2025-10-01T20:34:12Z",
+    "Expires": "2025-10-01T21:24:12Z",
+    "Subject": "CN=www.example.com",
+    "Template": "FlabShortWebServer",
+    "DNSNames": "www.example.com, api.example.com"
+  },
+  {
+    "Thumbprint": "A64DAA1C49D2D00EF4BBA23283112C8EAB1AD99C",
+    "Name": "cert203",
+    "Created": "2025-10-02T20:38:20Z",
+    "Expires": "2025-10-02T21:28:20Z",
+    "Subject": "CN=www.example.com",
+    "Template": "FlabShortWebServer",
+    "DNSNames": "www.example.com, api.example.com"
+  }
+]

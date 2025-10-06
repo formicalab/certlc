@@ -1,0 +1,3 @@
+source
+| extend Created = todatetime(Created), Expires = todatetime(Expires)
+| extend TimeGenerated = now()
