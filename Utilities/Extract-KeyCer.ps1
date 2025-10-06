@@ -1,20 +1,20 @@
 <#
 .SYNOPSIS
-  Extract certificate (.cer) and private key (.key) from a PFX file.
+  Extract certificate and private key from a PFX file and export as PEM files.
 
 .DESCRIPTION
   Loads a PFX and exports:
     - A PEM encoded certificate (.cer)
-    - A PKCS#8 private key (.key), optionally encrypted (ENCRYPTED PRIVATE KEY)
+    - A PKCS#8 private key (.key), optionally encrypted (ENCRYPTED PRIVATE KEY), encoded as PEM.
 
-  Supports RSA and ECDSA keys. Provides safety checks, optional overwrite control,
-  optional private key encryption
+  Supports RSA and ECDSA keys.
+  Supports password-protected PFX files or those protected against SIDs with DPAPI. 
 
 .PARAMETER PfxPath
   Path to the PFX file (must exist).
 
 .PARAMETER Password
-  (Optional) Password for the PFX (SecureString). If omitted assumes no password / DPAPI.
+  (Optional) Password for the PFX (SecureString). If omitted assumes no password or PFX protected against SIDs with DPAPI.
 
 .PARAMETER OutDirectory
   (Optional) Destination directory for outputs; defaults to the PFX directory.
@@ -63,34 +63,72 @@ param (
 )
 
 #Requires -PSEdition Core
-Set-StrictMode -Version 1
+Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
 
+#region Functions
+
+###############################
+# Convert-SecureStringToPlain #
+###############################
+
 function Convert-SecureStringToPlain {
-    param([Security.SecureString]$Secure)
-    if (-not $Secure) { return $null }
-    $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secure)
-    try { [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) }
-    finally { if ($ptr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) } }
+  <#
+    .SYNOPSIS
+      Convert a SecureString to a plain text string.
+
+    .DESCRIPTION
+      Uses Marshal.SecureStringToBSTR / PtrToStringBSTR to obtain the clear text then zeroes the unmanaged buffer.
+      NOTE: The returned managed string cannot be wiped; keep its scope minimal and null the variable after use.
+
+    .PARAMETER Secure
+      The SecureString to convert. If null/empty returns $null.
+
+    .OUTPUTS
+      [string]
+  #>
+  [OutputType([string])]
+  param(
+    [Parameter(Mandatory=$false)]
+    [Security.SecureString]$Secure
+  )
+
+  if (-not $Secure) { return $null }
+  $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secure)
+  try {
+    [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)
+  }
+  finally {
+    if ($ptr -ne [IntPtr]::Zero) {
+      [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)
+    }
+  }
 }
 
+#endregion
+
+# check that PFX file exists
 if (-not (Test-Path -Path $PfxPath -PathType Leaf)) {
     throw "PFX path '$PfxPath' not found."
 }
 
+# prepare output directory
 if (-not $OutDirectory) { $OutDirectory = [IO.Path]::GetDirectoryName((Resolve-Path -Path $PfxPath)) }
 if (-not (Test-Path -Path $OutDirectory)) { New-Item -Path $OutDirectory -ItemType Directory -Force | Out-Null }
 
+# prepare output paths
 $baseName = [IO.Path]::GetFileNameWithoutExtension($PfxPath)
 $certPath = Join-Path $OutDirectory ($baseName + '.cer')
 $keyPath  = Join-Path $OutDirectory ($baseName + '.key')
 
+# check for existing output files
 if (-not $Overwrite) {
     foreach ($f in @($certPath, $keyPath)) {
         if (Test-Path $f) { throw "Output file '$f' already exists. Use -Overwrite to replace." }
     }
 }
 
+# Convert SecureString password to plain text (if provided)
 $plainPfxPassword = Convert-SecureStringToPlain -Secure $Password
 
 # Load PFX
@@ -159,17 +197,20 @@ finally {
     if ($plainKeyPassword) { [Array]::Clear([char[]]$plainKeyPassword, 0, $plainKeyPassword.Length) }
 }
 
+# Base64 wrap 64 chars and write PEM
 $keyB64 = [Convert]::ToBase64String($keyBytes)
 $keyWrapped = ($keyB64 -split '(.{1,64})' | Where-Object { $_ }) -join "`n"
 $keyPem = "-----BEGIN $header-----`n$keyWrapped`n-----END $header-----`n"
 Set-Content -Path $keyPath -Value $keyPem -Encoding ascii -NoNewline
 
-## (ACL hardening removed per request; private key may retain default file permissions)
-
-
 Write-Host "Export complete:" -ForegroundColor Green
 Write-Host "  Certificate: $certPath"
-Write-Host "  Private Key: $keyPath" + $(if ($encrypt) { ' (encrypted)' } else { '' })
+if ($encrypt) {
+  Write-Host "  Private Key: $keyPath (encrypted)"
+}
+else {
+  Write-Host "  Private Key: $keyPath (unencrypted)"
+}
 
 # Cleanup disposable objects
 if ($rsa) { $rsa.Dispose() }

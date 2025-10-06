@@ -71,6 +71,16 @@ param (
   [Parameter(Mandatory = $true, ParameterSetName = 'Queue')]
   [Parameter(Mandatory = $true, ParameterSetName = 'Webhook')]
   [Parameter(Mandatory = $true, ParameterSetName = 'Direct')]
+  [string] $Subject = 'CN=www.example.com',
+
+  [Parameter(Mandatory = $true, ParameterSetName = 'Queue')]
+  [Parameter(Mandatory = $true, ParameterSetName = 'Webhook')]
+  [Parameter(Mandatory = $true, ParameterSetName = 'Direct')]
+  [string[]] $CertificateDnsNames = @('www.example.com', 'api.example.com'),
+
+  [Parameter(Mandatory = $true, ParameterSetName = 'Queue')]
+  [Parameter(Mandatory = $true, ParameterSetName = 'Webhook')]
+  [Parameter(Mandatory = $true, ParameterSetName = 'Direct')]
   [string] $CertificateTemplate,
 
   [Parameter(Mandatory = $true, ParameterSetName = 'Queue')]
@@ -133,8 +143,8 @@ $data = [ordered]@{
     ObjectType          = 'Certificate'
     ObjectName          = $CertName
     CertificateTemplate = $CertificateTemplate
-    CertificateSubject  = 'CN=www.example.com'
-    CertificateDnsNames = @('www.example.com', 'api.example.com')
+    CertificateSubject  = $Subject
+    CertificateDnsNames = $CertificateDnsNames
     Hostname            = $Hostname
     PfxProtectTo        = $PfxProtectTo
     NotifyTo            = $NotifyTo
