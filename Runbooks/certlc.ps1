@@ -1298,66 +1298,57 @@ else {
 # Get the runbook variables from the Automation Account
 # Since they are encrypted, we must use the internal cmdlet Get-AutomationVariable to retrieve them, not Get-AzAutomationVariable
 
-$SmtpServer = $null
-$FromAddress = $null
-$SmtpUser = $null
-$SmtpPassword = $null
-$CA = $null
-$PfxRootFolder = $null
-$SmtpCredential = $null
-
 Write-CertLCLog -Section 'Dispatcher' -Message 'Retrieving automation account variables...'
-try {
-    $SmtpServer = Get-AutomationVariable -Name 'certlc-smtpserver'          # optional
-    $FromAddress = Get-AutomationVariable -Name 'certlc-smtpfrom'           # mandatory if SmtpServer is set
-    $SmtpUser = Get-AutomationVariable -Name 'certlc-smtpuser'              # optional, if empty no authentication is used for smtp server
-    $SmtpPassword = Get-AutomationVariable -Name 'certlc-smtppassword'      # mandatory if SmtpUser is set
-    $CA = Get-AutomationVariable -Name 'certlc-ca'                          # mandatory
-    $PfxRootFolder = Get-AutomationVariable -Name 'certlc-pfxrootfolder'    # mandatory
-}
-catch {
-    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'Error getting automation account variables. Ensure the following variables exist in the automation account: certlc-smtpserver, certlc-smtpfrom, certlc-smtpuser, certlc-smtppassword, certlc-ca, certlc-pfxrootfolder' -Inner $_.Exception
+
+# Retrieve all variables (using Ignore to not pollute $Error collection if missing; will check later the mandatory ones)
+$SmtpServer = Get-AutomationVariable -Name 'certlc-smtpserver' -ErrorAction Ignore
+$FromAddress = Get-AutomationVariable -Name 'certlc-smtpfrom' -ErrorAction Ignore
+$SmtpUser = Get-AutomationVariable -Name 'certlc-smtpuser' -ErrorAction Ignore
+$SmtpPassword = Get-AutomationVariable -Name 'certlc-smtppassword' -ErrorAction Ignore
+$CA = Get-AutomationVariable -Name 'certlc-ca' -ErrorAction Ignore
+$PfxRootFolder = Get-AutomationVariable -Name 'certlc-pfxrootfolder' -ErrorAction Ignore
+
+# Validate mandatory variables first
+if ([string]::IsNullOrEmpty($CA)) {
+    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-ca' is missing or empty. Ensure this variable exists in the automation account."
 }
 
-# Validate the variables
+if ([string]::IsNullOrEmpty($PfxRootFolder)) {
+    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-pfxrootfolder' is missing or empty. Ensure this variable exists in the automation account."
+}
+
+# Validate SMTP variables
 # Case 1: SmtpServer is empty or missing - all other SMTP variables must also be empty
 if ([string]::IsNullOrEmpty($SmtpServer)) {
     if (-not [string]::IsNullOrEmpty($FromAddress)) {
-        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtpfrom' is set, but 'certlc-smtpserver' is empty. When SmtpServer is not configured, all other SMTP variables must be empty!"
+        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtpfrom' is set, but 'certlc-smtpserver' is missing or empty. When SmtpServer is not configured, all other SMTP variables must be missing or empty."
     }
     if (-not [string]::IsNullOrEmpty($SmtpUser)) {
-        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtpuser' is set, but 'certlc-smtpserver' is empty. When SmtpServer is not configured, all other SMTP variables must be empty!"
+        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtpuser' is set, but 'certlc-smtpserver' is missing or empty. When SmtpServer is not configured, all other SMTP variables must be missing or empty."
     }
     if (-not [string]::IsNullOrEmpty($SmtpPassword)) {
-        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtppassword' is set, but 'certlc-smtpserver' is empty. When SmtpServer is not configured, all other SMTP variables must be empty!"
+        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtppassword' is set, but 'certlc-smtpserver' is missing or empty. When SmtpServer is not configured, all other SMTP variables must be missing or empty."
     }
     Write-CertLCLog -Section 'Dispatcher' -Message 'SMTP: Email notifications are disabled (SmtpServer is not configured).'
 }
 # Case 2: SmtpServer is set - validate FromAddress and authentication variables
 else {
     if ([string]::IsNullOrEmpty($FromAddress)) {
-        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtpserver' is set, but 'certlc-smtpfrom' is empty. Both must be set to send email!"
+        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtpserver' is set, but 'certlc-smtpfrom' is missing or empty. Both must be set to send email."
     }
     # Check SmtpUser and SmtpPassword: both must be set or both must be empty
     $userSet = -not [string]::IsNullOrEmpty($SmtpUser)
     $passSet = -not [string]::IsNullOrEmpty($SmtpPassword)
     if ($userSet -and -not $passSet) {
-        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtpuser' is set, but 'certlc-smtppassword' is empty. Both must be set to use authentication, or both must be empty for unauthenticated email!"
+        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtpuser' is set, but 'certlc-smtppassword' is missing or empty. Both must be set to use authentication, or both must be missing or empty for unauthenticated email."
     }
     if ($passSet -and -not $userSet) {
-        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtppassword' is set, but 'certlc-smtpuser' is empty. Both must be set to use authentication, or both must be empty for unauthenticated email!"
+        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtppassword' is set, but 'certlc-smtpuser' is missing or empty. Both must be set to use authentication, or both must be missing or empty for unauthenticated email."
     }
-}
-
-if ([string]::IsNullOrEmpty($CA)) {
-    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-ca' is empty!"
-}
-
-if ([string]::IsNullOrEmpty($PfxRootFolder)) {
-    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-pfxrootfolder' is empty!"
 }
 
 # prepare the smtp credentials (only if SmtpServer is configured)
+$SmtpCredential = $null
 if (-not [string]::IsNullOrEmpty($SmtpServer)) {
     if (-not [string]::IsNullOrEmpty($SmtpUser) -and -not [string]::IsNullOrEmpty($SmtpPassword)) {
         $SmtpSecurePassword = ConvertTo-SecureString -String $SmtpPassword -AsPlainText -Force
@@ -1366,7 +1357,7 @@ if (-not [string]::IsNullOrEmpty($SmtpServer)) {
         Write-CertLCLog -Section 'Dispatcher' -Message 'SMTP: Authentication will be used to send email.'
     }
     else {
-        Write-CertLCLog -Section 'Dispatcher' -Message 'SMTP: No authentication will be used to send email (unauthenticated).'
+        Write-CertLCLog -Section 'Dispatcher' -Message 'SMTP: No authentication will be used to send email. Ensure the SMTP server allows unauthenticated email from this host!' -Level 'Warning'
     }
 }
 
