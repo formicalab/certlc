@@ -446,8 +446,9 @@ function Write-CertLCLogAndThrow {
     # Send email if needed. Note that we may not have the NotifyTo list in all cases.
     # For example, for a renewal, if the error occurs before we read the certificate details including the NotifyTo tag, we don't have the To list.
     # In this case, skip the email sending.
+    # Also skip email sending if SMTP is not configured.
 
-    if ($NotifyTo) {
+    if ($NotifyTo -and -not [string]::IsNullOrEmpty($SmtpServer)) {
         $subject = "Error in CERTLC runbook"
         $fragment = "An error occurred in section: $Section of the CERTLC runbook used to process certificate requests:<br>"
         $fragment += $message.Replace("`n", "`n<br/>").Replace("`r", '')
@@ -461,6 +462,9 @@ function Write-CertLCLogAndThrow {
         $fragment = [System.Net.WebUtility]::HtmlEncode($fragment)
         $body = $CertificateErrorEmailBodyHtml -replace '__CONTENT__', $fragment
         Send-NotificationEmail -SmtpServer $SmtpServer -fromAddress $fromAddress -To $NotifyTo -Subject $subject -Body $body -SmtpCredential $SmtpCredential
+    }
+    elseif ($NotifyTo -and [string]::IsNullOrEmpty($SmtpServer)) {
+        Write-CertLCLog -Level 'Warning' -Message "Error notification requested but SMTP is not configured. Skipping email notification." -Section $Section
     }
 
     Write-CertLCLog -Level 'Error' -Message $Message -Section $Section -CorrelationId $CorrelationId -Context $ctx
@@ -1316,14 +1320,33 @@ catch {
 }
 
 # Validate the variables
-if ([string]::IsNullOrEmpty($SmtpServer) -and -not [string]::IsNullOrEmpty($FromAddress)) {
-    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtpfrom' is set, but 'certlc-smtpserver' is empty. Both must be set to send email!"
+# Case 1: SmtpServer is empty or missing - all other SMTP variables must also be empty
+if ([string]::IsNullOrEmpty($SmtpServer)) {
+    if (-not [string]::IsNullOrEmpty($FromAddress)) {
+        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtpfrom' is set, but 'certlc-smtpserver' is empty. When SmtpServer is not configured, all other SMTP variables must be empty!"
+    }
+    if (-not [string]::IsNullOrEmpty($SmtpUser)) {
+        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtpuser' is set, but 'certlc-smtpserver' is empty. When SmtpServer is not configured, all other SMTP variables must be empty!"
+    }
+    if (-not [string]::IsNullOrEmpty($SmtpPassword)) {
+        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtppassword' is set, but 'certlc-smtpserver' is empty. When SmtpServer is not configured, all other SMTP variables must be empty!"
+    }
+    Write-CertLCLog -Section 'Dispatcher' -Message 'SMTP: Email notifications are disabled (SmtpServer is not configured).'
 }
-if (-not [string]::IsNullOrEmpty($SmtpServer) -and -not [string]::IsNullOrEmpty($SmtpPassword) -and [string]::IsNullOrEmpty($SmtpUser)) {
-    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtpuser' is empty, but 'certlc-smtppassword' is set. Both must be set to use authentication to send email!"
-}
-if (-not [string]::IsNullOrEmpty($SmtpServer) -and -not [string]::IsNullOrEmpty($SmtpUser) -and [string]::IsNullOrEmpty($SmtpPassword)) {
-    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtppassword' is empty, but 'certlc-smtpuser' is set. Both must be set to use authentication to send email!"
+# Case 2: SmtpServer is set - validate FromAddress and authentication variables
+else {
+    if ([string]::IsNullOrEmpty($FromAddress)) {
+        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtpserver' is set, but 'certlc-smtpfrom' is empty. Both must be set to send email!"
+    }
+    # Check SmtpUser and SmtpPassword: both must be set or both must be empty
+    $userSet = -not [string]::IsNullOrEmpty($SmtpUser)
+    $passSet = -not [string]::IsNullOrEmpty($SmtpPassword)
+    if ($userSet -and -not $passSet) {
+        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtpuser' is set, but 'certlc-smtppassword' is empty. Both must be set to use authentication, or both must be empty for unauthenticated email!"
+    }
+    if ($passSet -and -not $userSet) {
+        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtppassword' is set, but 'certlc-smtpuser' is empty. Both must be set to use authentication, or both must be empty for unauthenticated email!"
+    }
 }
 
 if ([string]::IsNullOrEmpty($CA)) {
@@ -1334,15 +1357,17 @@ if ([string]::IsNullOrEmpty($PfxRootFolder)) {
     Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-pfxrootfolder' is empty!"
 }
 
-# prepare the smtp credentials
-if (-not [string]::IsNullOrEmpty($SmtpUser) -and -not [string]::IsNullOrEmpty($SmtpPassword)) {
-    $SmtpSecurePassword = ConvertTo-SecureString -String $SmtpPassword -AsPlainText -Force
-    $SmtpCredential = New-Object System.Management.Automation.PSCredential ($SmtpUser, $SmtpSecurePassword)
-    $SmtpSecurePassword = $null
-    Write-CertLCLog -Section 'Dispatcher' -Message 'SMTP: Authentication will be used to send email.'
-}
-else {
-    Write-CertLCLog -Section 'Dispatcher' -Message 'SMTP: No authentication will be used to send email.'
+# prepare the smtp credentials (only if SmtpServer is configured)
+if (-not [string]::IsNullOrEmpty($SmtpServer)) {
+    if (-not [string]::IsNullOrEmpty($SmtpUser) -and -not [string]::IsNullOrEmpty($SmtpPassword)) {
+        $SmtpSecurePassword = ConvertTo-SecureString -String $SmtpPassword -AsPlainText -Force
+        $SmtpCredential = New-Object System.Management.Automation.PSCredential ($SmtpUser, $SmtpSecurePassword)
+        $SmtpSecurePassword = $null
+        Write-CertLCLog -Section 'Dispatcher' -Message 'SMTP: Authentication will be used to send email.'
+    }
+    else {
+        Write-CertLCLog -Section 'Dispatcher' -Message 'SMTP: No authentication will be used to send email (unauthenticated).'
+    }
 }
 
 # Check if we have the jsonRequestBody parameter
@@ -1560,12 +1585,15 @@ switch ($requestBody.type) {
             Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message 'Error processing certificate creation request' -Inner $_.Exception -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
         }
 
-        # send notification email if requested
-        if ($NotifyTo) {
+        # send notification email if requested and SMTP is configured
+        if ($NotifyTo -and -not [string]::IsNullOrEmpty($SmtpServer)) {
             $subject = "Certificate $CertificateName renewed successfully"
             $fragment = [System.Net.WebUtility]::HtmlEncode("A new version of certificate $CertificateName has been successfully renewed in the Key Vault $VaultName.")
             $body = $CertificateNotificationEmailBodyHtml -replace '__CONTENT__', $fragment
             Send-NotificationEmail -SmtpServer $SmtpServer -FromAddress $fromAddress -To $NotifyTo -Subject $subject -Body $body -SmtpCredential $SmtpCredential
+        }
+        elseif ($NotifyTo -and [string]::IsNullOrEmpty($SmtpServer)) {
+            Write-CertLCLog -Section 'Dispatcher.Renewal' -Message "Notification requested but SMTP is not configured. Skipping email notification." -Level 'Warning'
         }
 
         # confirm renewal
@@ -1681,12 +1709,15 @@ switch ($requestBody.type) {
             Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message 'Error processing new certificate request' -Inner $_.Exception -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
         }
 
-        # send notification email if requested
-        if ($NotifyTo) {
+        # send notification email if requested and SMTP is configured
+        if ($NotifyTo -and -not [string]::IsNullOrEmpty($SmtpServer)) {
             $subject = "Certificate $CertificateName created successfully"
             $fragment = [System.Net.WebUtility]::HtmlEncode("A new certificate $CertificateName has been successfully created in the Key Vault $VaultName.")
             $body = $CertificateNotificationEmailBodyHtml -replace '__CONTENT__', $fragment
             Send-NotificationEmail -SmtpServer $SmtpServer -FromAddress $fromAddress -To $NotifyTo -Subject $subject -Body $body -SmtpCredential $SmtpCredential
+        }
+        elseif ($NotifyTo -and [string]::IsNullOrEmpty($SmtpServer)) {
+            Write-CertLCLog -Section 'Dispatcher.Creation' -Message "Notification requested but SMTP is not configured. Skipping email notification." -Level 'Warning'
         }
 
         # confirm creation
@@ -1776,12 +1807,15 @@ switch ($requestBody.type) {
             Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message 'Error processing certificate revocation request' -Inner $_.Exception -NotifyTo $NotifyTo
         }
 
-        # send notification email if requested
-        if ($NotifyTo) {
+        # send notification email if requested and SMTP is configured
+        if ($NotifyTo -and -not [string]::IsNullOrEmpty($SmtpServer)) {
             $subject = "Certificate $CertificateName revoked successfully"
             $fragment = [System.Net.WebUtility]::HtmlEncode("The certificate $CertificateName has been successfully revoked in CA and deleted from the Key Vault $VaultName.")
             $body = $CertificateNotificationEmailBodyHtml -replace '__CONTENT__', $fragment
             Send-NotificationEmail -SmtpServer $SmtpServer -FromAddress $fromAddress -To $NotifyTo -Subject $subject -Body $body -smtpCredential $SmtpCredential
+        }
+        elseif ($NotifyTo -and [string]::IsNullOrEmpty($SmtpServer)) {
+            Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Notification requested but SMTP is not configured. Skipping email notification." -Level 'Warning'
         }
 
         # confirm revocation
