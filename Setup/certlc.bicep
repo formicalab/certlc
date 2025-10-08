@@ -68,6 +68,30 @@ param automationAccountVarSmtpUser string
 @secure()
 param automationAccountVarSmtpPassword string
 
+/*************/
+/* VARIABLES */
+/*************/
+
+// Common tags for all resources
+var commonTags = {
+  solution: 'CertLC'
+  purpose: 'Certificate Lifecycle Management'
+}
+
+// Azure built-in role definition IDs
+var roleDefinitions = {
+  storageQueueDataReader: '19e7f393-937e-4f77-808e-94535e297925'
+  storageQueueDataMessageSender: 'c6a89b2d-59bc-44d0-9896-0f6e12d7b80a'
+  keyVaultCertificatesOfficer: 'a4417e6f-fecd-4de8-b567-7b0420556985'
+  keyVaultSecretsOfficer: 'b86a8fe4-44ce-4948-aee5-eccb2c155cd7'
+  reader: 'acdd72a7-3385-48ef-bd42-f606fba81ae7'
+  monitoringMetricsPublisher: '3913510d-42f4-4e42-8a64-420c390055eb'
+  storageBlobDataOwner: 'b7e6dc6d-f1e8-4753-8033-0f276bb0955b'
+  storageQueueDataMessageProcessor: '8a0f0c08-91a1-4084-bc3d-661d67233fed'
+  storageQueueDataContributor: '974c5e8b-45b9-4653-ba55-5f855dd0fb88'
+  automationOperator: 'd3881f73-407a-4167-8283-e981cbba0404'
+}
+
 /**********************/
 /* EXISTING RESOURCES */
 /**********************/
@@ -146,10 +170,7 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2025-01-01' = {
     }
   }
 
-  tags: {
-    solution: 'CertLC'
-    purpose: 'Certificate Lifecycle Management'
-  }
+  tags: commonTags
 }
 
 // Private endpoint for the storage account - blob
@@ -173,25 +194,20 @@ resource storageAccountBlobPrivateEndpoint 'Microsoft.Network/privateEndpoints@2
     ]
     customNetworkInterfaceName: 'nic-pe-${storageAccountName}'
   }
-  tags: {
-    solution: 'CertLC'
-    purpose: 'Certificate Lifecycle Management'
-  }
-}
+  tags: commonTags
 
-// Private DNS Zone Group for the storage account - blob
-resource storageAccountBlobPrivateDnsZoneGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2024-10-01' = {
-  parent: storageAccountBlobPrivateEndpoint
-  name: 'pdzg-${storageAccountBlobPrivateEndpoint.name}'
-  properties: {
-    privateDnsZoneConfigs: [
-      {
-        name: 'pdzc-${storageAccountBlobPrivateEndpoint.name}'
-        properties: {
-          privateDnsZoneId: blobDnsZone.id
+  resource privateDnsZoneGroup 'privateDnsZoneGroups' = {
+    name: 'default'
+    properties: {
+      privateDnsZoneConfigs: [
+        {
+          name: 'config1'
+          properties: {
+            privateDnsZoneId: blobDnsZone.id
+          }
         }
-      }
-    ]
+      ]
+    }
   }
 }
 
@@ -216,25 +232,20 @@ resource storageAccountQueuePrivateEndpoint 'Microsoft.Network/privateEndpoints@
     ]
     customNetworkInterfaceName: 'nic-pe-queue-${storageAccountName}'
   }
-  tags: {
-    solution: 'CertLC'
-    purpose: 'Certificate Lifecycle Management'
-  }
-}
+  tags: commonTags
 
-// Private DNS Zone Group for the storage account - queue
-resource storageAccountQueuePrivateDnsZoneGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2024-10-01' = {
-  parent: storageAccountQueuePrivateEndpoint
-  name: 'pdzg-${storageAccountQueuePrivateEndpoint.name}'
-  properties: {
-    privateDnsZoneConfigs: [
-      {
-        name: 'pdzc-${storageAccountQueuePrivateEndpoint.name}'
-        properties: {
-          privateDnsZoneId: queueDnsZone.id
+  resource privateDnsZoneGroup 'privateDnsZoneGroups' = {
+    name: 'default'
+    properties: {
+      privateDnsZoneConfigs: [
+        {
+          name: 'config1'
+          properties: {
+            privateDnsZoneId: queueDnsZone.id
+          }
         }
-      }
-    ]
+      ]
+    }
   }
 }
 
@@ -242,16 +253,25 @@ resource storageAccountQueuePrivateDnsZoneGroup 'Microsoft.Network/privateEndpoi
 resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
   name: logAnalyticsWorkspaceName
   location: resourceGroup().location
-  tags: {
-    solution: 'CertLC'
-    purpose: 'Certificate Lifecycle Management'
-  }
   properties: {
     sku: {
       name: 'PerGB2018'
     }
     retentionInDays: 30
   }
+  tags: commonTags
+}
+
+// Data Collection Endpoint
+resource dataCollectionEndpoint 'Microsoft.Insights/dataCollectionEndpoints@2023-03-11' = {
+  name: dataCollectionEndpointName
+  location: resourceGroup().location
+  properties: {
+    networkAcls: {
+      publicNetworkAccess: 'Enabled'
+    }
+  }
+  tags: commonTags
 }
 
 // Custom Table for Certificate Statistics
@@ -313,10 +333,6 @@ resource customTable 'Microsoft.OperationalInsights/workspaces/tables@2022-10-01
 resource dataCollectionRule 'Microsoft.Insights/dataCollectionRules@2023-03-11' = {
   name: dataCollectionRuleName
   location: resourceGroup().location
-  tags: {
-    solution: 'CertLC'
-    purpose: 'Certificate Lifecycle Management'
-  }
   properties: {
     dataCollectionEndpointId: dataCollectionEndpoint.id
     streamDeclarations: {
@@ -375,11 +391,13 @@ resource dataCollectionRule 'Microsoft.Insights/dataCollectionRules@2023-03-11' 
     ]
   }
   dependsOn: [
-    customTable     // the DCR must be created after the custom table
+    customTable  // the DCR must be created after the custom table
   ]
+  tags: commonTags
 }
 
 // Application Insights
+// IMPORTANT: Deploy AFTER all Log Analytics operations are complete to avoid "Workspace not active" errors
 resource applicationInsights 'Microsoft.Insights/components@2020-02-02' = {
   name: applicationInsightsName
   location: resourceGroup().location
@@ -389,10 +407,12 @@ resource applicationInsights 'Microsoft.Insights/components@2020-02-02' = {
     WorkspaceResourceId: logAnalyticsWorkspace.id
     DisableLocalAuth: true
   }
-  tags: {
-    solution: 'CertLC'
-    purpose: 'Certificate Lifecycle Management'
-  }
+  dependsOn: [
+    // Force serial deployment: Log Analytics → Custom Table → DCR → Automation Account → App Insights
+    // This ensures the workspace backend is fully active before App Insights connects
+    automationAccount  // Automation Account depends on DCR, which depends on customTable
+  ]
+  tags: commonTags
 }
 
 // Flexible Consumption Plan for the function app
@@ -407,10 +427,7 @@ resource flexServicePlan 'Microsoft.Web/serverfarms@2024-11-01' = {
   properties: {
     reserved: true
   }
-  tags: {
-    solution: 'CertLC'
-    purpose: 'Certificate Lifecycle Management'
-  }
+  tags: commonTags
 }
 
 // Function App
@@ -463,13 +480,10 @@ resource functionApp 'Microsoft.Web/sites@2024-11-01' = {
     }
   }
   dependsOn: [
-    storageAccountBlobPrivateDnsZoneGroup // create the function only after the PEs for the storage account are ready
-    storageAccountQueuePrivateDnsZoneGroup
+    storageAccountBlobPrivateEndpoint // create the function only after the PEs for the storage account are ready
+    storageAccountQueuePrivateEndpoint
   ]
-  tags: {
-    solution: 'CertLC'
-    purpose: 'Certificate Lifecycle Management'
-  }
+  tags: commonTags
 }
 
 // Private endpoint for the function app
@@ -493,40 +507,20 @@ resource functionAppPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-10-
     ]
     customNetworkInterfaceName: 'nic-pe-${functionAppName}'
   }
-  tags: {
-    solution: 'CertLC'
-    purpose: 'Certificate Lifecycle Management'
-  }
-}
+  tags: commonTags
 
-// Private DNS Zone Group for the function app
-resource functionAppPrivateDnsZoneGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2024-10-01' = {
-  parent: functionAppPrivateEndpoint
-  name: 'pdzg-${functionAppPrivateEndpoint.name}'
-  properties: {
-    privateDnsZoneConfigs: [
-      {
-        name: 'pdzc-${functionAppPrivateEndpoint.name}'
-        properties: {
-          privateDnsZoneId: webAppDnsZone.id
+  resource privateDnsZoneGroup 'privateDnsZoneGroups' = {
+    name: 'default'
+    properties: {
+      privateDnsZoneConfigs: [
+        {
+          name: 'config1'
+          properties: {
+            privateDnsZoneId: webAppDnsZone.id
+          }
         }
-      }
-    ]
-  }
-}
-
-// Data Collection Endpoint
-resource dataCollectionEndpoint 'Microsoft.Insights/dataCollectionEndpoints@2023-03-11' = {
-  name: dataCollectionEndpointName
-  location: resourceGroup().location
-  properties: {
-    networkAcls: {
-      publicNetworkAccess: 'Enabled'
+      ]
     }
-  }
-  tags: {
-    solution: 'CertLC'
-    purpose: 'Certificate Lifecycle Management'
   }
 }
 
@@ -543,6 +537,11 @@ resource automationAccount 'Microsoft.Automation/automationAccounts@2024-10-23' 
       name: 'Basic'
     }
   }
+  dependsOn: [
+    dataCollectionRule
+    dataCollectionEndpoint
+  ]
+  tags: commonTags
   // variables
   resource automationAccountVariables 'variables@2024-10-23' = {
     name: 'certlc-ca'
@@ -646,25 +645,20 @@ resource automationAccountPrivateEndpoint 'Microsoft.Network/privateEndpoints@20
     ]
     customNetworkInterfaceName: 'nic-pe-webhook-${automationAccountName}'
   }
-  tags: {
-    solution: 'CertLC'
-    purpose: 'Certificate Lifecycle Management'
-  }
-}
+  tags: commonTags
 
-// Private DNS Zone Group for the Automation Account - Webhook
-resource automationAccountPrivateDnsZoneGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2024-10-01' = {
-  parent: automationAccountPrivateEndpoint
-  name: 'pdzg-${automationAccountPrivateEndpoint.name}'
-  properties: {
-    privateDnsZoneConfigs: [
-      {
-        name: 'pdzc-${automationAccountPrivateEndpoint.name}'
-        properties: {
-          privateDnsZoneId: automationAccountDnsZone.id
+  resource privateDnsZoneGroup 'privateDnsZoneGroups' = {
+    name: 'default'
+    properties: {
+      privateDnsZoneConfigs: [
+        {
+          name: 'config1'
+          properties: {
+            privateDnsZoneId: automationAccountDnsZone.id
+          }
         }
-      }
-    ]
+      ]
+    }
   }
 }
 
@@ -689,25 +683,20 @@ resource automationAccountPrivateEndpointDSCAndHybridWorker 'Microsoft.Network/p
     ]
     customNetworkInterfaceName: 'nic-pe-dscandhybridworker-${automationAccountName}'
   }
-  tags: {
-    solution: 'CertLC'
-    purpose: 'Certificate Lifecycle Management'
-  }
-}
+  tags: commonTags
 
-// Private DNS Zone Group for the Automation Account - DSCAndHybridWorker
-resource automationAccountPrivateDnsZoneGroupDSCAndHybridWorker 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2024-10-01' = {
-  parent: automationAccountPrivateEndpointDSCAndHybridWorker
-  name: 'pdzg-dscandhybridworker-${automationAccountPrivateEndpointDSCAndHybridWorker.name}'
-  properties: {
-    privateDnsZoneConfigs: [
-      {
-        name: 'pdzc-dscandhybridworker-${automationAccountPrivateEndpointDSCAndHybridWorker.name}'
-        properties: {
-          privateDnsZoneId: automationAccountDnsZone.id
+  resource privateDnsZoneGroup 'privateDnsZoneGroups' = {
+    name: 'default'
+    properties: {
+      privateDnsZoneConfigs: [
+        {
+          name: 'config1'
+          properties: {
+            privateDnsZoneId: automationAccountDnsZone.id
+          }
         }
-      }
-    ]
+      ]
+    }
   }
 }
 
@@ -726,10 +715,7 @@ resource keyVault 'Microsoft.KeyVault/vaults@2025-05-01' = {
     enableRbacAuthorization: true
     publicNetworkAccess: 'Disabled'
   }
-  tags: {
-    solution: 'CertLC'
-    purpose: 'Certificate Lifecycle Management'
-  }
+  tags: commonTags
 }
 
 // Private endpoint for the KeyVault
@@ -753,25 +739,20 @@ resource keyVaultPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-10-01'
     ]
     customNetworkInterfaceName: 'nic-pe-${keyVaultName}'
   }
-  tags: {
-    solution: 'CertLC'
-    purpose: 'Certificate Lifecycle Management'
-  }
-}
+  tags: commonTags
 
-// Private DNS Zone Group for the KeyVault
-resource keyVaultPrivateDnsZoneGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2024-10-01' = {
-  parent: keyVaultPrivateEndpoint
-  name: 'pdzg-${keyVaultPrivateEndpoint.name}'
-  properties: {
-    privateDnsZoneConfigs: [
-      {
-        name: 'pdzc-${keyVaultPrivateEndpoint.name}'
-        properties: {
-          privateDnsZoneId: keyVaultDnsZone.id
+  resource privateDnsZoneGroup 'privateDnsZoneGroups' = {
+    name: 'default'
+    properties: {
+      privateDnsZoneConfigs: [
+        {
+          name: 'config1'
+          properties: {
+            privateDnsZoneId: keyVaultDnsZone.id
+          }
         }
-      }
-    ]
+      ]
+    }
   }
 }
 
@@ -786,10 +767,7 @@ resource keyVaultEventGridSystemTopic 'Microsoft.EventGrid/systemTopics@2025-02-
     source: keyVault.id
     topicType: 'Microsoft.KeyVault.Vaults'
   }
-  tags: {
-    solution: 'CertLC'
-    purpose: 'Certificate Lifecycle Management'
-  }
+  tags: commonTags
 }
 
 // Event Grid subscription for the KeyVault to the queue
@@ -829,8 +807,8 @@ resource eventGridStorageQueueDataReader 'Microsoft.Authorization/roleAssignment
     description: 'EventGrid SystemTopic -> Storage Queue Data Reader -> Storage Account'
     roleDefinitionId: subscriptionResourceId(
       'Microsoft.Authorization/roleDefinitions',
-      '19e7f393-937e-4f77-808e-94535e297925'
-    ) // Storage Queue Data Reader
+      roleDefinitions.storageQueueDataReader
+    )
     principalId: keyVaultEventGridSystemTopic.identity.principalId
     principalType: 'ServicePrincipal'
   }
@@ -845,8 +823,8 @@ resource eventGridStorageQueueDataMessageSender 'Microsoft.Authorization/roleAss
     description: 'EventGrid SystemTopic -> Storage Queue Data Message Sender -> Storage Account'
     roleDefinitionId: subscriptionResourceId(
       'Microsoft.Authorization/roleDefinitions',
-      'c6a89b2d-59bc-44d0-9896-0f6e12d7b80a'
-    ) // Storage Queue Data Message Sender
+      roleDefinitions.storageQueueDataMessageSender
+    )
     principalId: keyVaultEventGridSystemTopic.identity.principalId
     principalType: 'ServicePrincipal'
   }
@@ -861,8 +839,8 @@ resource automationAccountKeyVaultCertificatesOfficer 'Microsoft.Authorization/r
     description: 'Automation Account -> Key Vault Certificates Officer -> Key Vault'
     roleDefinitionId: subscriptionResourceId(
       'Microsoft.Authorization/roleDefinitions',
-      'a4417e6f-fecd-4de8-b567-7b0420556985'
-    ) // Key Vault Certificates Officer
+      roleDefinitions.keyVaultCertificatesOfficer
+    )
     principalId: automationAccount.identity.principalId
     principalType: 'ServicePrincipal'
   }
@@ -877,8 +855,8 @@ resource automationAccountKeyVaultSecretsOfficer 'Microsoft.Authorization/roleAs
     description: 'Automation Account -> Key Vault Secrets Officer -> Key Vault'
     roleDefinitionId: subscriptionResourceId(
       'Microsoft.Authorization/roleDefinitions',
-      'b86a8fe4-44ce-4948-aee5-eccb2c155cd7'
-    ) // Key Vault Secrets Officer
+      roleDefinitions.keyVaultSecretsOfficer
+    )
     principalId: automationAccount.identity.principalId
     principalType: 'ServicePrincipal'
   }
@@ -893,8 +871,8 @@ resource automationAccountReader 'Microsoft.Authorization/roleAssignments@2022-0
     description: 'Automation Account -> Reader -> Automation Account (self)'
     roleDefinitionId: subscriptionResourceId(
       'Microsoft.Authorization/roleDefinitions',
-      'acdd72a7-3385-48ef-bd42-f606fba81ae7'
-    ) // Reader Role
+      roleDefinitions.reader
+    )
     principalId: automationAccount.identity.principalId
     principalType: 'ServicePrincipal'
   }
@@ -909,8 +887,8 @@ resource automationAccountMonitoringMetricsPublisher 'Microsoft.Authorization/ro
     description: 'Automation Account -> Monitoring Metrics Publisher -> DCR'
     roleDefinitionId: subscriptionResourceId(
       'Microsoft.Authorization/roleDefinitions',
-      '3913510d-42f4-4e42-8a64-420c390055eb'
-    ) // Monitoring Metrics Publisher
+      roleDefinitions.monitoringMetricsPublisher
+    )
     principalId: automationAccount.identity.principalId
     principalType: 'ServicePrincipal'
   }
@@ -924,8 +902,8 @@ resource functionAppStorageBlobDataOwner 'Microsoft.Authorization/roleAssignment
     description: 'Function App -> Storage Blob Data Owner -> Storage Account'
     roleDefinitionId: subscriptionResourceId(
       'Microsoft.Authorization/roleDefinitions',
-      'b7e6dc6d-f1e8-4753-8033-0f276bb0955b'
-    ) // Storage Blob Data Owner
+      roleDefinitions.storageBlobDataOwner
+    )
     principalId: functionApp.identity.principalId
     principalType: 'ServicePrincipal'
   }
@@ -939,8 +917,8 @@ resource functionAppStorageQueueDataMessageProcessor 'Microsoft.Authorization/ro
     description: 'Function App -> Storage Queue Data Message Processor -> Storage Account'
     roleDefinitionId: subscriptionResourceId(
       'Microsoft.Authorization/roleDefinitions',
-      '8a0f0c08-91a1-4084-bc3d-661d67233fed'
-    ) // Storage Queue Data Message Processor
+      roleDefinitions.storageQueueDataMessageProcessor
+    )
     principalId: functionApp.identity.principalId
     principalType: 'ServicePrincipal'
   }
@@ -954,8 +932,8 @@ resource functionAppStorageQueueDataContributor 'Microsoft.Authorization/roleAss
     description: 'Function App -> Storage Queue Data Contributor -> Storage Account'
     roleDefinitionId: subscriptionResourceId(
       'Microsoft.Authorization/roleDefinitions',
-      '974c5e8b-45b9-4653-ba55-5f855dd0fb88'
-    ) // Storage Queue Data Contributor
+      roleDefinitions.storageQueueDataContributor
+    )
     principalId: functionApp.identity.principalId
     principalType: 'ServicePrincipal'
   }
@@ -970,8 +948,8 @@ resource functionAppAutomationAccountReader 'Microsoft.Authorization/roleAssignm
     description: 'Function App -> Reader -> Automation Account'
     roleDefinitionId: subscriptionResourceId(
       'Microsoft.Authorization/roleDefinitions',
-      'acdd72a7-3385-48ef-bd42-f606fba81ae7'
-    ) // Reader
+      roleDefinitions.reader
+    )
     principalId: functionApp.identity.principalId
     principalType: 'ServicePrincipal'
   }
@@ -986,8 +964,8 @@ resource functionAppAutomationOperator 'Microsoft.Authorization/roleAssignments@
     description: 'Function App -> Automation Operator -> Automation Account'
     roleDefinitionId: subscriptionResourceId(
       'Microsoft.Authorization/roleDefinitions',
-      'd3881f73-407a-4167-8283-e981cbba0404'
-    ) // Automation Operator
+      roleDefinitions.automationOperator
+    )
     principalId: functionApp.identity.principalId
     principalType: 'ServicePrincipal'
   }
@@ -1002,8 +980,8 @@ resource functionAppMonitoringMetricsPublisher 'Microsoft.Authorization/roleAssi
     description: 'Function App -> Monitoring Metrics Publisher -> Application Insights'
     roleDefinitionId: subscriptionResourceId(
       'Microsoft.Authorization/roleDefinitions',
-      '3913510d-42f4-4e42-8a64-420c390055eb'
-    ) // Monitoring Metrics Publisher
+      roleDefinitions.monitoringMetricsPublisher
+    )
     principalId: functionApp.identity.principalId
     principalType: 'ServicePrincipal'
   }
