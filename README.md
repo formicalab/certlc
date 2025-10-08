@@ -29,29 +29,48 @@ CertLC is a solution designed to fully automate X.509 certificate lifecycle oper
 
 ```
 Runbooks\certlc.ps1          # Main runbook with all logic
+Runbooks\certlcstats.ps1     # Fill statistics in the custom log analytics table used by Azure Monitor workbook
 Functions\CertLCBridge       # FunctionApp code
+LogAnalytics\customtable     # Instructions to create the custom table
+Workbooks\certlc.workbook    # Workbook code
 ```
 
-## Setup (high-level)
+## Setup (_very_ high-level)
 
-1. Create storage account, automation account, key vault, function app
-2. Assign the required permissions (see table below)
-3. Deploy the runbook and the function app code
-4. Refer to inline comments in [`certlc.ps1`](d:/source/repos/CertLC/certlc.ps1) for detailed parameter documentation
+1. Create the following resources:
+    - a storage account containing a queue `certlc`
+    - a key vault
+    - an automation account with its managed identity, a hybrid worker group, and the automation variables required by the solution
+    - a log analytics workbook
+    - an application insights instance
+    - a function app in a Flex Consumption plan
+    - an Azure Monitor workbook
+2. create private endpoints for the storage account, the key vault, the automation account and the function app; block their accesses from Internet
+3. create the custom table used by the solution (see dedicated README file )
+4. Assign the required permissions (see table below)
+5. Deploy the runbooks `certlc.ps1` and `certlcstats.ps1`
+6. Deploy the function app code
+7. Deploy the workbook code
 
-| Service Principal                         | Permissions                             | Scope              | Usage                                                   |
-|-------------------------------------------|-----------------------------------------|--------------------|---------------------------------------------------------|
-| Automation Account Managed Identity (*)   | Key Vault Certificates Officer          | Key Vault           | Certificate requests                                    |
-|                                           | Key Vault Secrets Officer               | Key Vault           | PFX Export                                              |
-|                                           | Reader                                  | Automation Account  | Runbook access to variables set on Automation Account   |
-| Function Managed Identity                 | Reader                                  | Automation Account  | Launch and monitor jobs                                 |
-|                                           | Automation Operator                     | Automation Account  | Launch and monitor jobs                                 |
-| Hybrid Worker(s) Managed Identity         | Reader                                  | Automation Account  | Local troubleshooting / utilities executed locally from hybrid worker |
-|                                           | Automation Operator                     | Automation Account  | Local troubleshooting / utilities executed locally from hybrid worker |
-| Event Grid System Topic Managed Identity  | Storage Queue Data Reader               | Storage Account     | Submission of events to the queue                       |
-|                                           | Storage Queue Data Message Sender       | Storage Account     | Submission of events to the queue                       |
-| Function Managed Identity                 | Storage Queue Data Contributor          | Storage Account     | Function’s binding to the queue                         |
-|                                           | Storage Queue Data Message Processor    | Storage Account     | Function’s binding to the queue                         |
-| Hybrid Worker(s) Managed Identity         | Storage Queue Data Reader               | Storage Account     | Local troubleshooting / utilities executed locally from hybrid worker |
-|                                           | Storage Queue Data Message Sender       | Storage Account     | Local troubleshooting / utilities executed locally from hybrid worker |
-| Hybrid Worker(s) AD computer account      | Enroll (ACL)                            | CA’s templates      | Allow certificate requests using the templates          |
+Refer to inline comments in `certlc.ps1` for detailed documentation about request payloads
+
+## Permissions
+
+The following 12 RBAC role assignments are automatically created by the Bicep deployment (plus 1 manual ACL configuration on the CA):
+
+| Service Principal                        | RBAC Roles                           | Scope                  | Usage                                                                |
+|------------------------------------------|--------------------------------------|------------------------|----------------------------------------------------------------------|
+| Automation Account Managed Identity      | Key Vault Certificates Officer       | Key Vault              | Certificate requests                                                 |
+|                                          | Key Vault Secrets Officer            | Key Vault              | PFX Export                                                           |
+|                                          | Reader                               | Automation Account     | Runbook access to variables set on Automation Account                |
+|                                          | Monitoring Metrics Publisher         | DCR                    | Publish logs to the custom table                                     |
+| Function App Managed Identity            | Storage Blob Data Owner              | Storage Account        | Function runtime storage                                             |
+|                                          | Storage Queue Data Contributor       | Storage Account        | Function's binding to the queue                                      |
+|                                          | Storage Queue Data Message Processor | Storage Account        | Function's processing of queue messages                              |
+|                                          | Reader                               | Automation Account     | Read automation account information                                  |
+|                                          | Automation Operator                  | Automation Account     | Launch and monitor runbook jobs                                      |
+|                                          | Monitoring Metrics Publisher         | Application Insights   | Function telemetry and monitoring                                    |
+| Event Grid System Topic Managed Identity | Storage Queue Data Reader            | Storage Account        | Read queue metadata for event submission                             |
+|                                          | Storage Queue Data Message Sender    | Storage Account        | Send certificate expiry events to the queue                          |
+| Hybrid Worker(s) AD computer account     | Enroll (ACL)                         | CA's templates         | Allow certificate requests using the templates (manual configuration) |
+
