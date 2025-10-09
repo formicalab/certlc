@@ -3,9 +3,21 @@
 
 This directory contains the Bicep infrastructure-as-code templates for deploying all Azure resources required by the CertLC solution.
 
+## Prerequisites
+
+Before deploying, ensure you have:
+
+1. **Resource Group**: Created in the target Azure region
+2. **Virtual Network and Subnets**:
+   - Subnet for Private Endpoints
+   - Subnet delegated to `Microsoft.App/environments` for Function App VNet integration
+3. **Private DNS Zones**: Pre-existing Private DNS Zones for all required services (can be in a different subscription)
+4. **Hybrid Worker VM**: A Windows VM (on-premises or Azure) with access to the Enterprise CA
+
 ## Deployment
 
-Deploy the infrastructure using the Bicep template and parameter file:
+1. Edit the parameter file with the required values
+2. Deploy the infrastructure using the Bicep template and parameter file:
 
 ```powershell
 az deployment group create `
@@ -21,11 +33,11 @@ The Bicep template creates and configures the following Azure resources:
 
 #### 1. **Storage Account**
 - **Type**: Standard LRS with hierarchical namespace disabled
-- **Purpose**: Hosts the `certlc` queue for event-driven certificate lifecycle operations
+- **Purpose**: Hosts the `certlc` queue for event-driven certificate lifecycle operations. It is also used by the Azure Function
 - **Configuration**: 
   - Public network access disabled
   - Default to Azure AD authentication
-  - Blob, Queue, File, and Table services enabled
+  - Blob and Queue services enabled
 - **Private Endpoints**:
   - Blob service endpoint
   - Queue service endpoint
@@ -43,7 +55,7 @@ The Bicep template creates and configures the following Azure resources:
 
 #### 4. **Custom Table** (`certlc_CL`)
 - **Type**: Custom table in Log Analytics Workspace
-- **Purpose**: Stores certificate statistics and metadata for monitoring and reporting
+- **Purpose**: Stores certificate statistics updated by the `certlcstats.ps1` runbook
 - **Configuration**: 30-day retention, Analytics plan
 - **Schema**: 8 columns including TimeGenerated, Thumbprint, Name, Created, Expires, Subject, Template, DNSNames
 
@@ -67,17 +79,16 @@ The Bicep template creates and configures the following Azure resources:
 - **Purpose**: Event-driven processing of certificate lifecycle events from the queue
 - **Configuration**:
   - Integrated with VNet via delegated subnet
-  - Uses managed identity for authentication
-  - Connected to Storage Account and Application Insights
+  - Connected to Storage Account and Application Insights using its system assigned managed identity for authentication
   - Runtime: PowerShell 7.4
 - **Private Endpoint**: Secured with private endpoint for site access
 
 #### 8. **Automation Account**
 - **Type**: Basic SKU with System-Assigned Managed Identity
-- **Purpose**: Orchestrates certificate operations with the Enterprise CA and Key Vault
+- **Purpose**: Orchestrates certificate operations with the Enterprise CA and Key Vault (runbook `certlc.ps1`); collects statistics about certificates in the KeyVault (runbook `certlcstats.ps1`)
 - **Configuration**:
   - Public network access disabled
-  - Includes 10 encrypted variables (CA name, PFX root folder, SMTP settings, Key Vault name, DCR details)
+  - Includes encrypted variables used by the workbooks (CA name, PFX root folder, SMTP settings, Key Vault name, DCR details)
   - Hybrid Worker Group for on-premises CA communication
 - **Private Endpoints**:
   - Webhook endpoint (for Function App to trigger runbooks)
@@ -130,7 +141,7 @@ All PaaS resources are secured with private endpoints to disable public access:
 - Automation Account DSC/Hybrid Worker endpoint
 - Key Vault endpoint
 
-Each private endpoint is linked to existing Private DNS Zones (in another subscription/resource group) for name resolution.
+Each private endpoint is linked to existing Private DNS Zones (they can be in another subscription/resource group) for name resolution.
 
 #### 14. **Private DNS Zone Groups** (6 total)
 Each private endpoint has an associated DNS zone group that links to the appropriate Private DNS Zones:
@@ -161,17 +172,6 @@ Each private endpoint has an associated DNS zone group that links to the appropr
 **Event Grid System Topic Managed Identity** (2 assignments):
 - `Storage Queue Data Reader` on Storage Account - For reading queue metadata
 - `Storage Queue Data Message Sender` on Storage Account - For sending certificate expiry events to queue
-
-## Prerequisites
-
-Before deploying, ensure you have:
-
-1. **Resource Group**: Created in the target Azure region
-2. **Virtual Network and Subnets**:
-   - Subnet for Private Endpoints
-   - Subnet delegated to `Microsoft.App/environments` for Function App VNet integration
-3. **Private DNS Zones**: Pre-existing Private DNS Zones for all required services (can be in a different subscription)
-4. **Hybrid Worker VM**: A Windows VM (on-premises or Azure) with access to the Enterprise CA
 
 ## Parameters
 
@@ -204,7 +204,7 @@ After deploying the infrastructure, complete these additional steps:
 6. **Grant CA Permissions**: Assign the hybrid worker's computer account Enroll permissions on the CA templates
 7. **Deploy Workbook**: Import the Azure Monitor workbook for certificate monitoring
 
-## Architecture
+## Security notes
 
 The solution follows a secure-by-default architecture:
 - All PaaS resources use private endpoints with public access disabled
