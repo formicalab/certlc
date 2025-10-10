@@ -5,6 +5,9 @@
       "type": 9,
       "content": {
         "version": "KqlParameterItem/1.0",
+        "crossComponentResources": [
+          "value::all"
+        ],
         "parameters": [
           {
             "id": "222f9a3c-4c8c-4fd4-b2c1-d1a76012c456",
@@ -62,7 +65,26 @@
             },
             "queryType": 1,
             "resourceType": "microsoft.resourcegraph/resources",
-            "value": "/subscriptions/4a570962-701a-475e-bf5b-8dc76ec748ff/resourceGroups/rg-shared-neu-001/providers/Microsoft.Automation/automationAccounts/aa-shared-neu-001/runbooks/certlc"
+            "value": "/subscriptions/4a570962-701a-475e-bf5b-8dc76ec748ff/resourceGroups/rg-shared-neu-001/providers/Microsoft.Automation/automationAccounts/aa-shared-neu-001/runbooks/certlc",
+            "label": "Main Runbook"
+          },
+          {
+            "id": "8dc977cf-d7fb-47ab-886d-8534d3b83038",
+            "version": "KqlParameterItem/1.0",
+            "name": "StatsRunbook",
+            "label": "Stats Runbook",
+            "type": 5,
+            "isRequired": true,
+            "query": "where type =~ 'microsoft.automation/automationaccounts/runbooks'\r\n| where id startswith \"{AutomationAccount}\"\r\n| project id, name\r\n| order by name desc",
+            "crossComponentResources": [
+              "value::all"
+            ],
+            "typeSettings": {
+              "additionalResourceOptions": []
+            },
+            "queryType": 1,
+            "resourceType": "microsoft.resourcegraph/resources",
+            "value": "/subscriptions/4a570962-701a-475e-bf5b-8dc76ec748ff/resourceGroups/rg-shared-neu-001/providers/Microsoft.Automation/automationAccounts/aa-shared-neu-001/runbooks/certlcstats"
           },
           {
             "id": "a46ac1ec-5965-4af4-8750-49ace0d90f8d",
@@ -126,8 +148,8 @@
           }
         ],
         "style": "pills",
-        "queryType": 0,
-        "resourceType": "microsoft.operationalinsights/workspaces"
+        "queryType": 1,
+        "resourceType": "microsoft.resourcegraph/resources"
       },
       "name": "parameters - 0"
     },
@@ -190,7 +212,7 @@
                   "version": "KqlParameterItem/1.0",
                   "name": "LastUpdateFormatted",
                   "type": 1,
-                  "query": "certlc_CL\r\n| summarize LastUpdate = max(TimeGenerated)\r\n| extend LastUpdateLocal = LastUpdate + 2h\r\n| project LastUpdateFormatted = format_datetime(LastUpdateLocal, 'yyyy-MM-dd HH:mm:ss')",
+                  "query": "AzureDiagnostics\r\n| where Category == \"JobLogs\"\r\n| where Resource =~ \"{AutomationAccount:name}\"\r\n| where RunbookName_s =~ split(\"{StatsRunbook}\",\"/\")[-1]  // The stats collection runbook\r\n| where ResultType =~ \"Completed\"       // Only successful completions\r\n| summarize arg_max(TimeGenerated, *)   // Get the most recent completed job\r\n| project LastUpdateFormatted = format_datetime(TimeGenerated, 'yyyy-MM-dd HH:mm:ss')",
                   "crossComponentResources": [
                     "{LogAnalyticsWorkspace}"
                   ],
@@ -213,9 +235,9 @@
             "type": 3,
             "content": {
               "version": "KqlItem/1.0",
-              "query": "let latestCerts = certlc_CL\r\n| summarize arg_max(LastUpdate = TimeGenerated, Name, Subject, Template, Created, Expires) by Name\r\n| extend RawTimeToExpire = Expires - now()  // timespan\r\n| extend Status = case(\r\n    RawTimeToExpire < 0d, \"❌ Expired\",\r\n    RawTimeToExpire < 30d, \"⚠️ Expiring Soon\",\r\n    \"✅ OK\");\r\nlet totalCount = toscalar(latestCerts | summarize count());\r\nlatestCerts\r\n| summarize Count = count() by Status\r\n| extend Total = totalCount\r\n| extend Percentage = round(100.0 * Count / Total, 2)\r\n| project Status, Count, Percentage\r\n| order by Status asc",
+              "query": "// Purpose: Show certificate status summary for ONLY certificates that currently exist in the Key Vault\r\n// Problem: The runbook writes hourly snapshots, but deleted certificates remain in Log Analytics\r\n// Solution: Filter out certificates that weren't reported in the most recent successful runbook execution\r\n//\r\n// Logic:\r\n// 1. Get the completion time of the last SUCCESSFUL certlcstats runbook execution from job logs\r\n//    - This is safer than using certificate timestamps because:\r\n//      * It relies on actual job execution records, not certificate data\r\n//      * It handles cases where no certificates exist or all are deleted\r\n//      * It ensures we only consider data from completed (not failed) runs\r\n// 2. For each certificate Name, get its most recent entry (arg_max)\r\n// 3. Filter to only certificates updated within 5 minutes before the last successful job completion\r\n//    - If a certificate exists in Key Vault, it was written during the last successful cycle\r\n//    - If a certificate was deleted from Key Vault, it won't have been updated recently\r\n//    - 5 minutes allows for the runbook execution time to process all certificates\r\n// 4. Calculate status based on expiration time\r\n// 5. Summarize counts and percentages by status\r\n\r\nlet LastSuccessfulRunbookExecution = toscalar(\r\n    AzureDiagnostics\r\n    | where Category == \"JobLogs\"\r\n    | where Resource =~ \"{AutomationAccount:name}\"\r\n    | where RunbookName_s =~ \"certlcstats\"  // The stats collection runbook\r\n    | where ResultType =~ \"Completed\"       // Only successful completions\r\n    | summarize arg_max(TimeGenerated, *)   // Get the most recent completed job\r\n    | project TimeGenerated\r\n);\r\n\r\nlet latestCerts = certlc_CL\r\n| summarize arg_max(LastUpdate = TimeGenerated, Name, Subject, Template, Created, Expires) by Name\r\n| where LastUpdate >= (LastSuccessfulRunbookExecution - 5m)  // Only show certs from the last successful cycle\r\n| extend RawTimeToExpire = Expires - now()  // timespan\r\n| extend Status = case(\r\n    RawTimeToExpire < 0d, \"❌ Expired\",\r\n    RawTimeToExpire < 30d, \"⚠️ Expiring Soon\",\r\n    \"✅ OK\");\r\n\r\nlet totalCount = toscalar(latestCerts | summarize count());\r\n\r\nlatestCerts\r\n| summarize Count = count() by Status\r\n| extend Total = totalCount\r\n| extend Percentage = round(100.0 * Count / Total, 2)\r\n| project Status, Count, Percentage\r\n| order by Status asc\r\n",
               "size": 3,
-              "title": "Status of certificates in the key vault - Last refreshed: {LastUpdateFormatted}",
+              "title": "Status of certificates in the key vault - Last refreshed (UTC): {LastUpdateFormatted}",
               "noDataMessageStyle": 4,
               "timeContextFromParameter": "TimeRange",
               "showRefreshButton": true,
@@ -331,9 +353,9 @@
             "type": 3,
             "content": {
               "version": "KqlItem/1.0",
-              "query": "certlc_CL\r\n| summarize arg_max(LastUpdate = TimeGenerated, Name, Subject, Template, Created, Expires) by Name\r\n| extend RawTimeToExpire = Expires - now()  // timespan\r\n| extend TimeToExpire = format_timespan(RawTimeToExpire, 'd.hh:mm:ss')  // e.g., \"3.12:45:00\"\r\n| extend Status = case(\r\n    RawTimeToExpire < 0d, \"❌ Expired\",\r\n    RawTimeToExpire < 30d, \"⚠️ Expiring Soon\",\r\n    \"✅ OK\"\r\n)\r\n| order by RawTimeToExpire\r\n| project Status, LastUpdate, Name, Subject, Template, Created, Expires, TimeToExpire",
+              "query": "// Purpose: Show detailed certificate information for ONLY certificates that currently exist in the Key Vault\r\n// Problem: The runbook writes hourly snapshots, but deleted certificates remain in Log Analytics\r\n// Solution: Filter out certificates that weren't reported in the most recent successful runbook execution\r\n//\r\n// Logic:\r\n// 1. Get the completion time of the last SUCCESSFUL certlcstats runbook execution from job logs\r\n//    - This is safer than using certificate timestamps because:\r\n//      * It relies on actual job execution records, not certificate data\r\n//      * It handles cases where no certificates exist or all are deleted\r\n//      * It ensures we only consider data from completed (not failed) runs\r\n// 2. For each certificate Name, get its most recent entry (arg_max)\r\n// 3. Filter to only certificates updated within 5 minutes before the last successful job completion\r\n//    - If a certificate exists in Key Vault, it was written during the last successful cycle\r\n//    - If a certificate was deleted from Key Vault, it won't have been updated recently\r\n//    - 5 minutes allows for the runbook execution time to process all certificates\r\n// 4. Calculate status based on expiration time and format time-to-expire\r\n// 5. Display certificate details sorted by expiration urgency\r\n\r\nlet LastSuccessfulRunbookExecution = toscalar(\r\n    AzureDiagnostics\r\n    | where Category == \"JobLogs\"\r\n    | where Resource =~ \"{AutomationAccount:name}\"\r\n    | where RunbookName_s =~ \"certlcstats\"  // The stats collection runbook\r\n    | where ResultType =~ \"Completed\"       // Only successful completions\r\n    | summarize arg_max(TimeGenerated, *)   // Get the most recent completed job\r\n    | project TimeGenerated\r\n);\r\n\r\ncertlc_CL\r\n| summarize arg_max(LastUpdate = TimeGenerated, Name, Subject, Template, Created, Expires) by Name\r\n| where LastUpdate >= (LastSuccessfulRunbookExecution - 5m)  // Only show certs from the last successful cycle\r\n| extend RawTimeToExpire = Expires - now()  // timespan\r\n| extend TimeToExpire = format_timespan(RawTimeToExpire, 'd.hh:mm:ss')  // e.g., \"3.12:45:00\"\r\n| extend Status = case(\r\n    RawTimeToExpire < 0d, \"❌ Expired\",\r\n    RawTimeToExpire < 30d, \"⚠️ Expiring Soon\",\r\n    \"✅ OK\"\r\n)\r\n| order by RawTimeToExpire asc  // Most urgent (expired/expiring soon) first\r\n| project Status, LastUpdate, Name, Subject, Template, Created, Expires, TimeToExpire",
               "size": 3,
-              "title": "Details - last refreshed: {LastUpdateFormatted}",
+              "title": "Details - last refreshed (UTC): {LastUpdateFormatted}",
               "noDataMessageStyle": 4,
               "timeContextFromParameter": "TimeRange",
               "showRefreshButton": true,
