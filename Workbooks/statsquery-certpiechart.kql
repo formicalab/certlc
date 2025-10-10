@@ -1,0 +1,45 @@
+// Purpose: Show certificate status summary for ONLY certificates that currently exist in the Key Vault
+// Problem: The runbook writes hourly snapshots, but deleted certificates remain in Log Analytics
+// Solution: Filter out certificates that weren't reported in the most recent successful runbook execution
+//
+// Logic:
+// 1. Get the completion time of the last SUCCESSFUL certlcstats runbook execution from job logs
+//    - This is safer than using certificate timestamps because:
+//      * It relies on actual job execution records, not certificate data
+//      * It handles cases where no certificates exist or all are deleted
+//      * It ensures we only consider data from completed (not failed) runs
+// 2. For each certificate Name, get its most recent entry (arg_max)
+// 3. Filter to only certificates updated within 5 minutes before the last successful job completion
+//    - If a certificate exists in Key Vault, it was written during the last successful cycle
+//    - If a certificate was deleted from Key Vault, it won't have been updated recently
+//    - 5 minutes allows for the runbook execution time to process all certificates
+// 4. Calculate status based on expiration time
+// 5. Summarize counts and percentages by status
+
+let LastSuccessfulRunbookExecution = toscalar(
+    AzureDiagnostics
+    | where Category == "JobLogs"
+    | where Resource =~ "{AutomationAccount:name}"
+    | where RunbookName_s =~ "certlcstats"  // The stats collection runbook
+    | where ResultType =~ "Completed"       // Only successful completions
+    | summarize arg_max(TimeGenerated, *)   // Get the most recent completed job
+    | project TimeGenerated
+);
+
+let latestCerts = certlc_CL
+| summarize arg_max(LastUpdate = TimeGenerated, Name, Subject, Template, Created, Expires) by Name
+| where LastUpdate >= (LastSuccessfulRunbookExecution - 5m)  // Only show certs from the last successful cycle
+| extend RawTimeToExpire = Expires - now()  // timespan
+| extend Status = case(
+    RawTimeToExpire < 0d, "❌ Expired",
+    RawTimeToExpire < 30d, "⚠️ Expiring Soon",
+    "✅ OK");
+
+let totalCount = toscalar(latestCerts | summarize count());
+
+latestCerts
+| summarize Count = count() by Status
+| extend Total = totalCount
+| extend Percentage = round(100.0 * Count / Total, 2)
+| project Status, Count, Percentage
+| order by Status asc

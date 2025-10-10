@@ -1,2 +1,0 @@
-certlc_CL
-| summarize arg_max(LastUpdate = TimeGenerated, Name, Status, Subject, Template, Created, Expires) by Thumbprint
