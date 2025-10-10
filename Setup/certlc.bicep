@@ -82,6 +82,9 @@ param automationAccountVarSmtpUser string
 @secure()
 param automationAccountVarSmtpPassword string
 
+@description('The start time for the certlcstats schedule. Defaults to 15 minutes from deployment time.')
+param scheduleStartTime string = dateTimeAdd(utcNow('u'), 'PT15M')
+
 /*************/
 /* VARIABLES */
 /*************/
@@ -646,6 +649,34 @@ resource automationAccount 'Microsoft.Automation/automationAccounts@2024-10-23' 
     }
     tags: commonTags
   }
+
+  // Schedule for certlcstats runbook - runs every hour
+  // Note: Schedule is created but NOT linked to runbook initially (disabled state)
+  // To enable: Link the schedule to the runbook in Azure Portal or via Azure CLI
+  resource scheduleCertLCStats 'schedules@2024-10-23' = {
+    name: 'schedule-certlcstats-hourly'
+    properties: {
+      description: 'Runs certlcstats runbook every hour to collect certificate statistics (manually link to enable)'
+      startTime: scheduleStartTime
+      frequency: 'Hour'
+      interval: 1
+      timeZone: 'UTC'
+    }
+  }
+
+  // Uncomment to automatically link schedule to runbook (enables automatic execution on hybrid worker group)
+  // resource jobScheduleCertLCStats 'jobSchedules@2024-10-23' = {
+  //   name: guid(automationAccount.id, 'certlcstats-schedule')
+  //   properties: {
+  //     runbook: {
+  //       name: runbookCertLCStats.name
+  //     }
+  //     schedule: {
+  //       name: scheduleCertLCStats.name
+  //     }
+  //     runOn: hybridWorkerGroupName  // Execute on hybrid worker group (not Azure sandbox)
+  //   }
+  // }
 }
 
 // Hybrid Worker Group
