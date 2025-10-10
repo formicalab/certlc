@@ -8,65 +8,82 @@ Deploy with: az deployment group create --resource-group <existing resource grou
 
 */
 
+metadata name = 'CertLC Infrastructure'
+metadata description = 'Azure infrastructure deployment for Certificate Lifecycle Management solution with automated certificate enrollment, renewal, and monitoring'
+
 targetScope = 'resourceGroup'
 
-@description('The ID of the subnet to use for the private endpoint connections')
+@description('The Azure region where resources will be deployed. Defaults to the resource group location.')
+param location string = resourceGroup().location
+
+@description('The resource ID of the subnet for private endpoint connections. Format: /subscriptions/{subscriptionId}/resourceGroups/{rgName}/providers/Microsoft.Network/virtualNetworks/{vnetName}/subnets/{subnetName}')
 param peSubnetId string
 
-@description('The ID of the subnet to use for the function app - for Flex functions, it must be delegated to Microsoft.App/environments')
+@description('The resource ID of the subnet for the function app VNet integration. Must be delegated to Microsoft.App/environments for Flex Consumption plans. Format: /subscriptions/{subscriptionId}/resourceGroups/{rgName}/providers/Microsoft.Network/virtualNetworks/{vnetName}/subnets/{subnetName}')
 param fnSubnetId string
 
-@description('Subscription ID where the Private DNS Zones are located')
+@description('The subscription ID where existing Private DNS Zones are located (for privatelink zones). Format: GUID')
 param dnsZonesSubscriptionId string
 
-@description('Resource Group name where the Private DNS Zones are located')
+@description('The resource group name containing existing Private DNS Zones (e.g., privatelink.blob.core.windows.net, privatelink.vaultcore.azure.net)')
 param dnsZonesResourceGroupName string
 
-@description('The name of the storage account to create')
+@description('The name of the storage account to create. Must be globally unique, 3-24 characters, lowercase letters and numbers only. Used for function app storage and certificate lifecycle queue.')
+@minLength(3)
+@maxLength(24)
 param storageAccountName string
 
-@description('The name of the function app to create')
+@description('The name of the function app to create. Must be globally unique, 2-60 characters, alphanumerics and hyphens. Hosts the queue processor and automation triggers.')
+@minLength(2)
+@maxLength(60)
 param functionAppName string
 
-@description('The name of the log analytics workspace to create')
+@description('The name of the Log Analytics workspace for centralized logging and monitoring. Stores diagnostic logs, custom certificate statistics, and application telemetry.')
 param logAnalyticsWorkspaceName string
 
-@description('The name of the application insights to create')
+@description('The name of the Application Insights instance for function app monitoring and performance tracking.')
 param applicationInsightsName string
 
-@description('The name of the automation account to create')
+@description('The name of the Automation Account to create. 6-50 characters, alphanumerics and hyphens. Executes certificate lifecycle runbooks on hybrid workers.')
+@minLength(6)
+@maxLength(50)
 param automationAccountName string
 
-@description('The name of the hybrid worker group to create')
+@description('The name of the hybrid runbook worker group. On-premises workers must be registered to this group to execute certificate operations.')
 param hybridWorkerGroupName string
 
-@description('The name of the KeyVault to create')
+@description('The name of the Key Vault to create. Must be globally unique, 3-24 characters, alphanumerics and hyphens. Stores and manages certificates with automated lifecycle tracking.')
+@minLength(3)
+@maxLength(24)
 param keyVaultName string
 
-@description('The name of the Data Collection Endpoint (DCE) to create')
+@description('The name of the Data Collection Endpoint (DCE) to create. Ingestion endpoint for custom certificate statistics logs sent from automation runbooks.')
 param dataCollectionEndpointName string
 
-@description('The name of the Data Collection Rule (DCR) to create')
+@description('The name of the Data Collection Rule (DCR) to create. Defines transformation and routing of certificate statistics to Log Analytics custom table.')
 param dataCollectionRuleName string
 
-@description('The name of the CA to use (for the automation account variable)')
+@description('The Certificate Authority name for certificate enrollment. Format: CA_SERVER\\\\CA_NAME (e.g., PKI-CA01\\\\ContosoRootCA). Used by runbooks for ADCS operations.')
 param automationAccountVarCA string
 
-@description('The name of the folder to use (for the automation account variable)')
+@description('The root folder path on hybrid workers where PFX certificates are stored. Format: UNC path or local path (e.g., \\\\\\\\fileserver\\\\certs or C:\\\\\\\\Certificates).')
 param automationAccountVarPfxRootFolder string
 
-@description('The SMTP From address to use (for the automation account variable)')
+@description('The SMTP From email address for certificate expiration notifications (e.g., certlc@contoso.com).')
 param automationAccountVarSmtpFrom string
 
-@description('The SMTP Server to use (for the automation account variable)')
+@description('The SMTP server hostname or IP address for sending email notifications (e.g., smtp.office365.com or smtp.gmail.com).')
 param automationAccountVarSmtpServer string
 
-@description('The SMTP User to use (for the automation account variable)')
+@description('The SMTP username for authentication to the mail server. Required if the SMTP server requires authentication.')
 param automationAccountVarSmtpUser string
 
-@description('The SMTP Password to use (for the automation account variable)')
+@description('The SMTP password for authentication. Stored encrypted in Automation Account variables.')
 @secure()
 param automationAccountVarSmtpPassword string
+
+@description('The start time for the certlcstats schedule. Defaults to 15 minutes from deployment time.')
+param scheduleStartTime string = dateTimeAdd(utcNow('u'), 'PT15M')
 
 /*************/
 /* VARIABLES */
@@ -129,7 +146,7 @@ resource automationAccountDnsZone 'Microsoft.Network/privateDnsZones@2020-06-01'
 // Storage Account
 resource storageAccount 'Microsoft.Storage/storageAccounts@2025-01-01' = {
   name: storageAccountName
-  location: resourceGroup().location
+  location: location
   sku: {
     name: 'Standard_LRS'
   }
@@ -176,7 +193,7 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2025-01-01' = {
 // Private endpoint for the storage account - blob
 resource storageAccountBlobPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-10-01' = {
   name: 'pe-blob-${storageAccountName}'
-  location: resourceGroup().location
+  location: location
   properties: {
     subnet: {
       id: peSubnetId
@@ -214,7 +231,7 @@ resource storageAccountBlobPrivateEndpoint 'Microsoft.Network/privateEndpoints@2
 // Private endpoint for the storage account - queue
 resource storageAccountQueuePrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-10-01' = {
   name: 'pe-queue-${storageAccountName}'
-  location: resourceGroup().location
+  location: location
   properties: {
     subnet: {
       id: peSubnetId
@@ -252,7 +269,7 @@ resource storageAccountQueuePrivateEndpoint 'Microsoft.Network/privateEndpoints@
 // Log Analytics Workspace
 resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
   name: logAnalyticsWorkspaceName
-  location: resourceGroup().location
+  location: location
   properties: {
     sku: {
       name: 'PerGB2018'
@@ -265,7 +282,7 @@ resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2023-09
 // Data Collection Endpoint
 resource dataCollectionEndpoint 'Microsoft.Insights/dataCollectionEndpoints@2023-03-11' = {
   name: dataCollectionEndpointName
-  location: resourceGroup().location
+  location: location
   properties: {
     networkAcls: {
       publicNetworkAccess: 'Enabled'
@@ -279,50 +296,41 @@ resource customTable 'Microsoft.OperationalInsights/workspaces/tables@2022-10-01
   name: 'certlc_CL'
   parent: logAnalyticsWorkspace
   properties: {
-    totalRetentionInDays: 30
-    plan: 'Analytics'
+    retentionInDays: 30
     schema: {
       name: 'certlc_CL'
       columns: [
         {
           name: 'TimeGenerated'
           type: 'datetime'
-          description: 'The time the log was generated'
         }
         {
           name: 'Thumbprint'
           type: 'string'
-          description: 'Certificate thumbprint'
         }
         {
           name: 'Name'
           type: 'string'
-          description: 'Certificate name in Key Vault'
         }
         {
           name: 'Created'
           type: 'datetime'
-          description: 'Certificate creation date'
         }
         {
           name: 'Expires'
           type: 'datetime'
-          description: 'Certificate expiration date'
         }
         {
           name: 'Subject'
           type: 'string'
-          description: 'Certificate subject'
         }
         {
           name: 'Template'
           type: 'string'
-          description: 'Certificate template used'
         }
         {
           name: 'DNSNames'
           type: 'string'
-          description: 'Certificate DNS names (SAN)'
         }
       ]
     }
@@ -332,7 +340,7 @@ resource customTable 'Microsoft.OperationalInsights/workspaces/tables@2022-10-01
 // Data Collection Rule for Certificate Statistics
 resource dataCollectionRule 'Microsoft.Insights/dataCollectionRules@2023-03-11' = {
   name: dataCollectionRuleName
-  location: resourceGroup().location
+  location: location
   properties: {
     dataCollectionEndpointId: dataCollectionEndpoint.id
     streamDeclarations: {
@@ -400,7 +408,7 @@ resource dataCollectionRule 'Microsoft.Insights/dataCollectionRules@2023-03-11' 
 // IMPORTANT: Deploy AFTER all Log Analytics operations are complete to avoid "Workspace not active" errors
 resource applicationInsights 'Microsoft.Insights/components@2020-02-02' = {
   name: applicationInsightsName
-  location: resourceGroup().location
+  location: location
   kind: 'web'
   properties: {
     Application_Type: 'web'
@@ -408,17 +416,18 @@ resource applicationInsights 'Microsoft.Insights/components@2020-02-02' = {
     DisableLocalAuth: true
   }
   dependsOn: [
-    // Force serial deployment: Log Analytics → Custom Table → DCR → Automation Account → App Insights
+    // Force serial deployment: Log Analytics → Custom Table → DCR → Automation Account → Diagnostics → App Insights
     // This ensures the workspace backend is fully active before App Insights connects
-    automationAccount  // Automation Account depends on DCR, which depends on customTable
+    automationAccountDiagnostics  // Wait for diagnostic settings which write to workspace
+    keyVaultDiagnostics
   ]
   tags: commonTags
 }
 
 // Flexible Consumption Plan for the function app
 resource flexServicePlan 'Microsoft.Web/serverfarms@2024-11-01' = {
-  name: 'plan-${functionAppName}'
-  location: resourceGroup().location
+  name: 'asp-${functionAppName}'
+  location: location
   kind: 'functionapp'
   sku: {
     tier: 'FlexConsumption'
@@ -433,7 +442,7 @@ resource flexServicePlan 'Microsoft.Web/serverfarms@2024-11-01' = {
 // Function App
 resource functionApp 'Microsoft.Web/sites@2024-11-01' = {
   name: functionAppName
-  location: resourceGroup().location
+  location: location
   kind: 'functionapp,linux'
   identity: {
     type: 'SystemAssigned'
@@ -445,7 +454,6 @@ resource functionApp 'Microsoft.Web/sites@2024-11-01' = {
     publicNetworkAccess: 'Disabled'
     siteConfig: {
       minTlsVersion: '1.2'
-      vnetRouteAllEnabled: false
     }
     functionAppConfig: {
       deployment: {
@@ -489,7 +497,7 @@ resource functionApp 'Microsoft.Web/sites@2024-11-01' = {
 // Private endpoint for the function app
 resource functionAppPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-10-01' = {
   name: 'pe-sites-${functionAppName}'
-  location: resourceGroup().location
+  location: location
   properties: {
     subnet: {
       id: peSubnetId
@@ -527,7 +535,7 @@ resource functionAppPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-10-
 // Automation Account with its managed identity
 resource automationAccount 'Microsoft.Automation/automationAccounts@2024-10-23' = {
   name: automationAccountName
-  location: resourceGroup().location
+  location: location
   identity: {
     type: 'SystemAssigned'
   }
@@ -613,6 +621,62 @@ resource automationAccount 'Microsoft.Automation/automationAccounts@2024-10-23' 
       isEncrypted: true
     }
   }
+  
+  // Runbook: certlc
+  resource runbookCertLC 'runbooks@2024-10-23' = {
+    name: 'certlc'
+    location: location
+    properties: {
+      runbookType: 'PowerShell'
+      logProgress: false
+      logVerbose: false
+      description: 'Certificate lifecycle management runbook for enrollment, renewal, and revocation'
+      runtimeEnvironment: 'PowerShell-7.2'
+    }
+    tags: commonTags
+  }
+  
+  // Runbook: certlcstats
+  resource runbookCertLCStats 'runbooks@2024-10-23' = {
+    name: 'certlcstats'
+    location: location
+    properties: {
+      runbookType: 'PowerShell'
+      logProgress: false
+      logVerbose: false
+      description: 'Certificate statistics collection runbook for monitoring and reporting'
+      runtimeEnvironment: 'PowerShell-7.2'
+    }
+    tags: commonTags
+  }
+
+  // Schedule for certlcstats runbook - runs every hour
+  // Note: Schedule is created but NOT linked to runbook initially (disabled state)
+  // To enable: Link the schedule to the runbook in Azure Portal or via Azure CLI
+  resource scheduleCertLCStats 'schedules@2024-10-23' = {
+    name: 'schedule-certlcstats-hourly'
+    properties: {
+      description: 'Runs certlcstats runbook every hour to collect certificate statistics (manually link to enable)'
+      startTime: scheduleStartTime
+      frequency: 'Hour'
+      interval: 1
+      timeZone: 'UTC'
+    }
+  }
+
+  // Uncomment to automatically link schedule to runbook (enables automatic execution on hybrid worker group)
+  // resource jobScheduleCertLCStats 'jobSchedules@2024-10-23' = {
+  //   name: guid(automationAccount.id, 'certlcstats-schedule')
+  //   properties: {
+  //     runbook: {
+  //       name: runbookCertLCStats.name
+  //     }
+  //     schedule: {
+  //       name: scheduleCertLCStats.name
+  //     }
+  //     runOn: hybridWorkerGroupName  // Execute on hybrid worker group (not Azure sandbox)
+  //   }
+  // }
 }
 
 // Hybrid Worker Group
@@ -627,7 +691,7 @@ resource hybridWorkerGroup 'Microsoft.Automation/automationAccounts/hybridRunboo
 // Private endpoint for the Automation Account - Webhook
 resource automationAccountPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-10-01' = {
   name: 'pe-webhook-${automationAccountName}'
-  location: resourceGroup().location
+  location: location
   properties: {
     subnet: {
       id: peSubnetId
@@ -665,7 +729,7 @@ resource automationAccountPrivateEndpoint 'Microsoft.Network/privateEndpoints@20
 // Private endpoint for the Automation Account - DSCAndHybridWorker
 resource automationAccountPrivateEndpointDSCAndHybridWorker 'Microsoft.Network/privateEndpoints@2024-10-01' = {
   name: 'pe-dscandhybridworker-${automationAccountName}'
-  location: resourceGroup().location
+  location: location
   properties: {
     subnet: {
       id: peSubnetId
@@ -700,10 +764,35 @@ resource automationAccountPrivateEndpointDSCAndHybridWorker 'Microsoft.Network/p
   }
 }
 
+// Diagnostic Settings for Automation Account
+resource automationAccountDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
+  name: 'diag-${automationAccountName}'
+  scope: automationAccount
+  properties: {
+    workspaceId: logAnalyticsWorkspace.id
+    logs: [
+      {
+        category: 'JobLogs'
+        enabled: true
+      }
+      {
+        category: 'JobStreams'
+        enabled: true
+      }
+    ]
+    metrics: [
+      {
+        category: 'AllMetrics'
+        enabled: true
+      }
+    ]
+  }
+}
+
 // KeyVault
 resource keyVault 'Microsoft.KeyVault/vaults@2025-05-01' = {
   name: keyVaultName
-  location: resourceGroup().location
+  location: location
   properties: {
     sku: {
       family: 'A'
@@ -721,7 +810,7 @@ resource keyVault 'Microsoft.KeyVault/vaults@2025-05-01' = {
 // Private endpoint for the KeyVault
 resource keyVaultPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-10-01' = {
   name: 'pe-vault-${keyVaultName}'
-  location: resourceGroup().location
+  location: location
   properties: {
     subnet: {
       id: peSubnetId
@@ -756,10 +845,35 @@ resource keyVaultPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-10-01'
   }
 }
 
+// Diagnostic Settings for Key Vault
+resource keyVaultDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
+  name: 'diag-${keyVaultName}'
+  scope: keyVault
+  properties: {
+    workspaceId: logAnalyticsWorkspace.id
+    logs: [
+      {
+        category: 'AuditEvent'
+        enabled: true
+      }
+      {
+        category: 'AzurePolicyEvaluationDetails'
+        enabled: true
+      }
+    ]
+    metrics: [
+      {
+        category: 'AllMetrics'
+        enabled: true
+      }
+    ]
+  }
+}
+
 // Event Grid System Topic for the KeyVault
 resource keyVaultEventGridSystemTopic 'Microsoft.EventGrid/systemTopics@2025-02-15' = {
   name: 'egst-${keyVaultName}'
-  location: resourceGroup().location
+  location: location
   identity: {
     type: 'SystemAssigned'
   }
@@ -796,6 +910,23 @@ resource keyVaultEventGridSubscription 'Microsoft.EventGrid/systemTopics/eventSu
       eventTimeToLiveInMinutes: 1440 // 1 day
     }
   }
+}
+
+// Azure Monitor Workbook for Certificate Statistics
+resource workbookCertLCStats 'Microsoft.Insights/workbooks@2023-06-01' = {
+  name: guid(resourceGroup().id, 'certlcstats')
+  location: location
+  kind: 'shared'
+  properties: {
+    displayName: 'certlcstats'
+    serializedData: '{"version":"Notebook/1.0","items":[],"styleSettings":{},"$schema":"https://github.com/Microsoft/Application-Insights-Workbooks/blob/master/schema/workbook.json"}'
+    category: 'workbook'
+    sourceId: logAnalyticsWorkspace.id
+  }
+  dependsOn: [
+    applicationInsights  // Wait for App Insights to ensure workspace is fully active
+  ]
+  tags: commonTags
 }
 
 // Role Assignment: Grant the Event Grid System Topic the "Storage Queue Data Reader" role on the Storage Account
@@ -987,28 +1118,14 @@ resource functionAppMonitoringMetricsPublisher 'Microsoft.Authorization/roleAssi
   }
 }
 
-// Outputs
+// Output all resource IDs and important properties
+output storageAccountId string = storageAccount.id
+output storageAccountQueueUri string = storageAccount.properties.primaryEndpoints.queue
+output automationAccountId string = automationAccount.id
+output keyVaultId string = keyVault.id
+output functionAppId string = functionApp.id
 output logAnalyticsWorkspaceId string = logAnalyticsWorkspace.id
-output customTableName string = customTable.name
-output dataCollectionRuleId string = dataCollectionRule.id
+output applicationInsightsId string = applicationInsights.id
+output dceIngestionEndpoint string = dataCollectionEndpoint.properties.logsIngestion.endpoint
+@secure()
 output dataCollectionRuleImmutableId string = dataCollectionRule.properties.immutableId
-output dataCollectionEndpointId string = dataCollectionEndpoint.id
-output keyVaultName string = keyVault.name
-output automationAccountName string = automationAccount.name
-output functionAppName string = functionApp.name
-
-// Role Assignment GUID Mappings (for troubleshooting)
-output roleAssignmentGuids object = {
-  eventGridToStorageQueueDataReader: eventGridStorageQueueDataReader.name
-  eventGridToStorageQueueDataMessageSender: eventGridStorageQueueDataMessageSender.name
-  automationAccountToKeyVaultCertificatesOfficer: automationAccountKeyVaultCertificatesOfficer.name
-  automationAccountToKeyVaultSecretsOfficer: automationAccountKeyVaultSecretsOfficer.name
-  automationAccountToAutomationAccountReader: automationAccountReader.name
-  automationAccountToDCRMonitoringMetricsPublisher: automationAccountMonitoringMetricsPublisher.name
-  functionAppToStorageBlobDataOwner: functionAppStorageBlobDataOwner.name
-  functionAppToStorageQueueDataContributor: functionAppStorageQueueDataContributor.name
-  functionAppToStorageQueueDataMessageProcessor: functionAppStorageQueueDataMessageProcessor.name
-  functionAppToAutomationAccountReader: functionAppAutomationAccountReader.name
-  functionAppToAutomationOperator: functionAppAutomationOperator.name
-  functionAppToAppInsightsMonitoringMetricsPublisher: functionAppMonitoringMetricsPublisher.name
-}
