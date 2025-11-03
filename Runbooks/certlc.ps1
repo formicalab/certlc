@@ -97,8 +97,7 @@ For certificate revocation requests, the body has a structure like this:
     "VaultName": "<key vault name>",
     "ObjectType": "Certificate",
     "ObjectName": "<name of the new certificate>",
-    "RevocationReason": "1",  # see https://learn.microsoft.com/en-us/windows/win32/api/certadm/nf-certadm-icertadmin-revokecertificate for possible values
-    "NotifyTo": [ "<email address to notify>", "other email address", ... ]  # optional, email addresses to notify when the certificate is revoked
+    "RevocationReason": "1"  # see https://learn.microsoft.com/en-us/windows/win32/api/certadm/nf-certadm-icertadmin-revokecertificate for possible values
   }
 }
 
