@@ -52,6 +52,9 @@ param automationAccountName string
 @description('The name of the hybrid runbook worker group. On-premises workers must be registered to this group to execute certificate operations.')
 param hybridWorkerGroupName string
 
+@description('The name of the runbook to invoke for certificate lifecycle operations. Must match the runbook name deployed to the Automation Account.')
+param runbookName string
+
 @description('The name of the Key Vault to create. Must be globally unique, 3-24 characters, alphanumerics and hyphens. Stores and manages certificates with automated lifecycle tracking.')
 @minLength(3)
 @maxLength(24)
@@ -479,6 +482,8 @@ resource functionApp 'Microsoft.Web/sites@2024-11-01' = {
     name: 'appsettings'
     properties: {
       AutomationAccountName: automationAccount.name
+      HybridWorkerGroupName: hybridWorkerGroupName
+      RunbookName: runbookName
       ResourceGroupName: resourceGroup().name
       AzureWebJobsStorage__credential: 'managedidentity'
       AzureWebJobsStorage__blobServiceUri: storageAccount.properties.primaryEndpoints.blob
@@ -559,7 +564,7 @@ resource automationAccount 'Microsoft.Automation/automationAccounts@2024-10-23' 
     }
   }
   resource automationAccountVariablesPfxRootFolder 'variables@2024-10-23' = {
-    name: 'certlc-pfx-root-folder'
+    name: 'certlc-pfxrootfolder'
     properties: {
       value: '"${replace(automationAccountVarPfxRootFolder, '\\', '\\\\')}"'
       isEncrypted: true

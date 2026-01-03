@@ -11,17 +11,17 @@
   vault name, certificate template, subject, DNS names, and the user or group to protect the PFX file to.
 
 .EXAMPLE
-  .\testnewcert.ps1 -UseQueue -StorageAccountName "storageaccountname" -QueueName "queuename" -CertName "mycert" -VaultName "keyvaultname" -CertificateTemplate "WebServer" -PfxProtectTo @('domain\user') -Hostname "myhost"
+  .\testnewcert.ps1 -UseQueue -StorageAccountName "storageaccountname" -QueueName "queuename" -CertName "mycert" -VaultName "keyvaultname" -CertificateTemplate "WebServer" -Subject "CN=www.example.com" -CertificateDnsNames @('www.example.com', 'api.example.com') -PfxProtectTo @('domain\user') -Hostname "myhost"
 
   Send a new certificate request to Azure Storage Queue
 
 .EXAMPLE
-  .\testnewcert.ps1 -UseWebhook -AutomationWebhookUrl "https://70cf67fa-9b4f-4a13-....webhook.ne.azure-automation.net/webhooks?token=pr3..." -CertName "mycert" -VaultName "keyvaultname" -CertificateTemplate "WebServer" -PfxProtectTo @('domain\user') -Hostname "myhost"
+  .\testnewcert.ps1 -UseWebhook -AutomationWebhookUrl "https://70cf67fa-9b4f-4a13-....webhook.ne.azure-automation.net/webhooks?token=pr3..." -CertName "mycert" -VaultName "keyvaultname" -CertificateTemplate "WebServer" -Subject "CN=www.example.com" -CertificateDnsNames @('www.example.com', 'api.example.com') -PfxProtectTo @('domain\user') -Hostname "myhost"
 
   Invoke Azure Automation Runbook via webhook
 
 .EXAMPLE
-  .\testnewcert.ps1  -UseDirectRunbookInvocation -AutomationAccountName "aa-shared-neu-001" -AutomationAccountRGName "rg-shared-neu-001" -HybridWorkerGroupName "workergroup001" -RunbookName "certlc" -CertName "mycert" -VaultName "keyvaultname" -CertificateTemplate "WebServer" -PfxProtectTo @('domain\user')
+  .\testnewcert.ps1  -UseDirectRunbookInvocation -AutomationAccountName "aa-shared-neu-001" -AutomationAccountRGName "rg-shared-neu-001" -HybridWorkerGroupName "workergroup001" -RunbookName "certlc" -CertName "mycert" -VaultName "keyvaultname" -CertificateTemplate "WebServer" -Subject "CN=www.example.com" -CertificateDnsNames @('www.example.com', 'api.example.com') -PfxProtectTo @('domain\user')
   
   Directly start the runbook on a hybrid worker group
 
