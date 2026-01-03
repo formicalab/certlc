@@ -25,5 +25,5 @@ param automationAccountVarCA = 'flazdc03.lab.formicalab.casa\\SubCA' // Name of 
 param automationAccountVarPfxRootFolder = 'C:\\PFX_Repo' // Name of the folder to use (for the automation account variable)
 param automationAccountVarSmtpFrom = 'certlc@formicalab.casa' // SMTP From address to use (for the automation account variable)
 param automationAccountVarSmtpServer = 'mail.smtp2go.com' // SMTP Server to use (for the automation account variable)
-param automationAccountVarSmtpUser = 'certlc@formicalab.casa' // SMTP User to use (for the automation account variable)
-param automationAccountVarSmtpPassword = 'Anakin$$2022' // SMTP Password to use (for the automation account variable)
+param automationAccountVarSmtpUser = 'certlc' // SMTP User to use (for the automation account variable)
+param automationAccountVarSmtpPassword = '<pasword>' // SMTP Password to use (for the automation account variable)
