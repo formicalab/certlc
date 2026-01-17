@@ -96,7 +96,7 @@ For certificate revocation requests, the body has a structure like this:
     "Id": "<request id, free field>",
     "VaultName": "<key vault name>",
     "ObjectType": "Certificate",
-    "ObjectName": "<name of the new certificate>",
+    "CertificateThumbprint": "<certificate thumbprint>",
     "RevocationReason": "1"  # see https://learn.microsoft.com/en-us/windows/win32/api/certadm/nf-certadm-icertadmin-revokecertificate for possible values
   }
 }
@@ -1149,6 +1149,125 @@ function New-CertificateCreationRequest {
 
 #endregion
 
+#region ### Get-CertificateByThumbprint ###
+
+############################################
+# FUNCTIONS - Get-CertificateByThumbprint  #
+############################################
+
+<#
+
+.SYNOPSIS
+    Finds a certificate in Azure Key Vault by thumbprint and returns its name.
+
+.DESCRIPTION
+    This function searches for a certificate in the specified Azure Key Vault using the
+    Key Vault REST API. Given a thumbprint, it enumerates all certificates (with pagination)
+    and returns the certificate name if found, or $null if not found.
+
+.PARAMETER VaultName
+    The name of the Azure Key Vault to query.
+
+.PARAMETER Thumbprint
+    The thumbprint of the certificate to find (hex format).
+
+.OUTPUTS
+    String - The name of the certificate in the vault, or $null if not found.
+
+.EXAMPLE
+    $certName = Get-CertificateByThumbprint -VaultName "mykeyvault" -Thumbprint "7CB8B52E7BA87B221534BB9B04A7FFF2D3FA59BA"
+    if ($certName) { Write-Host "Found: $certName" }
+
+.NOTES
+    Uses Key Vault REST API version 2025-07-01.
+    Requires an active Azure context with appropriate Key Vault permissions.
+
+#>
+
+function Get-CertificateByThumbprint {
+    [OutputType([string])]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$VaultName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Thumbprint
+    )
+
+    # Normalize the input thumbprint (remove spaces, dashes, colons; convert to uppercase)
+    $normalizedThumbprint = ($Thumbprint -replace '[^a-fA-F0-9]', '').ToUpper()
+    
+    if ([string]::IsNullOrEmpty($normalizedThumbprint)) {
+        throw [System.ArgumentException]::new('Get-CertificateByThumbprint: Thumbprint is empty after normalization.', 'Thumbprint')
+    }
+
+    # Helper: Convert base64url thumbprint to hex
+    $convertToHex = {
+        param([string]$base64Url)
+        $base64 = $base64Url.Replace('-', '+').Replace('_', '/')
+        switch ($base64.Length % 4) {
+            2 { $base64 += '==' }
+            3 { $base64 += '=' }
+        }
+        $bytes = [Convert]::FromBase64String($base64)
+        return ($bytes | ForEach-Object { $_.ToString('X2') }) -join ''
+    }
+
+    # Helper: Invoke Key Vault REST API
+    $invokeApi = {
+        param([string]$uri)
+        $tokenResult = Get-AzAccessToken -ResourceTypeName KeyVault -AsSecureString
+        $accessToken = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR(
+            [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($tokenResult.Token)
+        )
+        $headers = @{
+            'Authorization' = "Bearer $accessToken"
+            'Content-Type'  = 'application/json'
+        }
+        return Invoke-RestMethod -Uri $uri -Method GET -Headers $headers
+    }
+
+    # Build the base URI
+    $vaultBaseUrl = "https://$VaultName.vault.azure.net"
+    $apiVersion = "2025-07-01"
+    $uri = "$vaultBaseUrl/certificates?api-version=$apiVersion"
+
+    # Search for the certificate with matching thumbprint (handling pagination)
+    $foundCertName = $null
+    
+    try {
+        :searchLoop do {
+            $response = & $invokeApi $uri
+            
+            if ($response.value) {
+                foreach ($cert in $response.value) {
+                    if ($cert.x5t) {
+                        $certThumbprint = & $convertToHex $cert.x5t
+                        
+                        if ($certThumbprint -eq $normalizedThumbprint) {
+                            # Extract certificate name from the ID URL
+                            $foundCertName = ($cert.id -split '/certificates/')[-1]
+                            break searchLoop
+                        }
+                    }
+                }
+            }
+            
+            # Check for pagination
+            $uri = $response.nextLink
+            
+        } while ($uri)
+    }
+    catch {
+        throw [System.Exception]::new("Get-CertificateByThumbprint: Failed to enumerate certificates in vault '$VaultName'.", $_.Exception)
+    }
+
+    return $foundCertName
+}
+
+#endregion
+
 #region ### New-CertificateRevocationRequest ###
 
 ################################################
@@ -1726,7 +1845,7 @@ switch ($requestBody.type) {
 
         # get required parameters
         $VaultName = $requestBody.data.VaultName
-        $CertificateName = $requestBody.data.ObjectName
+        $CertificateThumbprint = $requestBody.data.CertificateThumbprint
         $RevocationReasonString = $requestBody.data.RevocationReason
 
         # VaultName: presence and non-empty check
@@ -1734,9 +1853,9 @@ switch ($requestBody.type) {
             Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "Missing or empty mandatory string parameter: 'data.VaultName' in request body!"
         }
 
-        # CertificateName: presence and non-empty check
-        if ([string]::IsNullOrEmpty($CertificateName)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "Missing or empty mandatory string parameter: 'data.ObjectName' in request body!"
+        # CertificateThumbprint: presence and non-empty check
+        if ([string]::IsNullOrEmpty($CertificateThumbprint)) {
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "Missing or empty mandatory string parameter: 'data.CertificateThumbprint' in request body!"
         }
 
         # RevocationReason: presence and integer check
@@ -1763,8 +1882,21 @@ switch ($requestBody.type) {
 
         if ($RevocationReason -notin 0, 1, 2, 3, 4, 5, 6) { Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "Revocation request validation: Invalid integer value for 'data.RevocationReason'. Supported: 0-6." }
 
-        # before processing the request, we need to obtain the other certificate details
-        Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Getting additional certificate details for $CertificateName from key vault $VaultName..."
+        # before processing the request, we need to find the certificate by thumbprint
+        Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Searching for certificate with thumbprint $CertificateThumbprint in key vault $VaultName..."
+        $CertificateName = $null
+        try {
+            $CertificateName = Get-CertificateByThumbprint -VaultName $VaultName -Thumbprint $CertificateThumbprint
+        }
+        catch {
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "Error finding certificate with thumbprint $CertificateThumbprint in vault $VaultName" -Inner $_.Exception
+        }
+        if ($null -eq $CertificateName) {
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "No certificate found with thumbprint $CertificateThumbprint in vault $VaultName."
+        }
+        Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Found certificate '$CertificateName' matching thumbprint $CertificateThumbprint in vault $VaultName."
+
+        # Get the full certificate object to retrieve tags
         $cert = $null
         try {
             $cert = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName
@@ -1773,7 +1905,7 @@ switch ($requestBody.type) {
             Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "Error getting certificate details for $CertificateName from vault $VaultName" -Inner $_.Exception
         }
         if ($null -eq $cert) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "Error getting certificate details for $CertificateName from vault $($VaultName): empty response! Certificate may not exist in the vault."
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "Error getting certificate details for $CertificateName from vault $($VaultName): empty response!"
         }
 
         # get NotifyTo from the certificate tags (optional)
@@ -1789,7 +1921,7 @@ switch ($requestBody.type) {
 
         # end of validation. Now process the certificate revocation request
 
-        Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Performing certificate revocation request for certificate $CertificateName using vault $VaultName with reason $RevocationReason..."
+        Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Performing certificate revocation request for certificate $CertificateName in vault $VaultName with reason $RevocationReason..."
         try {
             New-CertificateRevocationRequest -VaultName $VaultName -CertificateName $CertificateName -RevocationReason $RevocationReason
         }
