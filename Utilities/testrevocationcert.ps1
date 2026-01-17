@@ -11,17 +11,17 @@
   vault name, revocation reason, and other relevant details.
 
 .EXAMPLE
-  .\testrevocationcert.ps1 -UseQueue -StorageAccountName "storageaccountname" -QueueName "queuename" -CertName "mycert" -VaultName "keyvaultname" -RevocationReason 4
+  .\testrevocationcert.ps1 -UseQueue -StorageAccountName "storageaccountname" -QueueName "queuename" -CertificateThumbprint "A1B2C3D4E5F6..." -VaultName "keyvaultname" -RevocationReason 4
 
   Send a certificate revocation request to Azure Storage Queue. 4 = CRL_REASON_SUPERSEDED (see https://learn.microsoft.com/en-us/windows/win32/api/certadm/nf-certadm-icertadmin-revokecertificate)
 
 .EXAMPLE
-  .\testrevocationcert.ps1 -UseWebhook -AutomationWebhookUrl "https://70cf67fa-9b4f-4a13-....webhook.ne.azure-automation.net/webhooks?token=pr3..." -CertName "mycert" -VaultName "keyvaultname" -RevocationReason 4
+  .\testrevocationcert.ps1 -UseWebhook -AutomationWebhookUrl "https://70cf67fa-9b4f-4a13-....webhook.ne.azure-automation.net/webhooks?token=pr3..." -CertificateThumbprint "A1B2C3D4E5F6..." -VaultName "keyvaultname" -RevocationReason 4
 
   Invoke Azure Automation Runbook via webhook
 
 .EXAMPLE
-  .\testrevocationcert.ps1  -UseDirectRunbookInvocation -AutomationAccountName "aa-shared-neu-001" -AutomationAccountRGName "rg-shared-neu-001" -HybridWorkerGroupName "workergroup001" -RunbookName "certlc" -CertName "mycert" -VaultName "keyvaultname" -RevocationReason 4
+  .\testrevocationcert.ps1  -UseDirectRunbookInvocation -AutomationAccountName "aa-shared-neu-001" -AutomationAccountRGName "rg-shared-neu-001" -HybridWorkerGroupName "workergroup001" -RunbookName "certlc" -CertificateThumbprint "A1B2C3D4E5F6..." -VaultName "keyvaultname" -RevocationReason 4
   
   Directly start the runbook on a hybrid worker group
 
@@ -66,7 +66,7 @@ param (
   [Parameter(Mandatory = $true, ParameterSetName = 'Queue')]
   [Parameter(Mandatory = $true, ParameterSetName = 'Webhook')]
   [Parameter(Mandatory = $true, ParameterSetName = 'Direct')]
-  [string] $CertName,
+  [string] $CertificateThumbprint,
 
   [Parameter(Mandatory = $true, ParameterSetName = 'Queue')]
   [Parameter(Mandatory = $true, ParameterSetName = 'Webhook')]
@@ -79,21 +79,21 @@ Set-StrictMode -Version 1.0
 
 <#
 
-Define the JSON message for new certificate request.
-For new certificate requests, the body has a structure like this:
+Define the JSON message for certificate revocation request.
+For certificate revocation requests, the body has a structure like this:
 
 {
   "id": "<event identifier, free field>",
   "source": "<free field, can be used to identify the requestor>",
   "specversion": "1.0",
   "type": "CertLC.CertificateRevocationRequest",
-  "subject": "<name of the new certificate>",
+  "subject": "<certificate thumbprint>",
   "time": "<event time, using format: 2025-06-08T19:52:25.1524887Z>",
   "data": {
     "Id": "<request id, free field>",
     "VaultName": "<key vault name>",
     "ObjectType": "Certificate",
-    "ObjectName": "<name of the new certificate>",
+    "CertificateThumbprint": "<certificate thumbprint>",
     "RevocationReason": "<reason code>"
   }
 }
@@ -105,14 +105,14 @@ $data = [ordered]@{
   source      = 'testrevocationcert.ps1'
   specversion = '1.0'
   type        = 'CertLC.CertificateRevocationRequest'
-  subject     = $certName
+  subject     = $CertificateThumbprint
   time        = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ss.fffffffZ' -AsUTC)
   data        = [ordered]@{
-    Id               = 'Ticket01'
-    VaultName        = $vaultName
-    ObjectType       = 'Certificate'
-    ObjectName       = $certName
-    RevocationReason = $RevocationReason
+    Id                    = 'Ticket01'
+    VaultName             = $vaultName
+    ObjectType            = 'Certificate'
+    CertificateThumbprint = $CertificateThumbprint
+    RevocationReason      = $RevocationReason
   }
 }
 

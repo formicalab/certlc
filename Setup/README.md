@@ -1,7 +1,8 @@
-# Certificate Lifecycle Management (CertLC)
-## Setup
+# CertLC Setup Guide
 
 This directory contains the Bicep infrastructure-as-code templates for deploying all Azure resources required by the CertLC solution.
+
+For a complete solution overview, architecture, and feature description, see the [main README](../README.md).
 
 ## Prerequisites
 
@@ -300,6 +301,43 @@ The solution follows a secure-by-default architecture:
 - Automation Account variables for sensitive data are encrypted
 - Key Vault uses RBAC authorization and soft delete protection
 - Diagnostic settings enabled on critical resources (Automation Account, Key Vault) for audit logging
+
+## RBAC Role Assignments
+
+The Bicep template automatically creates 12 role assignments for the managed identities. Additionally, one manual ACL configuration is required on the Enterprise CA.
+
+### Automation Account Managed Identity
+
+| Role | Scope | Purpose |
+|------|-------|---------|
+| Key Vault Certificates Officer | Key Vault | Create and manage certificates in Key Vault |
+| Key Vault Secrets Officer | Key Vault | Export certificates as PFX (access to private keys) |
+| Reader | Automation Account (self) | Allow hybrid worker to read automation account variables |
+| Monitoring Metrics Publisher | Data Collection Rule | Publish certificate statistics to custom Log Analytics table |
+
+### Function App Managed Identity
+
+| Role | Scope | Purpose |
+|------|-------|---------|
+| Storage Blob Data Owner | Storage Account | Function runtime storage operations |
+| Storage Queue Data Contributor | Storage Account | Function's queue binding operations |
+| Storage Queue Data Message Processor | Storage Account | Process and delete queue messages |
+| Reader | Automation Account | Read automation account information |
+| Automation Operator | Automation Account | Start and monitor runbook jobs |
+| Monitoring Metrics Publisher | Application Insights | Function telemetry and monitoring |
+
+### Event Grid System Topic Managed Identity
+
+| Role | Scope | Purpose |
+|------|-------|---------|
+| Storage Queue Data Reader | Storage Account | Read queue metadata for event delivery |
+| Storage Queue Data Message Sender | Storage Account | Send certificate expiry events to queue |
+
+### Manual Configuration (On-Premises)
+
+| Principal | Permission | Scope | Purpose |
+|-----------|------------|-------|---------|
+| Hybrid Worker(s) AD computer account | Enroll (ACL) | CA certificate templates | Allow certificate requests using the configured templates |
 
 ## Files
 

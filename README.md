@@ -1,139 +1,213 @@
 # Certificate Lifecycle Management (CertLC)
 
-CertLC is a solution designed to fully automate X.509 certificate lifecycle operations on Azure-connected environments, integrating a Key Vault with a traditional Active Directory Enterprise CA.
+An automated certificate lifecycle management solution for Azure environments that integrates Azure Key Vault with an on-premises Enterprise Certificate Authority (CA) to handle certificate creation, renewal, revocation, and monitoring.
 
-* **Creation**
-  * Creates new certificates on demand.
-  * All private keys are generated and stored inside the target Key Vault.  
-  * All certificates are signed by the Enterprise CA and safely stored in Key Vault
-  * The resulting certificates are also made available inside a secured per-user/per-group folder as protected PFXs (user or group protection - no passwords used) for operator to pick up and install.
+## Overview
 
-* **Renewal**
-  * The key vault emits `Microsoft.KeyVault.CertificateNearExpiry` events for certificates near expiration. The event is used to trigger the automatic renewal process.
-  * An Event Grid System Topic is used to send `Microsoft.KeyVault.CertificateNearExpiry` events to a storage queue
-  * a Function App with queue bindings is used to get the events and forward them to Automation Account, triggering the execution of the renewal with the **certlc** runbook
-  * A new certificate version is stored in Key Vault and exported as new PFX
+CertLC provides end-to-end automation for managing certificates stored in Azure Key Vault when the issuing authority is an on-premises Windows Enterprise CA. The solution uses an event-driven architecture to respond to certificate lifecycle events and execute the appropriate operations.
 
-* **Revocation**
-  * Revokes the certificate in the CA and deletes it from the key vault
+### Key Features
 
-* **Statistics Collection**
-  * The **certlcstats** runbook collects certificate statistics from Key Vault and publishes them to a Log Analytics custom table
-  * Can run on-demand or on an hourly schedule for continuous monitoring
-  * Statistics include certificate thumbprint, name, creation/expiration dates, subject, template, and DNS names
+- **Certificate Creation**: Automatically request and issue new certificates from the Enterprise CA based on queue messages
+- **Certificate Renewal**: Proactively renew certificates approaching expiration using Event Grid notifications
+- **Certificate Revocation**: Revoke certificates on demand using the certificate thumbprint
+- **Statistics Collection**: Gather and store certificate metadata in Log Analytics for monitoring and reporting 
 
-* **Runbook and Hybrid Worker Execution**  
-  * The **certlc** runbook manages all certificate requests to the Enterprise CA and Key Vault operations
-  * The **certlcstats** runbook collects and publishes certificate statistics for monitoring
-  * All runbook execution is performed by **Azure Automation Hybrid Workers** able to orchestrate operations towards the CA and Key Vault
+## Architecture
 
-* **Security**  
-  * All PaaS resources can have their public endpoint disabled - Private Endpoints are used for all communications 
-  * No AD service accounts are used: all permissions are assigned to computer accounts and to the system-assigned managed identities of the PaaS resources 
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                                    Azure                                        │
+│  ┌────────────┐    ┌─────────────┐    ┌──────────────┐    ┌──────────────────┐  │
+│  │ Event Grid │───►│   Storage   │───►│ Function App │───►│ Automation       │  │
+│  │ (KeyVault  │    │   Queue     │    │ (PowerShell) │    │ Account          │  │
+│  │  events)   │    │             │    │              │    │ (Hybrid Worker)  │  │
+│  └────────────┘    └─────────────┘    └──────────────┘    └────────┬─────────┘  │
+│                                                                     │           │
+│  ┌────────────┐                       ┌──────────────┐              │           │
+│  │ Key Vault  │◄──────────────────────│ Certificate  │◄─────────────┘           │
+│  │            │                       │ Operations   │                          │
+│  └────────────┘                       └──────────────┘                          │
+│                                                                                 │
+│  ┌────────────┐    ┌─────────────┐                                              │
+│  │    Log     │◄───│    DCR      │    Certificate statistics collection        │
+│  │ Analytics  │    │             │                                              │
+│  └────────────┘    └─────────────┘                                              │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                            │
+                                            │ Hybrid Worker
+                                            ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              On-Premises                                        │
+│  ┌───────────────────────────────────┐                                          │
+│  │    Enterprise Certificate         │    Certificate enrollment, renewal,     │
+│  │    Authority (Windows CA)         │    and revocation via CEP/CES           │
+│  └───────────────────────────────────┘                                          │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
 
-## Architecture Highlights
+### Architecture Highlights
 
-- **Event-Driven**: Certificate expiry events flow from Key Vault → Event Grid → Storage Queue → Function App → Automation Account runbook
-- **Hybrid Execution**: Runbooks execute on on-premises hybrid workers with direct access to Enterprise CA
-- **Observability**: Comprehensive logging with Application Insights, Log Analytics, diagnostic settings, and custom tables for certificate statistics
-- **Monitoring**: Azure Monitor workbook provides visualization of certificate lifecycle and statistics
-- **Automation**: Optional hourly schedule for proactive certificate statistics collection
-- **Secure by Default**: All PaaS resources use private endpoints, managed identities for authentication, and RBAC for authorization
+- **Event-Driven Processing**: Event Grid captures Key Vault certificate events (e.g., near-expiry) and routes them to a Storage Queue
+- **Serverless Compute**: Azure Function App (Flex Consumption) processes queue messages and triggers Automation runbooks
+- **Hybrid Execution**: Automation Account with Hybrid Worker enables secure communication with on-premises Enterprise CA
+- **Private Networking**: All Azure PaaS resources are secured with private endpoints
+- **Managed Identities**: No stored credentials - all Azure-to-Azure authentication uses system-assigned managed identities
+- **Observability**: Application Insights for function monitoring, Log Analytics for certificate statistics and audit logs
+
+## How It Works
+
+### Certificate Creation Flow
+
+1. An external system or utility script sends a certificate request message to the Storage Queue
+2. The Function App receives the message and triggers the `certlc` runbook via webhook
+3. The runbook executes on the Hybrid Worker with access to the Enterprise CA
+4. A certificate signing request (CSR) is submitted to the CA using CEP/CES protocols
+5. The issued certificate is imported into Azure Key Vault
+
+### Certificate Renewal Flow
+
+1. Azure Key Vault raises a `CertificateNearExpiry` event when a certificate approaches expiration
+2. Event Grid captures the event and delivers it to the Storage Queue
+3. The Function App triggers the renewal process through the Automation runbook
+4. The Hybrid Worker requests a renewed certificate from the Enterprise CA
+5. The renewed certificate replaces the expiring one in Key Vault
+
+### Certificate Revocation Flow
+
+1. A revocation request with the certificate thumbprint is sent to the Storage Queue
+2. The Function App triggers the `certlc` runbook
+3. The runbook locates the certificate by thumbprint and submits a revocation request to the CA
+4. The certificate is removed from Key Vault after successful revocation
+
+### Statistics Collection
+
+1. The `certlcstats` runbook runs on a schedule (hourly by default)
+2. It enumerates all certificates in Key Vault and collects metadata
+3. Certificate data is published to a custom Log Analytics table via Data Collection Rule
+4. Azure Monitor Workbooks can visualize certificate inventory and expiration timelines
 
 ## Repository Structure
 
 ```
-Setup/
-  certlc.bicep              # Main Bicep infrastructure template
-  parameters.dev.bicepparam # Bicep parameters file
-  README.md                 # Detailed setup and deployment documentation
-Runbooks/
-  certlc.ps1                # Main runbook with certificate lifecycle logic
-  certlcstats.ps1           # Statistics collection runbook for Log Analytics custom table
-Functions/
-  CertLCBridge/             # Function App code (PowerShell 7.4)
-LogAnalytics/
-  customtable/              # Manual custom table setup (only needed if not using Bicep deployment)
-Workbooks/
-  certlc.workbook           # Azure Monitor workbook for certificate monitoring
-Utilities/
-  testnewcert.ps1           # Test script for new certificate enrollment
-  testrenewcert.ps1         # Test script for certificate renewal
-  testrevocationcert.ps1    # Test script for certificate revocation
+CertLC/
+├── README.md                    # This file - Solution overview
+├── Setup/                       # Infrastructure deployment
+│   ├── certlc.bicep            # Main Bicep template
+│   ├── parameters.dev.bicepparam
+│   └── README.md               # Deployment instructions
+├── Functions/                   # Azure Function App code
+│   └── CertLCBridge/           # PowerShell function for queue processing
+│       ├── QueueHandler/       # Queue trigger function
+│       └── OutboundTester/     # HTTP trigger for testing connectivity
+├── Runbooks/                    # Automation runbooks
+│   ├── certlc.ps1              # Main certificate operations runbook
+│   ├── certlcstats.ps1         # Certificate statistics collection
+│   ├── normalnotification.html # Email template for successful operations
+│   └── errornotification.html  # Email template for failures
+├── LogAnalytics/               # Custom table configuration
+│   └── customTable/            # Schema and transformation for certlc_CL table
+├── Workbooks/                  # Azure Monitor workbooks
+│   ├── certlc.workbook         # Certificate statistics dashboard
+│   └── *.kql                   # KQL queries for visualizations
+├── Utilities/                  # Helper scripts
+│   ├── testnewcert.ps1         # Test certificate creation
+│   ├── testrenewcert.ps1       # Test certificate renewal
+│   └── testrevocationcert.ps1  # Test certificate revocation
+└── Tests/                      # Development and testing scripts
 ```
 
-## Setup
+## Components
 
-The solution infrastructure is deployed using **Azure Bicep** templates located in the `Setup/` folder. The Bicep template automates the creation of all required Azure resources with secure defaults.
+### Azure Function App (CertLCBridge)
 
-### Quick Start
+PowerShell-based Azure Function that bridges the Storage Queue with the Automation Account:
+- **QueueHandler**: Triggered by queue messages, parses the request payload, and invokes the appropriate Automation runbook
+- **OutboundTester**: HTTP-triggered function for testing network connectivity from the Function App
 
-1. Review the detailed setup documentation in [`Setup/README.md`](Setup/README.md)
-2. Configure the parameters in `Setup/parameters.dev.bicepparam`
-3. Deploy using Azure CLI:
-   ```powershell
-   az deployment group create `
-     --resource-group <your-resource-group> `
-     --parameters .\Setup\parameters.dev.bicepparam
-   ```
+### Automation Runbooks
 
-### What Gets Deployed
+- **certlc.ps1**: Main runbook handling certificate creation, renewal, and revocation operations. Executes on Hybrid Workers with CA access.
+- **certlcstats.ps1**: Scheduled runbook that collects certificate metadata from Key Vault and publishes to Log Analytics.
 
-The Bicep template automatically creates and configures:
-- **Storage Account** with `certlc` queue (LRS, private endpoints)
-- **Key Vault** (RBAC mode, soft delete, private endpoint)
-- **Automation Account** with PowerShell 7.2 runtime, placeholder runbooks, encrypted variables, hybrid worker group
-- **Log Analytics Workspace** with custom table (`certlc_CL`) for certificate statistics
-- **Application Insights** for monitoring and diagnostics
-- **Function App** on Flex Consumption plan (PowerShell 7.4, VNet integration)
-- **Data Collection Endpoint/Rule** for custom logs ingestion
-- **Event Grid System Topic** and subscription for certificate expiry events
-- **Azure Monitor Workbook** for certificate visualization
-- **6 Private Endpoints** with DNS zone integration (Blob, Queue, Function, Automation Webhook, Automation DSC, Key Vault)
-- **12 RBAC role assignments** for managed identities
-- **Diagnostic settings** for Automation Account and Key Vault
+### Certificate Request Schema
 
-### Post-Deployment
+Requests are sent as JSON messages to the Storage Queue using CloudEventSchema. The schema varies by operation type:
 
-After infrastructure deployment, complete these steps:
-1. **Register hybrid worker(s)** to the hybrid worker group
-2. **Upload runbook code** (`certlc.ps1` and `certlcstats.ps1`) to the Automation Account, directly from Azure Portal
-3. **Deploy Function App code** using Azure Functions Core Tools:
+**Creation Request:**
+```json
+{
+  "id": "<event identifier, free field>",
+  "source": "<free field, can be used to identify the requestor>",
+  "specversion": "1.0",
+  "type": "CertLC.NewCertificateRequest",
+  "subject": "<name of the new certificate>",
+  "time": "<event time, using format: 2025-06-08T19:52:25.1524887Z>",
+  "data": {
+    "Id": "<request id, free field>",
+    "VaultName": "<key vault name>",
+    "ObjectType": "Certificate",
+    "ObjectName": "<name of the new certificate>",
+    "CertificateTemplate": "<certificate template name>",
+    "CertificateSubject": "<certificate subject>",
+    "CertificateDnsNames": [ "<dns name 1>", "<dns name 2>" ],
+    "Hostname": "<hostname - used as folder name for exported PFX>",
+    "PfxProtectTo": [ "<user or group to protect the PFX file>" ],
+    "NotifyTo": [ "<email address to notify>" ]
+  }
+}
+```
 
-   - Install [Azure Functions Core Tools](https://learn.microsoft.com/en-us/azure/azure-functions/functions-run-local?tabs=windows%2Cisolated-process%2Cnode-v4%2Cpython-v2%2Chttp-trigger%2Ccontainer-apps&pivots=programming-language-powershell#install-the-azure-functions-core-tools) if needed
-   - Go to the `Functions/CertLCBridge` directory and execute:
+**Renewal Request** (from Event Grid CertificateNearExpiry event):
+```json
+{
+  "id": "<event identifier>",
+  "source": "/subscriptions/<subscriptionid>/resourceGroups/<rg>/providers/Microsoft.KeyVault/<vault>",
+  "specversion": "1.0",
+  "type": "Microsoft.KeyVault.CertificateNearExpiry",
+  "subject": "<name of the expiring certificate>",
+  "time": "<event time, using format: 2025-06-08T19:52:25.1524887Z>",
+  "data": {
+    "Id": "https://<key vault name>.vault.azure.net/certificates/<certificate name>/<version>",
+    "VaultName": "<key vault name>",
+    "ObjectType": "Certificate",
+    "ObjectName": "<certificate name>",
+    "Version": "<certificate version>",
+    "NBF": 1749411621,
+    "EXP": 1749418821
+  }
+}
+```
 
-      ```powershell
-      # From the Functions/CertLCBridge folder:
-      func azure functionapp publish <functionappname>
-      ```
+**Revocation Request:**
+```json
+{
+  "id": "<event identifier, free field>",
+  "source": "<free field, can be used to identify the requestor>",
+  "specversion": "1.0",
+  "type": "CertLC.CertificateRevocationRequest",
+  "subject": "<name of the certificate>",
+  "time": "<event time, using format: 2025-06-08T19:52:25.1524887Z>",
+  "data": {
+    "Id": "<request id, free field>",
+    "VaultName": "<key vault name>",
+    "ObjectType": "Certificate",
+    "CertificateThumbprint": "<certificate thumbprint>",
+    "RevocationReason": "1"
+  }
+}
+```
 
-4. **Upload workbook code** to the Azure Monitor Workbook created by the Bicep deployment (edit the workbook in Advanced Editor mode and paste the content from `Workbooks/certlc.workbook`)
-5. **Grant CA template permissions** to hybrid worker computer accounts (Enroll permission on certificate templates)
-6. **(Optional) Enable hourly schedule** for certificate statistics collection
-7. **Test end-to-end** using utility scripts in `Utilities/` folder
+> **Note:** For revocation reasons, see [ICertAdmin::RevokeCertificate](https://learn.microsoft.com/en-us/windows/win32/api/certadm/nf-certadm-icertadmin-revokecertificate) for possible values.
 
-See [`Setup/README.md`](Setup/README.md) for complete prerequisites, RBAC requirements, detailed deployment steps, and troubleshooting.
+## Security Considerations
 
-Refer to inline comments in `certlc.ps1` for detailed documentation about request payloads and runbook behavior.
+- **No Stored Secrets**: All Azure service authentication uses managed identities
+- **Private Endpoints**: All PaaS resources are isolated from public internet
+- **RBAC Authorization**: Key Vault uses Azure RBAC (not access policies) with least-privilege assignments
+- **Encrypted Variables**: Sensitive automation variables (SMTP credentials) are stored encrypted
+- **Audit Logging**: Diagnostic settings enabled on Key Vault and Automation Account
 
-## Permissions
+## Getting Started
 
-The following RBAC role assignments are automatically created by the Bicep deployment (plus 1 manual ACL configuration on the CA):
-
-| Service Principal                        | RBAC Roles                           | Scope                  | Usage                                                                |
-|------------------------------------------|--------------------------------------|------------------------|----------------------------------------------------------------------|
-| Automation Account Managed Identity      | Key Vault Certificates Officer       | Key Vault              | Certificate requests                                                 |
-|                                          | Key Vault Secrets Officer            | Key Vault              | PFX Export                                                           |
-|                                          | Reader                               | Automation Account     | Runbook access to variables set on Automation Account                |
-|                                          | Monitoring Metrics Publisher         | DCR                    | Publish logs to the custom table                                     |
-| Function App Managed Identity            | Storage Blob Data Owner              | Storage Account        | Function runtime storage                                             |
-|                                          | Storage Queue Data Contributor       | Storage Account        | Function's binding to the queue                                      |
-|                                          | Storage Queue Data Message Processor | Storage Account        | Function's processing of queue messages                              |
-|                                          | Reader                               | Automation Account     | Read automation account information                                  |
-|                                          | Automation Operator                  | Automation Account     | Launch and monitor runbook jobs                                      |
-|                                          | Monitoring Metrics Publisher         | Application Insights   | Function telemetry and monitoring                                    |
-| Event Grid System Topic Managed Identity | Storage Queue Data Reader            | Storage Account        | Read queue metadata for event submission                             |
-|                                          | Storage Queue Data Message Sender    | Storage Account        | Send certificate expiry events to the queue                          |
-| Hybrid Worker(s) AD computer account     | Enroll (ACL)                         | CA's templates         | Allow certificate requests using the templates (manual configuration) |
-
+For deployment instructions, prerequisites, and configuration details, see the [Setup Guide](Setup/README.md).
