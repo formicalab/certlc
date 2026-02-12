@@ -101,7 +101,7 @@ For certificate revocation requests, the body has a structure like this:
 #>
 
 $data = [ordered]@{
-  id          = (New-Guid)
+  id          = (New-Guid).ToString()
   source      = 'testrevocationcert.ps1'
   specversion = '1.0'
   type        = 'CertLC.CertificateRevocationRequest'

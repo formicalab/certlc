@@ -131,7 +131,7 @@ For new certificate requests, the body has a structure like this:
 #>
 
 $data = [ordered]@{
-  id          = (New-Guid)
+  id          = (New-Guid).ToString()
   source      = 'testnewcert.ps1'
   specversion = '1.0'
   type        = 'CertLC.NewCertificateRequest'
