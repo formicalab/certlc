@@ -1518,11 +1518,24 @@ if ([string]::IsNullOrEmpty($jsonRequestBody)) {
 
         if ($WebhookData -match '"?RequestBody"?\s*:\s*((?:{([^{}]|(?<open>{)|(?<-open>}))*(?(open)(?!))})|(?:\[([^\[\]]|(?<open>\[)|(?<-open>\]))*(?(open)(?!))\]))') {
             $jsonRequestBody = $matches[1]
+            Write-CertLCLog -Section 'Dispatcher' -Message "Regex extracted RequestBody: $jsonRequestBody"
             try {
                 $RequestBody = ConvertFrom-Json -InputObject $jsonRequestBody -Depth 10
             }
             catch {
-                Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'Failed to parse WebhookData.RequestBody using regex' -Inner $_.Exception
+                # The extracted body may contain literal escape sequences (e.g. \r\n, \") from callers that
+                # double-serialized the JSON (sent an already-escaped string as the HTTP body).
+                # Try unescaping those sequences and parsing again before giving up.
+                Write-CertLCLog -Level Warning -Section 'Dispatcher' -Message "First parse attempt failed: $($_.Exception.Message). Attempting to unescape literal \r\n and \`" sequences and retry..."
+                $jsonRequestBody = $jsonRequestBody -replace '\\r\\n', "`r`n" -replace '\\"', '"'
+                Write-CertLCLog -Section 'Dispatcher' -Message "Unescaped RequestBody: $jsonRequestBody"
+                try {
+                    $RequestBody = ConvertFrom-Json -InputObject $jsonRequestBody -Depth 10
+                    Write-CertLCLog -Section 'Dispatcher' -Message 'Successfully parsed RequestBody after unescaping.'
+                }
+                catch {
+                    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'Failed to parse WebhookData.RequestBody using regex (even after unescaping)' -Inner $_.Exception
+                }
             }
         }
         else { Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'WebhookData.RequestBody not recognized using regex!' }
@@ -1562,6 +1575,13 @@ if ([string]::IsNullOrEmpty($requestBody.type)) {
 }
 else {
     Write-CertLCLog -Section 'Dispatcher' -Message "request type: $($requestBody.type)"
+}
+
+if ([string]::IsNullOrEmpty($requestBody.id)) {
+    Write-CertLCLog -Section 'Dispatcher' -Message "request id: (not provided)" -Level 'Warning'
+}
+else {
+    Write-CertLCLog -Section 'Dispatcher' -Message "request id: $($requestBody.id)"
 }
 
 # Process requests based on type
