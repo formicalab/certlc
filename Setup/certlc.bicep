@@ -279,6 +279,18 @@ resource dataCollectionEndpoint 'Microsoft.Insights/dataCollectionEndpoints@2024
   tags: commonTags
 }
 
+// Schema of the certlc_CL custom table data columns (shared between the LAW custom table and the DCR stream).
+// The LAW table additionally prepends a TimeGenerated column (the DCR computes it via transformKql).
+var certlcDataColumns = [
+  { name: 'Thumbprint', type: 'string' }
+  { name: 'Name',       type: 'string' }
+  { name: 'Created',    type: 'datetime' }
+  { name: 'Expires',    type: 'datetime' }
+  { name: 'Subject',    type: 'string' }
+  { name: 'Template',   type: 'string' }
+  { name: 'DNSNames',   type: 'string' }
+]
+
 // Custom Table for Certificate Statistics
 resource customTable 'Microsoft.OperationalInsights/workspaces/tables@2025-02-01' = {
   name: 'certlc_CL'
@@ -287,40 +299,10 @@ resource customTable 'Microsoft.OperationalInsights/workspaces/tables@2025-02-01
     retentionInDays: logAnalyticsRetentionInDays
     schema: {
       name: 'certlc_CL'
-      columns: [
-        {
-          name: 'TimeGenerated'
-          type: 'datetime'
-        }
-        {
-          name: 'Thumbprint'
-          type: 'string'
-        }
-        {
-          name: 'Name'
-          type: 'string'
-        }
-        {
-          name: 'Created'
-          type: 'datetime'
-        }
-        {
-          name: 'Expires'
-          type: 'datetime'
-        }
-        {
-          name: 'Subject'
-          type: 'string'
-        }
-        {
-          name: 'Template'
-          type: 'string'
-        }
-        {
-          name: 'DNSNames'
-          type: 'string'
-        }
-      ]
+      columns: concat(
+        [ { name: 'TimeGenerated', type: 'datetime' } ],
+        certlcDataColumns
+      )
     }
   }
 }
@@ -333,36 +315,7 @@ resource dataCollectionRule 'Microsoft.Insights/dataCollectionRules@2024-03-11' 
     dataCollectionEndpointId: dataCollectionEndpoint.id
     streamDeclarations: {
       'Custom-certlc_CL': {
-        columns: [
-          {
-            name: 'Thumbprint'
-            type: 'string'
-          }
-          {
-            name: 'Name'
-            type: 'string'
-          }
-          {
-            name: 'Created'
-            type: 'datetime'
-          }
-          {
-            name: 'Expires'
-            type: 'datetime'
-          }
-          {
-            name: 'Subject'
-            type: 'string'
-          }
-          {
-            name: 'Template'
-            type: 'string'
-          }
-          {
-            name: 'DNSNames'
-            type: 'string'
-          }
-        ]
+        columns: certlcDataColumns
       }
     }
     destinations: {
