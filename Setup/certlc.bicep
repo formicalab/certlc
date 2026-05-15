@@ -467,10 +467,14 @@ resource functionApp 'Microsoft.Web/sites@2024-11-01' = {
   properties: {
     serverFarmId: flexServicePlan.id
     httpsOnly: true
+    clientAffinityEnabled: false
+    keyVaultReferenceIdentity: 'SystemAssigned'
     virtualNetworkSubnetId: fnSubnetId
     publicNetworkAccess: 'Disabled'
     siteConfig: {
       minTlsVersion: '1.2'
+      ftpsState: 'Disabled'
+      http20Enabled: true
     }
     functionAppConfig: {
       deployment: {
