@@ -906,7 +906,7 @@ resource keyVaultEventGridSubscription 'Microsoft.EventGrid/systemTopics/eventSu
     }
   }
   dependsOn: [
-    eventGridStorageBlobDataContributor // ensure the role is granted before validating the dead-letter destination
+    storageRoleAssignments // ensure all storage role grants (incl. Storage Blob Data Contributor for dead-letter) are in place before EG validates destinations
   ]
 }
 
@@ -927,206 +927,82 @@ resource workbookCertLCStats 'Microsoft.Insights/workbooks@2023-06-01' = {
   tags: commonTags
 }
 
-// Role Assignment: Grant the Event Grid System Topic the "Storage Queue Data Reader" role on the Storage Account
-// this role allows Event Grid to read messages from the queue
-resource eventGridStorageQueueDataReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(subscription().id, resourceGroup().id, 'eventGridStorageQueueDataReader')
+// Role Assignments (grouped by scope so each loop has a constant scope, as required by Bicep)
+
+// On Storage Account: EG (read/send queue, dead-letter blob) + Function App (blob owner, queue processor, queue contributor)
+var storageRoleAssignmentDefs = [
+  { key: 'eventGridStorageQueueDataReader',             roleId: roleDefinitions.storageQueueDataReader,           principalId: keyVaultEventGridSystemTopic.identity.principalId, description: 'EventGrid SystemTopic -> Storage Queue Data Reader -> Storage Account' }
+  { key: 'eventGridStorageQueueDataMessageSender',      roleId: roleDefinitions.storageQueueDataMessageSender,    principalId: keyVaultEventGridSystemTopic.identity.principalId, description: 'EventGrid SystemTopic -> Storage Queue Data Message Sender -> Storage Account' }
+  { key: 'eventGridStorageBlobDataContributor',         roleId: roleDefinitions.storageBlobDataContributor,       principalId: keyVaultEventGridSystemTopic.identity.principalId, description: 'EventGrid SystemTopic -> Storage Blob Data Contributor -> Storage Account (for dead-letter)' }
+  { key: 'functionAppStorageBlobDataOwner',             roleId: roleDefinitions.storageBlobDataOwner,             principalId: functionApp.identity.principalId,                  description: 'Function App -> Storage Blob Data Owner -> Storage Account' }
+  { key: 'functionAppStorageQueueDataMessageProcessor', roleId: roleDefinitions.storageQueueDataMessageProcessor, principalId: functionApp.identity.principalId,                  description: 'Function App -> Storage Queue Data Message Processor -> Storage Account' }
+  { key: 'functionAppStorageQueueDataContributor',      roleId: roleDefinitions.storageQueueDataContributor,      principalId: functionApp.identity.principalId,                  description: 'Function App -> Storage Queue Data Contributor -> Storage Account' }
+]
+resource storageRoleAssignments 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for d in storageRoleAssignmentDefs: {
   scope: storageAccount
+  name: guid(subscription().id, resourceGroup().id, d.key)
   properties: {
-    description: 'EventGrid SystemTopic -> Storage Queue Data Reader -> Storage Account'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      roleDefinitions.storageQueueDataReader
-    )
-    principalId: keyVaultEventGridSystemTopic.identity.principalId
+    description: d.description
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', d.roleId)
+    principalId: d.principalId
     principalType: 'ServicePrincipal'
   }
-}
+}]
 
-// Role Assignment: Grant the Event Grid System Topic the "Storage Queue Data Message Sender" role on the Storage Account
-// this role allows Event Grid to send messages to the queue
-resource eventGridStorageQueueDataMessageSender 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(subscription().id, resourceGroup().id, 'eventGridStorageQueueDataMessageSender')
-  scope: storageAccount
-  properties: {
-    description: 'EventGrid SystemTopic -> Storage Queue Data Message Sender -> Storage Account'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      roleDefinitions.storageQueueDataMessageSender
-    )
-    principalId: keyVaultEventGridSystemTopic.identity.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
-
-// Role Assignment: Grant the Event Grid System Topic the "Storage Blob Data Contributor" role on the Storage Account
-// this role allows Event Grid to write dead-lettered events to the eventgrid-deadletter blob container
-resource eventGridStorageBlobDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(subscription().id, resourceGroup().id, 'eventGridStorageBlobDataContributor')
-  scope: storageAccount
-  properties: {
-    description: 'EventGrid SystemTopic -> Storage Blob Data Contributor -> Storage Account (for dead-letter)'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      roleDefinitions.storageBlobDataContributor
-    )
-    principalId: keyVaultEventGridSystemTopic.identity.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
-
-// Role Assignment: Grant the Automation Account the "Key Vault Certificates Officer" role on the KeyVault
-// this role allows the automation account to create and manage certificates in the KeyVault
-resource automationAccountKeyVaultCertificatesOfficer 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(subscription().id, resourceGroup().id, 'automationAccountKeyVaultCertificatesOfficer')
+// On Key Vault: Automation Account (certificates officer, secrets officer)
+var keyVaultRoleAssignmentDefs = [
+  { key: 'automationAccountKeyVaultCertificatesOfficer', roleId: roleDefinitions.keyVaultCertificatesOfficer, principalId: automationAccount.identity.principalId, description: 'Automation Account -> Key Vault Certificates Officer -> Key Vault' }
+  { key: 'automationAccountKeyVaultSecretsOfficer',      roleId: roleDefinitions.keyVaultSecretsOfficer,      principalId: automationAccount.identity.principalId, description: 'Automation Account -> Key Vault Secrets Officer -> Key Vault' }
+]
+resource keyVaultRoleAssignments 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for d in keyVaultRoleAssignmentDefs: {
   scope: keyVault
+  name: guid(subscription().id, resourceGroup().id, d.key)
   properties: {
-    description: 'Automation Account -> Key Vault Certificates Officer -> Key Vault'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      roleDefinitions.keyVaultCertificatesOfficer
-    )
-    principalId: automationAccount.identity.principalId
+    description: d.description
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', d.roleId)
+    principalId: d.principalId
     principalType: 'ServicePrincipal'
   }
-}
+}]
 
-// Role Assignment: Grant the Automation Account the "Key Vault Secrets Officer" role on the KeyVault
-// this role allows the automation account to create and manage secrets (private keys of the certificates) in the KeyVault
-resource automationAccountKeyVaultSecretsOfficer 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(subscription().id, resourceGroup().id, 'automationAccountKeyVaultSecretsOfficer')
-  scope: keyVault
-  properties: {
-    description: 'Automation Account -> Key Vault Secrets Officer -> Key Vault'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      roleDefinitions.keyVaultSecretsOfficer
-    )
-    principalId: automationAccount.identity.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
-
-// Role Assignment: Grant the Automation Account the "Reader" role on the Automation Account
-// This may seem strange, but it is required for the hybrid worker (that uses the automation account's identity) to read the automation account variables
-resource automationAccountReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(subscription().id, resourceGroup().id, 'automationAccountReader')
+// On Automation Account: AA self-reader (needed by hybrid workers to read AA variables) + Function App (reader, automation operator)
+var automationAccountRoleAssignmentDefs = [
+  { key: 'automationAccountReader',            roleId: roleDefinitions.reader,             principalId: automationAccount.identity.principalId, description: 'Automation Account -> Reader -> Automation Account (self; required for hybrid workers to read AA variables)' }
+  { key: 'functionAppAutomationAccountReader', roleId: roleDefinitions.reader,             principalId: functionApp.identity.principalId,       description: 'Function App -> Reader -> Automation Account' }
+  { key: 'functionAppAutomationOperator',      roleId: roleDefinitions.automationOperator, principalId: functionApp.identity.principalId,       description: 'Function App -> Automation Operator -> Automation Account' }
+]
+resource automationAccountRoleAssignments 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for d in automationAccountRoleAssignmentDefs: {
   scope: automationAccount
+  name: guid(subscription().id, resourceGroup().id, d.key)
   properties: {
-    description: 'Automation Account -> Reader -> Automation Account (self)'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      roleDefinitions.reader
-    )
-    principalId: automationAccount.identity.principalId
+    description: d.description
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', d.roleId)
+    principalId: d.principalId
     principalType: 'ServicePrincipal'
   }
-}
+}]
 
-// Role Assignment: Grant the Automation Account the "Monitoring Metrics Publisher" role on the DCR
-// (this is to allow the automation account to write custom logs to the DCR)
+// Singletons (one-of-a-kind scope; no benefit from a loop)
+
+// On Data Collection Rule: Automation Account (Monitoring Metrics Publisher) to allow AA to write custom logs
 resource automationAccountMonitoringMetricsPublisher 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(subscription().id, resourceGroup().id, 'automationAccountMonitoringMetricsPublisher')
   scope: dataCollectionRule
   properties: {
     description: 'Automation Account -> Monitoring Metrics Publisher -> DCR'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      roleDefinitions.monitoringMetricsPublisher
-    )
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleDefinitions.monitoringMetricsPublisher)
     principalId: automationAccount.identity.principalId
     principalType: 'ServicePrincipal'
   }
 }
 
-// Role Assignment: Grant the Function App the "Storage Blob Data Owner" role on the Storage Account
-resource functionAppStorageBlobDataOwner 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(subscription().id, resourceGroup().id, 'functionAppStorageBlobDataOwner')
-  scope: storageAccount
-  properties: {
-    description: 'Function App -> Storage Blob Data Owner -> Storage Account'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      roleDefinitions.storageBlobDataOwner
-    )
-    principalId: functionApp.identity.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
-
-// Role Assignment: Grant the Function App the "Storage Queue Data Message Processor" role on the Storage Account
-resource functionAppStorageQueueDataMessageProcessor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(subscription().id, resourceGroup().id, 'functionAppStorageQueueDataMessageProcessor')
-  scope: storageAccount
-  properties: {
-    description: 'Function App -> Storage Queue Data Message Processor -> Storage Account'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      roleDefinitions.storageQueueDataMessageProcessor
-    )
-    principalId: functionApp.identity.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
-
-// Role Assignment: Grant the Function App the "Storage Queue Data Contributor" role on the Storage Account
-resource functionAppStorageQueueDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(subscription().id, resourceGroup().id, 'functionAppStorageQueueDataContributor')
-  scope: storageAccount
-  properties: {
-    description: 'Function App -> Storage Queue Data Contributor -> Storage Account'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      roleDefinitions.storageQueueDataContributor
-    )
-    principalId: functionApp.identity.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
-
-// Role Assignment: Grant the Function App the "Reader" role on the Automation Account
-// (this is to allow the function app to read automation account information and trigger runbooks)
-resource functionAppAutomationAccountReader 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(subscription().id, resourceGroup().id, 'functionAppAutomationAccountReader')
-  scope: automationAccount
-  properties: {
-    description: 'Function App -> Reader -> Automation Account'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      roleDefinitions.reader
-    )
-    principalId: functionApp.identity.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
-
-// Role Assignment: Grant the Function App the "Automation Operator" role on the Automation Account
-// (this is to allow the function app to start runbook jobs)
-resource functionAppAutomationOperator 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(subscription().id, resourceGroup().id, 'functionAppAutomationOperator')
-  scope: automationAccount
-  properties: {
-    description: 'Function App -> Automation Operator -> Automation Account'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      roleDefinitions.automationOperator
-    )
-    principalId: functionApp.identity.principalId
-    principalType: 'ServicePrincipal'
-  }
-}
-
-// Role Assignment: Grant the Function App the "Monitoring Metrics Publisher" role on the Application Insights instance
-// (this is to instrument the function app with App Insights)
+// On Application Insights: Function App (Monitoring Metrics Publisher) to instrument the Function App
 resource functionAppMonitoringMetricsPublisher 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(subscription().id, resourceGroup().id, 'functionAppMonitoringMetricsPublisher')
   scope: applicationInsights
   properties: {
     description: 'Function App -> Monitoring Metrics Publisher -> Application Insights'
-    roleDefinitionId: subscriptionResourceId(
-      'Microsoft.Authorization/roleDefinitions',
-      roleDefinitions.monitoringMetricsPublisher
-    )
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleDefinitions.monitoringMetricsPublisher)
     principalId: functionApp.identity.principalId
     principalType: 'ServicePrincipal'
   }
