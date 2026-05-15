@@ -564,6 +564,7 @@ resource automationAccount 'Microsoft.Automation/automationAccounts@2024-10-23' 
   }
   properties: {
     publicNetworkAccess: false
+    disableLocalAuth: true
     sku: {
       name: 'Basic'
     }
@@ -654,7 +655,7 @@ resource automationAccount 'Microsoft.Automation/automationAccounts@2024-10-23' 
       logProgress: false
       logVerbose: false
       description: 'Certificate lifecycle management runbook for enrollment, renewal, and revocation'
-      runtimeEnvironment: 'PowerShell-7.2'
+      runtimeEnvironment: 'PowerShell-7.4'
     }
     tags: commonTags
   }
@@ -668,7 +669,7 @@ resource automationAccount 'Microsoft.Automation/automationAccounts@2024-10-23' 
       logProgress: false
       logVerbose: false
       description: 'Certificate statistics collection runbook for monitoring and reporting'
-      runtimeEnvironment: 'PowerShell-7.2'
+      runtimeEnvironment: 'PowerShell-7.4'
     }
     tags: commonTags
   }
