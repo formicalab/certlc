@@ -41,6 +41,11 @@ param functionAppName string
 @description('The name of the Log Analytics workspace for centralized logging and monitoring. Stores diagnostic logs, custom certificate statistics, and application telemetry.')
 param logAnalyticsWorkspaceName string
 
+@description('Retention in days for the Log Analytics workspace and the certlc_CL custom table. Range 30-730. Default 30 (lab-friendly).')
+@minValue(30)
+@maxValue(730)
+param logAnalyticsRetentionInDays int = 30
+
 @description('The name of the Application Insights instance for function app monitoring and performance tracking.')
 param applicationInsightsName string
 
@@ -283,7 +288,10 @@ resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2025-07
     sku: {
       name: 'PerGB2018'
     }
-    retentionInDays: 30
+    retentionInDays: logAnalyticsRetentionInDays
+    features: {
+      disableLocalAuth: true
+    }
   }
   tags: commonTags
 }
@@ -305,7 +313,7 @@ resource customTable 'Microsoft.OperationalInsights/workspaces/tables@2025-02-01
   name: 'certlc_CL'
   parent: logAnalyticsWorkspace
   properties: {
-    retentionInDays: 30
+    retentionInDays: logAnalyticsRetentionInDays
     schema: {
       name: 'certlc_CL'
       columns: [
