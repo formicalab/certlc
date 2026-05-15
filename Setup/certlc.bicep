@@ -209,81 +209,47 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2025-01-01' = {
   tags: commonTags
 }
 
-// Private endpoint for the storage account - blob
-resource storageAccountBlobPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-10-01' = {
-  name: 'pe-blob-${storageAccountName}'
+// Private endpoints for the storage account (blob + queue).
+// Declared here (before the function app) so the function app can depend on them: the function app
+// reaches storage via private link, so it must not start before its PEs and DNS records are ready.
+var storagePeDefs = [
+  { peName: 'pe-blob-${storageAccountName}',  plsConnName: 'pls-${storageAccountName}', groupId: 'blob',  nicName: 'nic-pe-${storageAccountName}',       dnsKey: 'blob' }
+  { peName: 'pe-queue-${storageAccountName}', plsConnName: 'pls-${storageAccountName}', groupId: 'queue', nicName: 'nic-pe-queue-${storageAccountName}', dnsKey: 'queue' }
+]
+
+resource storagePrivateEndpoints 'Microsoft.Network/privateEndpoints@2024-10-01' = [for d in storagePeDefs: {
+  name: d.peName
   location: location
   properties: {
-    subnet: {
-      id: peSubnetId
-    }
+    subnet: { id: peSubnetId }
     privateLinkServiceConnections: [
       {
-        name: 'pls-${storageAccountName}'
+        name: d.plsConnName
         properties: {
           privateLinkServiceId: storageAccount.id
-          groupIds: [
-            'blob'
-          ]
+          groupIds: [ d.groupId ]
         }
       }
     ]
-    customNetworkInterfaceName: 'nic-pe-${storageAccountName}'
+    customNetworkInterfaceName: d.nicName
   }
   tags: commonTags
+}]
 
-  resource privateDnsZoneGroup 'privateDnsZoneGroups' = {
-    name: 'default'
-    properties: {
-      privateDnsZoneConfigs: [
-        {
-          name: 'config1'
-          properties: {
-            privateDnsZoneId: blobDnsZone.id
-          }
-        }
-      ]
-    }
-  }
-}
-
-// Private endpoint for the storage account - queue
-resource storageAccountQueuePrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-10-01' = {
-  name: 'pe-queue-${storageAccountName}'
-  location: location
+resource storagePrivateEndpointDnsGroups 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2024-10-01' = [for (d, i) in storagePeDefs: {
+  parent: storagePrivateEndpoints[i]
+  name: 'default'
   properties: {
-    subnet: {
-      id: peSubnetId
-    }
-    privateLinkServiceConnections: [
+    privateDnsZoneConfigs: [
       {
-        name: 'pls-${storageAccountName}'
+        name: 'config1'
         properties: {
-          privateLinkServiceId: storageAccount.id
-          groupIds: [
-            'queue'
-          ]
+          privateDnsZoneId: d.dnsKey == 'blob' ? blobDnsZone.id : queueDnsZone.id
         }
       }
     ]
-    customNetworkInterfaceName: 'nic-pe-queue-${storageAccountName}'
   }
-  tags: commonTags
-
-  resource privateDnsZoneGroup 'privateDnsZoneGroups' = {
-    name: 'default'
-    properties: {
-      privateDnsZoneConfigs: [
-        {
-          name: 'config1'
-          properties: {
-            privateDnsZoneId: queueDnsZone.id
-          }
-        }
-      ]
-    }
-  }
-}
+}]
 
 // Log Analytics Workspace
 resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2025-07-01' = {
@@ -516,48 +482,9 @@ resource functionApp 'Microsoft.Web/sites@2024-11-01' = {
     }
   }
   dependsOn: [
-    storageAccountBlobPrivateEndpoint // create the function only after the PEs for the storage account are ready
-    storageAccountQueuePrivateEndpoint
+    storagePrivateEndpoints // create the function only after the PEs for the storage account are ready
   ]
   tags: commonTags
-}
-
-// Private endpoint for the function app
-resource functionAppPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-10-01' = {
-  name: 'pe-sites-${functionAppName}'
-  location: location
-  properties: {
-    subnet: {
-      id: peSubnetId
-    }
-    privateLinkServiceConnections: [
-      {
-        name: 'pls-${functionAppName}'
-        properties: {
-          privateLinkServiceId: functionApp.id
-          groupIds: [
-            'sites'
-          ]
-        }
-      }
-    ]
-    customNetworkInterfaceName: 'nic-pe-${functionAppName}'
-  }
-  tags: commonTags
-
-  resource privateDnsZoneGroup 'privateDnsZoneGroups' = {
-    name: 'default'
-    properties: {
-      privateDnsZoneConfigs: [
-        {
-          name: 'config1'
-          properties: {
-            privateDnsZoneId: webAppDnsZone.id
-          }
-        }
-      ]
-    }
-  }
 }
 
 // Automation Account with its managed identity
@@ -685,82 +612,6 @@ resource hybridWorkerGroup 'Microsoft.Automation/automationAccounts/hybridRunboo
   }
 }
 
-// Private endpoint for the Automation Account - Webhook
-resource automationAccountPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-10-01' = {
-  name: 'pe-webhook-${automationAccountName}'
-  location: location
-  properties: {
-    subnet: {
-      id: peSubnetId
-    }
-    privateLinkServiceConnections: [
-      {
-        name: 'pls-${automationAccountName}'
-        properties: {
-          privateLinkServiceId: automationAccount.id
-          groupIds: [
-            'Webhook'
-          ]
-        }
-      }
-    ]
-    customNetworkInterfaceName: 'nic-pe-webhook-${automationAccountName}'
-  }
-  tags: commonTags
-
-  resource privateDnsZoneGroup 'privateDnsZoneGroups' = {
-    name: 'default'
-    properties: {
-      privateDnsZoneConfigs: [
-        {
-          name: 'config1'
-          properties: {
-            privateDnsZoneId: automationAccountDnsZone.id
-          }
-        }
-      ]
-    }
-  }
-}
-
-// Private endpoint for the Automation Account - DSCAndHybridWorker
-resource automationAccountPrivateEndpointDSCAndHybridWorker 'Microsoft.Network/privateEndpoints@2024-10-01' = {
-  name: 'pe-dscandhybridworker-${automationAccountName}'
-  location: location
-  properties: {
-    subnet: {
-      id: peSubnetId
-    }
-    privateLinkServiceConnections: [
-      {
-        name: 'pls-dscandhybridworker-${automationAccountName}'
-        properties: {
-          privateLinkServiceId: automationAccount.id
-          groupIds: [
-            'DSCAndHybridWorker'
-          ]
-        }
-      }
-    ]
-    customNetworkInterfaceName: 'nic-pe-dscandhybridworker-${automationAccountName}'
-  }
-  tags: commonTags
-
-  resource privateDnsZoneGroup 'privateDnsZoneGroups' = {
-    name: 'default'
-    properties: {
-      privateDnsZoneConfigs: [
-        {
-          name: 'config1'
-          properties: {
-            privateDnsZoneId: automationAccountDnsZone.id
-          }
-        }
-      ]
-    }
-  }
-}
-
 // Diagnostic Settings for Automation Account
 resource automationAccountDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
   name: 'diag-${automationAccountName}'
@@ -805,43 +656,60 @@ resource keyVault 'Microsoft.KeyVault/vaults@2025-05-01' = {
   tags: commonTags
 }
 
-// Private endpoint for the KeyVault
-resource keyVaultPrivateEndpoint 'Microsoft.Network/privateEndpoints@2024-10-01' = {
-  name: 'pe-vault-${keyVaultName}'
+// Private endpoints for the application-tier resources: Function App, Automation Account (Webhook + DSCAndHybridWorker), Key Vault.
+// Declared here (after the Key Vault) so all target resources are already in scope.
+var appPeDefs = [
+  { peName: 'pe-sites-${functionAppName}',                    plsConnName: 'pls-${functionAppName}',                          groupId: 'sites',              nicName: 'nic-pe-${functionAppName}',                          targetKey: 'function', dnsKey: 'webapp' }
+  { peName: 'pe-webhook-${automationAccountName}',            plsConnName: 'pls-${automationAccountName}',                    groupId: 'Webhook',            nicName: 'nic-pe-webhook-${automationAccountName}',            targetKey: 'aa',       dnsKey: 'aa' }
+  { peName: 'pe-dscandhybridworker-${automationAccountName}', plsConnName: 'pls-dscandhybridworker-${automationAccountName}', groupId: 'DSCAndHybridWorker', nicName: 'nic-pe-dscandhybridworker-${automationAccountName}', targetKey: 'aa',       dnsKey: 'aa' }
+  { peName: 'pe-vault-${keyVaultName}',                       plsConnName: 'pls-${keyVaultName}',                             groupId: 'vault',              nicName: 'nic-pe-${keyVaultName}',                             targetKey: 'kv',       dnsKey: 'kv' }
+]
+
+// Lookup maps (resource ids are calculable at start; DNS zone ids likewise). Looked up inside the loop body.
+var appPeTargetIds = {
+  function: functionApp.id
+  aa: automationAccount.id
+  kv: keyVault.id
+}
+var appPeDnsZoneIds = {
+  webapp: webAppDnsZone.id
+  aa: automationAccountDnsZone.id
+  kv: keyVaultDnsZone.id
+}
+
+resource appPrivateEndpoints 'Microsoft.Network/privateEndpoints@2024-10-01' = [for d in appPeDefs: {
+  name: d.peName
   location: location
   properties: {
-    subnet: {
-      id: peSubnetId
-    }
+    subnet: { id: peSubnetId }
     privateLinkServiceConnections: [
       {
-        name: 'pls-${keyVaultName}'
+        name: d.plsConnName
         properties: {
-          privateLinkServiceId: keyVault.id
-          groupIds: [
-            'vault'
-          ]
+          privateLinkServiceId: appPeTargetIds[d.targetKey]
+          groupIds: [ d.groupId ]
         }
       }
     ]
-    customNetworkInterfaceName: 'nic-pe-${keyVaultName}'
+    customNetworkInterfaceName: d.nicName
   }
   tags: commonTags
+}]
 
-  resource privateDnsZoneGroup 'privateDnsZoneGroups' = {
-    name: 'default'
-    properties: {
-      privateDnsZoneConfigs: [
-        {
-          name: 'config1'
-          properties: {
-            privateDnsZoneId: keyVaultDnsZone.id
-          }
+resource appPrivateEndpointDnsGroups 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2024-10-01' = [for (d, i) in appPeDefs: {
+  parent: appPrivateEndpoints[i]
+  name: 'default'
+  properties: {
+    privateDnsZoneConfigs: [
+      {
+        name: 'config1'
+        properties: {
+          privateDnsZoneId: appPeDnsZoneIds[d.dnsKey]
         }
-      ]
-    }
+      }
+    ]
   }
-}
+}]
 
 // Diagnostic Settings for Key Vault
 resource keyVaultDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
