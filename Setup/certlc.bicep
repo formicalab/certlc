@@ -357,10 +357,10 @@ resource applicationInsights 'Microsoft.Insights/components@2020-02-02' = {
     DisableLocalAuth: true
   }
   dependsOn: [
-    // Force serial deployment: Log Analytics → Custom Table → DCR → Automation Account → Diagnostics → App Insights
-    // This ensures the workspace backend is fully active before App Insights connects
-    automationAccountDiagnostics  // Wait for diagnostic settings which write to workspace
-    keyVaultDiagnostics
+    // Avoid the "Workspace not active" race on first deployment by waiting until the workspace and its first child
+    // (the customTable) are both provisioned — by then the LAW backend is fully ready for App Insights to bind.
+    logAnalyticsWorkspace
+    customTable
   ]
   tags: commonTags
 }
@@ -454,10 +454,6 @@ resource automationAccount 'Microsoft.Automation/automationAccounts@2024-10-23' 
       name: 'Basic'
     }
   }
-  dependsOn: [
-    dataCollectionRule
-    dataCollectionEndpoint
-  ]
   tags: commonTags
 
   // Runbook: certlc
