@@ -164,6 +164,7 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2025-01-01' = {
     defaultToOAuthAuthentication: true
     allowBlobPublicAccess: false
     allowSharedKeyAccess: false
+    allowCrossTenantReplication: false
     minimumTlsVersion: 'TLS1_2'
     supportsHttpsTrafficOnly: true
     networkAcls: {
