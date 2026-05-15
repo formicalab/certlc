@@ -117,6 +117,7 @@ var roleDefinitions = {
   reader: 'acdd72a7-3385-48ef-bd42-f606fba81ae7'
   monitoringMetricsPublisher: '3913510d-42f4-4e42-8a64-420c390055eb'
   storageBlobDataOwner: 'b7e6dc6d-f1e8-4753-8033-0f276bb0955b'
+  storageBlobDataContributor: 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
   storageQueueDataMessageProcessor: '8a0f0c08-91a1-4084-bc3d-661d67233fed'
   storageQueueDataContributor: '974c5e8b-45b9-4653-ba55-5f855dd0fb88'
   automationOperator: 'd3881f73-407a-4167-8283-e981cbba0404'
@@ -191,6 +192,10 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2025-01-01' = {
   resource blobServices 'blobServices' = {
     name: 'default'
     properties: {}
+    resource deadLetterContainer 'containers' = {
+      name: 'eventgrid-deadletter'
+      properties: {}
+    }
   }
   resource queueServices 'queueServices' = {
     name: 'default'
@@ -934,7 +939,22 @@ resource keyVaultEventGridSubscription 'Microsoft.EventGrid/systemTopics/eventSu
       maxDeliveryAttempts: 30
       eventTimeToLiveInMinutes: 1440 // 1 day
     }
+    deadLetterWithResourceIdentity: {
+      identity: {
+        type: 'SystemAssigned'
+      }
+      deadLetterDestination: {
+        endpointType: 'StorageBlob'
+        properties: {
+          resourceId: storageAccount.id
+          blobContainerName: 'eventgrid-deadletter'
+        }
+      }
+    }
   }
+  dependsOn: [
+    eventGridStorageBlobDataContributor // ensure the role is granted before validating the dead-letter destination
+  ]
 }
 
 // Azure Monitor Workbook for Certificate Statistics
@@ -980,6 +1000,22 @@ resource eventGridStorageQueueDataMessageSender 'Microsoft.Authorization/roleAss
     roleDefinitionId: subscriptionResourceId(
       'Microsoft.Authorization/roleDefinitions',
       roleDefinitions.storageQueueDataMessageSender
+    )
+    principalId: keyVaultEventGridSystemTopic.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// Role Assignment: Grant the Event Grid System Topic the "Storage Blob Data Contributor" role on the Storage Account
+// this role allows Event Grid to write dead-lettered events to the eventgrid-deadletter blob container
+resource eventGridStorageBlobDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(subscription().id, resourceGroup().id, 'eventGridStorageBlobDataContributor')
+  scope: storageAccount
+  properties: {
+    description: 'EventGrid SystemTopic -> Storage Blob Data Contributor -> Storage Account (for dead-letter)'
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      roleDefinitions.storageBlobDataContributor
     )
     principalId: keyVaultEventGridSystemTopic.identity.principalId
     principalType: 'ServicePrincipal'
