@@ -117,27 +117,27 @@ var roleDefinitions = {
 /**********************/
 
 // References to existing Private DNS Zones in their subscription
-resource blobDnsZone 'Microsoft.Network/privateDnsZones@2020-06-01' existing = {
+resource blobDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' existing = {
   name: 'privatelink.blob.${environment().suffixes.storage}'
   scope: resourceGroup(dnsZonesSubscriptionId, dnsZonesResourceGroupName)
 }
 
-resource keyVaultDnsZone 'Microsoft.Network/privateDnsZones@2020-06-01' existing = {
+resource keyVaultDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' existing = {
   name: 'privatelink.vaultcore.azure.net'
   scope: resourceGroup(dnsZonesSubscriptionId, dnsZonesResourceGroupName)
 }
 
-resource queueDnsZone 'Microsoft.Network/privateDnsZones@2020-06-01' existing = {
+resource queueDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' existing = {
   name: 'privatelink.queue.${environment().suffixes.storage}'
   scope: resourceGroup(dnsZonesSubscriptionId, dnsZonesResourceGroupName)
 }
 
-resource webAppDnsZone 'Microsoft.Network/privateDnsZones@2020-06-01' existing = {
+resource webAppDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' existing = {
   name: 'privatelink.azurewebsites.net'
   scope: resourceGroup(dnsZonesSubscriptionId, dnsZonesResourceGroupName)
 }
 
-resource automationAccountDnsZone 'Microsoft.Network/privateDnsZones@2020-06-01' existing = {
+resource automationAccountDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' existing = {
   name: 'privatelink.azure-automation.net'
   scope: resourceGroup(dnsZonesSubscriptionId, dnsZonesResourceGroupName)
 }
@@ -270,7 +270,7 @@ resource storageAccountQueuePrivateEndpoint 'Microsoft.Network/privateEndpoints@
 }
 
 // Log Analytics Workspace
-resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
+resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2025-07-01' = {
   name: logAnalyticsWorkspaceName
   location: location
   properties: {
@@ -283,7 +283,7 @@ resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2023-09
 }
 
 // Data Collection Endpoint
-resource dataCollectionEndpoint 'Microsoft.Insights/dataCollectionEndpoints@2023-03-11' = {
+resource dataCollectionEndpoint 'Microsoft.Insights/dataCollectionEndpoints@2024-03-11' = {
   name: dataCollectionEndpointName
   location: location
   properties: {
@@ -295,7 +295,7 @@ resource dataCollectionEndpoint 'Microsoft.Insights/dataCollectionEndpoints@2023
 }
 
 // Custom Table for Certificate Statistics
-resource customTable 'Microsoft.OperationalInsights/workspaces/tables@2022-10-01' = {
+resource customTable 'Microsoft.OperationalInsights/workspaces/tables@2025-02-01' = {
   name: 'certlc_CL'
   parent: logAnalyticsWorkspace
   properties: {
@@ -341,7 +341,7 @@ resource customTable 'Microsoft.OperationalInsights/workspaces/tables@2022-10-01
 }
 
 // Data Collection Rule for Certificate Statistics
-resource dataCollectionRule 'Microsoft.Insights/dataCollectionRules@2023-03-11' = {
+resource dataCollectionRule 'Microsoft.Insights/dataCollectionRules@2024-03-11' = {
   name: dataCollectionRuleName
   location: location
   properties: {
@@ -685,7 +685,7 @@ resource automationAccount 'Microsoft.Automation/automationAccounts@2024-10-23' 
 }
 
 // Hybrid Worker Group
-resource hybridWorkerGroup 'Microsoft.Automation/automationAccounts/hybridRunbookWorkerGroups@2023-11-01' = {
+resource hybridWorkerGroup 'Microsoft.Automation/automationAccounts/hybridRunbookWorkerGroups@2024-10-23' = {
   name: hybridWorkerGroupName
   parent: automationAccount
   properties: {
