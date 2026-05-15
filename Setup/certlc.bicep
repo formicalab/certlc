@@ -60,6 +60,11 @@ param runbookName string
 @maxLength(24)
 param keyVaultName string
 
+@description('Soft-delete retention in days for the Key Vault. Allowed range 7-90. Default 7 (lab-friendly minimum); use 90 for production.')
+@minValue(7)
+@maxValue(90)
+param keyVaultSoftDeleteRetentionInDays int = 7
+
 @description('The name of the Data Collection Endpoint (DCE) to create. Ingestion endpoint for custom certificate statistics logs sent from automation runbooks.')
 param dataCollectionEndpointName string
 
@@ -805,7 +810,8 @@ resource keyVault 'Microsoft.KeyVault/vaults@2025-05-01' = {
     }
     tenantId: subscription().tenantId
     enableSoftDelete: true
-    softDeleteRetentionInDays: 7
+    softDeleteRetentionInDays: keyVaultSoftDeleteRetentionInDays
+    enablePurgeProtection: true
     enableRbacAuthorization: true
     publicNetworkAccess: 'Disabled'
   }
