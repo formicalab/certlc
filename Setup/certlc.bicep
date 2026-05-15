@@ -579,78 +579,7 @@ resource automationAccount 'Microsoft.Automation/automationAccounts@2024-10-23' 
     dataCollectionEndpoint
   ]
   tags: commonTags
-  // variables
-  resource automationAccountVariables 'variables@2024-10-23' = {
-    name: 'certlc-ca'
-    properties: {
-      value: '"${replace(automationAccountVarCA, '\\', '\\\\')}"'
-      isEncrypted: true
-    }
-  }
-  resource automationAccountVariablesPfxRootFolder 'variables@2024-10-23' = {
-    name: 'certlc-pfxrootfolder'
-    properties: {
-      value: '"${replace(automationAccountVarPfxRootFolder, '\\', '\\\\')}"'
-      isEncrypted: true
-    }
-  }
-  resource automationAccountVariablesSmtpFrom 'variables@2024-10-23' = {
-    name: 'certlc-smtpfrom'
-    properties: {
-      value: '"${replace(automationAccountVarSmtpFrom, '\\', '\\\\')}"'
-      isEncrypted: true
-    }
-  }
-  resource automationAccountVariablesSmtpServer 'variables@2024-10-23' = {
-    name: 'certlc-smtpserver'
-    properties: {
-      value: '"${replace(automationAccountVarSmtpServer, '\\', '\\\\')}"'
-      isEncrypted: true
-    }
-  }
-  resource automationAccountVariablesSmtpUser 'variables@2024-10-23' = {
-    name: 'certlc-smtpuser'
-    properties: {
-      value: '"${replace(automationAccountVarSmtpUser, '\\', '\\\\')}"'
-      isEncrypted: true
-    }
-  }
-  resource automationAccountVariablesSmtpPassword 'variables@2024-10-23' = {
-    name: 'certlc-smtppassword'
-    properties: {
-      value: '"${replace(automationAccountVarSmtpPassword, '\\', '\\\\')}"'
-      isEncrypted: true
-    }
-  }
-  resource automationAccountVariablesKeyVault 'variables@2024-10-23' = {
-    name: 'certlc-stats-keyvault'
-    properties: {
-      value: '"${keyVault.name}"'
-      isEncrypted: true
-    }
-  }
-  resource automationAccountVariablesImmutableId 'variables@2024-10-23' = {
-    name: 'certlc-stats-immutableid'
-    properties: {
-      value: '"${dataCollectionRule.properties.immutableId}"'
-      isEncrypted: true
-    }
-  }
-  resource automationAccountVariablesStreamName 'variables@2024-10-23' = {
-    name: 'certlc-stats-streamname'
-    properties: {
-      value: '"Custom-certlc_CL"'
-      isEncrypted: true
-    }
-  }
-  resource automationAccountVariablesIngestionUrl 'variables@2024-10-23' = {
-    name: 'certlc-stats-ingestionurl'
-    properties: {
-      value: '"${dataCollectionEndpoint.properties.logsIngestion.endpoint}"'
-      isEncrypted: true
-    }
-  }
-  
+
   // Runbook: certlc
   resource runbookCertLC 'runbooks@2024-10-23' = {
     name: 'certlc'
@@ -707,6 +636,30 @@ resource automationAccount 'Microsoft.Automation/automationAccounts@2024-10-23' 
   //   }
   // }
 }
+
+// Automation Account variables (loop). Values are JSON-string-encoded:
+// wrapped in double-quotes and with any backslashes escaped (replace is a no-op for values without backslashes).
+var automationAccountVariableDefs = [
+  { name: 'certlc-ca',                 value: automationAccountVarCA }
+  { name: 'certlc-pfxrootfolder',      value: automationAccountVarPfxRootFolder }
+  { name: 'certlc-smtpfrom',           value: automationAccountVarSmtpFrom }
+  { name: 'certlc-smtpserver',         value: automationAccountVarSmtpServer }
+  { name: 'certlc-smtpuser',           value: automationAccountVarSmtpUser }
+  { name: 'certlc-smtppassword',       value: automationAccountVarSmtpPassword }
+  { name: 'certlc-stats-keyvault',     value: keyVault.name }
+  { name: 'certlc-stats-immutableid',  value: dataCollectionRule.properties.immutableId }
+  { name: 'certlc-stats-streamname',   value: 'Custom-certlc_CL' }
+  { name: 'certlc-stats-ingestionurl', value: dataCollectionEndpoint.properties.logsIngestion.endpoint }
+]
+
+resource automationAccountVariables 'Microsoft.Automation/automationAccounts/variables@2024-10-23' = [for v in automationAccountVariableDefs: {
+  parent: automationAccount
+  name: v.name
+  properties: {
+    value: '"${replace(v.value, '\\', '\\\\')}"'
+    isEncrypted: true
+  }
+}]
 
 // Hybrid Worker Group
 resource hybridWorkerGroup 'Microsoft.Automation/automationAccounts/hybridRunbookWorkerGroups@2024-10-23' = {
