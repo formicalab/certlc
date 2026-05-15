@@ -639,24 +639,39 @@ resource automationAccount 'Microsoft.Automation/automationAccounts@2024-10-23' 
 
 // Automation Account variables (loop). Values are JSON-string-encoded:
 // wrapped in double-quotes and with any backslashes escaped (replace is a no-op for values without backslashes).
-var automationAccountVariableDefs = [
-  { name: 'certlc-ca',                 value: automationAccountVarCA }
-  { name: 'certlc-pfxrootfolder',      value: automationAccountVarPfxRootFolder }
-  { name: 'certlc-smtpfrom',           value: automationAccountVarSmtpFrom }
-  { name: 'certlc-smtpserver',         value: automationAccountVarSmtpServer }
-  { name: 'certlc-smtpuser',           value: automationAccountVarSmtpUser }
-  { name: 'certlc-smtppassword',       value: automationAccountVarSmtpPassword }
-  { name: 'certlc-stats-keyvault',     value: keyVault.name }
-  { name: 'certlc-stats-immutableid',  value: dataCollectionRule.properties.immutableId }
-  { name: 'certlc-stats-streamname',   value: 'Custom-certlc_CL' }
-  { name: 'certlc-stats-ingestionurl', value: dataCollectionEndpoint.properties.logsIngestion.endpoint }
+// Note: the [for] iteratee must be calculable at the start of deployment (BCP178), so it lists only literal
+// variable names; the actual values (some of which reference runtime resource properties) are looked up via
+// the automationAccountVariableValues map inside the loop body.
+var automationAccountVariableValues = {
+  'certlc-ca':                 automationAccountVarCA
+  'certlc-pfxrootfolder':      automationAccountVarPfxRootFolder
+  'certlc-smtpfrom':           automationAccountVarSmtpFrom
+  'certlc-smtpserver':         automationAccountVarSmtpServer
+  'certlc-smtpuser':           automationAccountVarSmtpUser
+  'certlc-smtppassword':       automationAccountVarSmtpPassword
+  'certlc-stats-keyvault':     keyVault.name
+  'certlc-stats-immutableid':  dataCollectionRule.properties.immutableId
+  'certlc-stats-streamname':   'Custom-certlc_CL'
+  'certlc-stats-ingestionurl': dataCollectionEndpoint.properties.logsIngestion.endpoint
+}
+var automationAccountVariableNames = [
+  'certlc-ca'
+  'certlc-pfxrootfolder'
+  'certlc-smtpfrom'
+  'certlc-smtpserver'
+  'certlc-smtpuser'
+  'certlc-smtppassword'
+  'certlc-stats-keyvault'
+  'certlc-stats-immutableid'
+  'certlc-stats-streamname'
+  'certlc-stats-ingestionurl'
 ]
 
-resource automationAccountVariables 'Microsoft.Automation/automationAccounts/variables@2024-10-23' = [for v in automationAccountVariableDefs: {
+resource automationAccountVariables 'Microsoft.Automation/automationAccounts/variables@2024-10-23' = [for n in automationAccountVariableNames: {
   parent: automationAccount
-  name: v.name
+  name: n
   properties: {
-    value: '"${replace(v.value, '\\', '\\\\')}"'
+    value: '"${replace(automationAccountVariableValues[n], '\\', '\\\\')}"'
     isEncrypted: true
   }
 }]
@@ -928,15 +943,22 @@ resource workbookCertLCStats 'Microsoft.Insights/workbooks@2023-06-01' = {
 }
 
 // Role Assignments (grouped by scope so each loop has a constant scope, as required by Bicep)
+// Note: variable arrays used in [for] cannot contain runtime resource references (BCP178), so principals are
+// referenced by literal key here and resolved inside the loop body via the principalIds map below.
+var principalIds = {
+  eg: keyVaultEventGridSystemTopic.identity.principalId
+  aa: automationAccount.identity.principalId
+  fa: functionApp.identity.principalId
+}
 
 // On Storage Account: EG (read/send queue, dead-letter blob) + Function App (blob owner, queue processor, queue contributor)
 var storageRoleAssignmentDefs = [
-  { key: 'eventGridStorageQueueDataReader',             roleId: roleDefinitions.storageQueueDataReader,           principalId: keyVaultEventGridSystemTopic.identity.principalId, description: 'EventGrid SystemTopic -> Storage Queue Data Reader -> Storage Account' }
-  { key: 'eventGridStorageQueueDataMessageSender',      roleId: roleDefinitions.storageQueueDataMessageSender,    principalId: keyVaultEventGridSystemTopic.identity.principalId, description: 'EventGrid SystemTopic -> Storage Queue Data Message Sender -> Storage Account' }
-  { key: 'eventGridStorageBlobDataContributor',         roleId: roleDefinitions.storageBlobDataContributor,       principalId: keyVaultEventGridSystemTopic.identity.principalId, description: 'EventGrid SystemTopic -> Storage Blob Data Contributor -> Storage Account (for dead-letter)' }
-  { key: 'functionAppStorageBlobDataOwner',             roleId: roleDefinitions.storageBlobDataOwner,             principalId: functionApp.identity.principalId,                  description: 'Function App -> Storage Blob Data Owner -> Storage Account' }
-  { key: 'functionAppStorageQueueDataMessageProcessor', roleId: roleDefinitions.storageQueueDataMessageProcessor, principalId: functionApp.identity.principalId,                  description: 'Function App -> Storage Queue Data Message Processor -> Storage Account' }
-  { key: 'functionAppStorageQueueDataContributor',      roleId: roleDefinitions.storageQueueDataContributor,      principalId: functionApp.identity.principalId,                  description: 'Function App -> Storage Queue Data Contributor -> Storage Account' }
+  { key: 'eventGridStorageQueueDataReader',             roleId: roleDefinitions.storageQueueDataReader,           principalKey: 'eg', description: 'EventGrid SystemTopic -> Storage Queue Data Reader -> Storage Account' }
+  { key: 'eventGridStorageQueueDataMessageSender',      roleId: roleDefinitions.storageQueueDataMessageSender,    principalKey: 'eg', description: 'EventGrid SystemTopic -> Storage Queue Data Message Sender -> Storage Account' }
+  { key: 'eventGridStorageBlobDataContributor',         roleId: roleDefinitions.storageBlobDataContributor,       principalKey: 'eg', description: 'EventGrid SystemTopic -> Storage Blob Data Contributor -> Storage Account (for dead-letter)' }
+  { key: 'functionAppStorageBlobDataOwner',             roleId: roleDefinitions.storageBlobDataOwner,             principalKey: 'fa', description: 'Function App -> Storage Blob Data Owner -> Storage Account' }
+  { key: 'functionAppStorageQueueDataMessageProcessor', roleId: roleDefinitions.storageQueueDataMessageProcessor, principalKey: 'fa', description: 'Function App -> Storage Queue Data Message Processor -> Storage Account' }
+  { key: 'functionAppStorageQueueDataContributor',      roleId: roleDefinitions.storageQueueDataContributor,      principalKey: 'fa', description: 'Function App -> Storage Queue Data Contributor -> Storage Account' }
 ]
 resource storageRoleAssignments 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for d in storageRoleAssignmentDefs: {
   scope: storageAccount
@@ -944,15 +966,15 @@ resource storageRoleAssignments 'Microsoft.Authorization/roleAssignments@2022-04
   properties: {
     description: d.description
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', d.roleId)
-    principalId: d.principalId
+    principalId: principalIds[d.principalKey]
     principalType: 'ServicePrincipal'
   }
 }]
 
 // On Key Vault: Automation Account (certificates officer, secrets officer)
 var keyVaultRoleAssignmentDefs = [
-  { key: 'automationAccountKeyVaultCertificatesOfficer', roleId: roleDefinitions.keyVaultCertificatesOfficer, principalId: automationAccount.identity.principalId, description: 'Automation Account -> Key Vault Certificates Officer -> Key Vault' }
-  { key: 'automationAccountKeyVaultSecretsOfficer',      roleId: roleDefinitions.keyVaultSecretsOfficer,      principalId: automationAccount.identity.principalId, description: 'Automation Account -> Key Vault Secrets Officer -> Key Vault' }
+  { key: 'automationAccountKeyVaultCertificatesOfficer', roleId: roleDefinitions.keyVaultCertificatesOfficer, principalKey: 'aa', description: 'Automation Account -> Key Vault Certificates Officer -> Key Vault' }
+  { key: 'automationAccountKeyVaultSecretsOfficer',      roleId: roleDefinitions.keyVaultSecretsOfficer,      principalKey: 'aa', description: 'Automation Account -> Key Vault Secrets Officer -> Key Vault' }
 ]
 resource keyVaultRoleAssignments 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for d in keyVaultRoleAssignmentDefs: {
   scope: keyVault
@@ -960,16 +982,16 @@ resource keyVaultRoleAssignments 'Microsoft.Authorization/roleAssignments@2022-0
   properties: {
     description: d.description
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', d.roleId)
-    principalId: d.principalId
+    principalId: principalIds[d.principalKey]
     principalType: 'ServicePrincipal'
   }
 }]
 
 // On Automation Account: AA self-reader (needed by hybrid workers to read AA variables) + Function App (reader, automation operator)
 var automationAccountRoleAssignmentDefs = [
-  { key: 'automationAccountReader',            roleId: roleDefinitions.reader,             principalId: automationAccount.identity.principalId, description: 'Automation Account -> Reader -> Automation Account (self; required for hybrid workers to read AA variables)' }
-  { key: 'functionAppAutomationAccountReader', roleId: roleDefinitions.reader,             principalId: functionApp.identity.principalId,       description: 'Function App -> Reader -> Automation Account' }
-  { key: 'functionAppAutomationOperator',      roleId: roleDefinitions.automationOperator, principalId: functionApp.identity.principalId,       description: 'Function App -> Automation Operator -> Automation Account' }
+  { key: 'automationAccountReader',            roleId: roleDefinitions.reader,             principalKey: 'aa', description: 'Automation Account -> Reader -> Automation Account (self; required for hybrid workers to read AA variables)' }
+  { key: 'functionAppAutomationAccountReader', roleId: roleDefinitions.reader,             principalKey: 'fa', description: 'Function App -> Reader -> Automation Account' }
+  { key: 'functionAppAutomationOperator',      roleId: roleDefinitions.automationOperator, principalKey: 'fa', description: 'Function App -> Automation Operator -> Automation Account' }
 ]
 resource automationAccountRoleAssignments 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for d in automationAccountRoleAssignmentDefs: {
   scope: automationAccount
@@ -977,7 +999,7 @@ resource automationAccountRoleAssignments 'Microsoft.Authorization/roleAssignmen
   properties: {
     description: d.description
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', d.roleId)
-    principalId: d.principalId
+    principalId: principalIds[d.principalKey]
     principalType: 'ServicePrincipal'
   }
 }]
