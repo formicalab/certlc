@@ -357,9 +357,9 @@ resource applicationInsights 'Microsoft.Insights/components@2020-02-02' = {
     DisableLocalAuth: true
   }
   dependsOn: [
-    // Avoid the "Workspace not active" race on first deployment by waiting until the workspace and its first child
-    // (the customTable) are both provisioned — by then the LAW backend is fully ready for App Insights to bind.
-    logAnalyticsWorkspace
+    // Wait until the customTable (the last LAW child to provision) exists. By then the workspace backend is
+    // fully ready, which avoids the "Workspace not active" race that App Insights would otherwise hit on first
+    // deployment. (logAnalyticsWorkspace itself is already an implicit dep via WorkspaceResourceId.)
     customTable
   ]
   tags: commonTags
