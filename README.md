@@ -130,6 +130,8 @@ PowerShell-based Azure Function that bridges the Storage Queue with the Automati
 - **certlc.ps1**: Main runbook handling certificate creation, renewal, and revocation operations. Executes on Hybrid Workers with CA access.
 - **certlcstats.ps1**: Scheduled runbook that collects certificate metadata from Key Vault and publishes to Log Analytics.
 
+Both runbooks run on a custom **PowerShell 7.6** runtime environment (default name `certlc-PowerShell-7-6`) created on the Automation Account by the Bicep template, with the `Az` and `Azure CLI` modules preloaded as default packages.
+
 ### Certificate Request Schema
 
 Requests are sent as JSON messages to the Storage Queue using CloudEventSchema. The schema varies by operation type:
