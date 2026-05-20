@@ -27,7 +27,7 @@ The identity deploying this Bicep template requires the following Azure role ass
 #### On the Deployment Resource Group (where CertLC resources will be created):
 - **Owner** role (or Contributor + User Access Administrator)
   - Required to create resources and assign RBAC roles to managed identities
-  - The template creates 12 role assignments for managed identities across various resources
+  - The template creates 13 role assignments for managed identities across various resources
 
 #### On the Private DNS Zones Resource Group (if zones are in a different subscription/resource group):
 - **Private DNS Zone Contributor** role
@@ -72,11 +72,13 @@ The Bicep template creates and configures the following Azure resources:
 
 #### 1. **Storage Account**
 - **Type**: Standard LRS with hierarchical namespace disabled
-- **Purpose**: Hosts the `certlc` queue for event-driven certificate lifecycle operations. It is also used by the Azure Function
+- **Purpose**: Hosts the `certlc` queue for event-driven certificate lifecycle operations. It is also used by the Azure Function and stores Event Grid dead-lettered messages
 - **Configuration**: 
   - Public network access disabled
+  - Cross-tenant replication disabled
   - Default to Azure AD authentication
   - Blob and Queue services enabled
+  - Dead-letter blob container `eventgrid-deadletter` for failed Event Grid deliveries
 - **Private Endpoints**:
   - Blob service endpoint
   - Queue service endpoint
@@ -84,13 +86,17 @@ The Bicep template creates and configures the following Azure resources:
 #### 2. **Log Analytics Workspace**
 - **Type**: PerGB2018 pricing tier
 - **Purpose**: Centralized logging and analytics for all CertLC components
-- **Configuration**: 30-day retention period
+- **Configuration**:
+  - Retention period (parameterized, default 30 days)
+  - Local (shared-key) authentication disabled — ingestion uses Entra ID only
 - **Used by**: Application Insights, Azure Monitor, and custom tables for certificate statistics
 
 #### 3. **Application Insights**
 - **Type**: Web application monitoring
 - **Purpose**: Application performance monitoring and diagnostics for the Function App
-- **Configuration**: Linked to Log Analytics Workspace
+- **Configuration**:
+  - Linked to Log Analytics Workspace
+  - Local authentication disabled — telemetry is ingested via the Function App's managed identity (Monitoring Metrics Publisher role) using `APPLICATIONINSIGHTS_AUTHENTICATION_STRING=Authorization=AAD`
 
 #### 4. **Custom Table** (`certlc_CL`)
 - **Type**: Custom table in Log Analytics Workspace
@@ -118,8 +124,9 @@ The Bicep template creates and configures the following Azure resources:
 - **Purpose**: Event-driven processing of certificate lifecycle events from the queue
 - **Configuration**:
   - Integrated with VNet via delegated subnet
-  - Connected to Storage Account and Application Insights using its system assigned managed identity for authentication
+  - Connected to Storage Account and Application Insights using its system-assigned managed identity for authentication (no instrumentation keys or connection strings with secrets)
   - Runtime: PowerShell 7.4
+  - Hardened: HTTPS only, FTPS state disabled, public network access restricted to the private endpoint
 - **Private Endpoint**: Secured with private endpoint for site access
 
 #### 8. **Automation Account**
@@ -127,7 +134,8 @@ The Bicep template creates and configures the following Azure resources:
 - **Purpose**: Orchestrates certificate operations with the Enterprise CA and Key Vault (runbook `certlc.ps1`); collects statistics about certificates in the KeyVault (runbook `certlcstats.ps1`)
 - **Configuration**:
   - Public network access disabled
-  - PowerShell 7.2 runtime environment configured
+  - Custom PowerShell 7.6 runtime environment (default name `certlc-PowerShell-7-6`, parameterized) used by both runbooks, with default packages `Az` 15.1.0 and `Azure CLI` 2.77.0 preloaded
+  - `disableLocalAuth: false` — kept enabled because legacy webhook authentication (key in query string) is still required by external callers that cannot use Entra ID
   - Includes encrypted variables used by the runbooks (CA name, PFX root folder, SMTP settings, Key Vault name, DCR details)
   - Two placeholder runbooks created: `certlc` and `certlcstats` (code must be uploaded post-deployment)
   - Hybrid Worker Group for on-premises CA communication
@@ -149,7 +157,8 @@ The Bicep template creates and configures the following Azure resources:
 - **Purpose**: Secure storage for certificates and secrets
 - **Configuration**:
   - Public network access disabled
-  - Soft delete enabled (7-day retention)
+  - Soft delete enabled (retention parameterized, default 7 days)
+  - Purge protection enabled (irreversible — soft-deleted objects cannot be purged before the retention window expires)
   - RBAC authorization mode
   - Diagnostic settings enabled: AuditEvent, AzurePolicyEvaluationDetails, AllMetrics sent to Log Analytics
 - **Private Endpoint**: Secured with private endpoint for vault access
@@ -173,6 +182,7 @@ The Bicep template creates and configures the following Azure resources:
   - Uses CloudEvents v1.0 schema
   - Message TTL: 1 day (86400 seconds)
   - Retry policy: 30 attempts over 1 day (1440 minutes)
+  - **Dead-letter destination**: failed deliveries are written to the `eventgrid-deadletter` blob container on the Storage Account (using the system topic's managed identity)
 
 ### Networking
 
@@ -206,7 +216,7 @@ Each private endpoint has an associated DNS zone group that links to the appropr
 
 ### Identity and Access Management
 
-#### 16. **Role Assignments** (12 total)
+#### 16. **Role Assignments** (13 total)
 
 **Automation Account Managed Identity** (4 assignments):
 - `Key Vault Certificates Officer` on Key Vault - For certificate requests
@@ -220,11 +230,12 @@ Each private endpoint has an associated DNS zone group that links to the appropr
 - `Storage Queue Data Message Processor` on Storage Account - For processing queue messages
 - `Reader` on Automation Account - For reading automation account information
 - `Automation Operator` on Automation Account - For starting runbook jobs
-- `Monitoring Metrics Publisher` on Application Insights - For telemetry and monitoring
+- `Monitoring Metrics Publisher` on Application Insights - For telemetry and monitoring (used with Entra ID auth)
 
-**Event Grid System Topic Managed Identity** (2 assignments):
+**Event Grid System Topic Managed Identity** (3 assignments):
 - `Storage Queue Data Reader` on Storage Account - For reading queue metadata
 - `Storage Queue Data Message Sender` on Storage Account - For sending certificate expiry events to queue
+- `Storage Blob Data Contributor` on Storage Account - For writing dead-lettered events to the `eventgrid-deadletter` blob container
 
 ## Parameters
 
@@ -241,8 +252,11 @@ The deployment requires the following parameters (configured in `parameters.dev.
 | `logAnalyticsWorkspaceName` | Name for the Log Analytics Workspace |
 | `applicationInsightsName` | Name for the Application Insights instance |
 | `automationAccountName` | Name for the Automation Account |
+| `runtimeEnvironmentName` | Name of the custom PowerShell 7.6 runtime environment created on the Automation Account and used by both runbooks (default `certlc-PowerShell-7-6`; names cannot contain dots) |
 | `hybridWorkerGroupName` | Name for the Hybrid Worker Group |
 | `keyVaultName` | Name for the Key Vault |
+| `logAnalyticsRetentionInDays` | Log Analytics Workspace retention in days (default 30) |
+| `keyVaultSoftDeleteRetentionInDays` | Key Vault soft-delete retention in days (default 7) |
 | `dataCollectionEndpointName` | Name for the Data Collection Endpoint |
 | `dataCollectionRuleName` | Name for the Data Collection Rule |
 | `automationAccountVarCA` | Certificate Authority name (CA_SERVER\\CA_NAME) |
@@ -304,7 +318,7 @@ The solution follows a secure-by-default architecture:
 
 ## RBAC Role Assignments
 
-The Bicep template automatically creates 12 role assignments for the managed identities. Additionally, one manual ACL configuration is required on the Enterprise CA.
+The Bicep template automatically creates 13 role assignments for the managed identities. Additionally, one manual ACL configuration is required on the Enterprise CA.
 
 ### Automation Account Managed Identity
 
@@ -332,6 +346,7 @@ The Bicep template automatically creates 12 role assignments for the managed ide
 |------|-------|---------|
 | Storage Queue Data Reader | Storage Account | Read queue metadata for event delivery |
 | Storage Queue Data Message Sender | Storage Account | Send certificate expiry events to queue |
+| Storage Blob Data Contributor | Storage Account | Write dead-lettered events to the `eventgrid-deadletter` blob container |
 
 ### Manual Configuration (On-Premises)
 
