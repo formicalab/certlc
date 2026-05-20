@@ -60,6 +60,9 @@ param hybridWorkerGroupName string
 @description('The name of the runbook to invoke for certificate lifecycle operations. Must match the runbook name deployed to the Automation Account.')
 param runbookName string
 
+@description('The name of the custom PowerShell 7.6 runtime environment to create on the Automation Account and use for the runbooks. Note: runtime environment names cannot contain dots.')
+param runtimeEnvironmentName string = 'certlc-PowerShell-7-6'
+
 @description('The name of the Key Vault to create. Must be globally unique, 3-24 characters, alphanumerics and hyphens. Stores and manages certificates with automated lifecycle tracking.')
 @minLength(3)
 @maxLength(24)
@@ -449,12 +452,31 @@ resource automationAccount 'Microsoft.Automation/automationAccounts@2024-10-23' 
   }
   properties: {
     publicNetworkAccess: false
-    disableLocalAuth: true
+    // Local auth must remain enabled so that webhooks invoked via key in the URL query string keep working
+    // (callers cannot use AAD). Do NOT set this to true unless all webhook callers have been migrated to AAD.
+    disableLocalAuth: false
     sku: {
       name: 'Basic'
     }
   }
   tags: commonTags
+
+  // Custom runtime environment based on PowerShell 7.6 with Az module preloaded
+  resource runtimeEnv 'runtimeEnvironments@2024-10-23' = {
+    name: runtimeEnvironmentName
+    location: location
+    properties: {
+      runtime: {
+        language: 'PowerShell'
+        version: '7.6'
+      }
+      defaultPackages: {
+        Az: '15.1.0'
+        AzureCLI: '2.77.0'
+      }
+    }
+    tags: commonTags
+  }
 
   // Runbook: certlc
   resource runbookCertLC 'runbooks@2024-10-23' = {
@@ -465,7 +487,7 @@ resource automationAccount 'Microsoft.Automation/automationAccounts@2024-10-23' 
       logProgress: false
       logVerbose: false
       description: 'Certificate lifecycle management runbook for enrollment, renewal, and revocation'
-      runtimeEnvironment: 'PowerShell-7.4'
+      runtimeEnvironment: runtimeEnv.name
     }
     tags: commonTags
   }
@@ -479,7 +501,7 @@ resource automationAccount 'Microsoft.Automation/automationAccounts@2024-10-23' 
       logProgress: false
       logVerbose: false
       description: 'Certificate statistics collection runbook for monitoring and reporting'
-      runtimeEnvironment: 'PowerShell-7.4'
+      runtimeEnvironment: runtimeEnv.name
     }
     tags: commonTags
   }
