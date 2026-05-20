@@ -472,7 +472,7 @@ resource automationAccount 'Microsoft.Automation/automationAccounts@2024-10-23' 
       }
       defaultPackages: {
         Az: '15.1.0'
-        AzureCLI: '2.77.0'
+        'Azure CLI': '2.77.0'
       }
     }
     tags: commonTags
