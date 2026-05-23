@@ -101,6 +101,18 @@ For certificate revocation requests, the body has a structure like this:
   }
 }
 
+Revocation semantics:
+- The thumbprint may refer to ANY version of the certificate in the key vault (latest or older).
+  The runbook locates the specific version whose x5t matches the supplied thumbprint.
+- The CA revokes the corresponding serial number using the supplied reason code.
+- In Key Vault, the matched version is set to attributes.enabled=false and tagged with
+  Revoked=true, RevokedAt=<UTC ISO-8601>, RevocationReason=<n>, RevokedJobId=<automation job id>.
+  Existing tags on the version (e.g. NotifyTo, Hostname, PfxProtectTo) are preserved.
+- The certificate object and other versions of the same certificate are NEVER deleted or modified.
+- If the revoked version is the latest version of the certificate, a warning is logged and
+  any subsequent CertificateNearExpiry event for the same certificate is ignored by the
+  renewal flow (it checks the latest version's Revoked tag and exits without renewing).
+
 You can also pass the RequestBody parameter explicitly, which must be a JSON string with the same structure as above.
 In this case, use the Start-AzAutomationRunbook cmdlet to start the runbook, passing the jsonRequestBody parameter:
 
@@ -1158,34 +1170,49 @@ function New-CertificateCreationRequest {
 <#
 
 .SYNOPSIS
-    Finds a certificate in Azure Key Vault by thumbprint and returns its name.
+    Finds a certificate version in Azure Key Vault by thumbprint.
 
 .DESCRIPTION
-    This function searches for a certificate in the specified Azure Key Vault using the
-    Key Vault REST API. Given a thumbprint, it enumerates all certificates (with pagination)
-    and returns the certificate name if found, or $null if not found.
+    Searches the specified Azure Key Vault for the version of any certificate whose thumbprint
+    (x5t) matches the supplied value. The thumbprint may correspond to any version of any
+    certificate - current ("latest") or older.
+
+    Algorithm:
+      1. List certificates with GET /certificates?api-version=2025-07-01 (one entry per
+         certificate name; the x5t exposed there is the thumbprint of the latest version
+         only). If a match is found here, the matched version is the latest version of that
+         certificate.
+      2. If no match in step 1, for each certificate listed in step 1 enumerate its versions
+         via GET /certificates/{name}/versions?api-version=2025-07-01 and compare x5t.
+
+    Pagination is handled for both listings via nextLink.
 
 .PARAMETER VaultName
     The name of the Azure Key Vault to query.
 
 .PARAMETER Thumbprint
-    The thumbprint of the certificate to find (hex format).
+    The thumbprint of the certificate version to find (hex format; spaces, dashes and
+    colons are stripped and case is normalized to uppercase).
 
 .OUTPUTS
-    String - The name of the certificate in the vault, or $null if not found.
+    [pscustomobject] with properties:
+      - Name     : certificate name in the vault
+      - Version  : version identifier of the matched version
+      - IsLatest : $true if the matched version is the latest version of the certificate
+    Returns $null when no version with the supplied thumbprint exists in the vault.
 
 .EXAMPLE
-    $certName = Get-CertificateByThumbprint -VaultName "mykeyvault" -Thumbprint "7CB8B52E7BA87B221534BB9B04A7FFF2D3FA59BA"
-    if ($certName) { Write-Host "Found: $certName" }
+    $match = Get-CertificateByThumbprint -VaultName 'mykeyvault' -Thumbprint '7CB8B52E7BA87B221534BB9B04A7FFF2D3FA59BA'
+    if ($match) { "Found $($match.Name) version $($match.Version) (latest: $($match.IsLatest))" }
 
 .NOTES
     Uses Key Vault REST API version 2025-07-01.
-    Requires an active Azure context with appropriate Key Vault permissions.
+    Requires an active Azure context with the certificates/list permission on the vault.
 
 #>
 
 function Get-CertificateByThumbprint {
-    [OutputType([string])]
+    [OutputType([pscustomobject])]
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
@@ -1197,7 +1224,7 @@ function Get-CertificateByThumbprint {
 
     # Normalize the input thumbprint (remove spaces, dashes, colons; convert to uppercase)
     $normalizedThumbprint = ($Thumbprint -replace '[^a-fA-F0-9]', '').ToUpper()
-    
+
     if ([string]::IsNullOrEmpty($normalizedThumbprint)) {
         throw [System.ArgumentException]::new('Get-CertificateByThumbprint: Thumbprint is empty after normalization.', 'Thumbprint')
     }
@@ -1214,6 +1241,12 @@ function Get-CertificateByThumbprint {
         return ($bytes | ForEach-Object { $_.ToString('X2') }) -join ''
     }
 
+    # Helper: Extract the last URL segment (certificate name or version) from a KV resource id
+    $lastSegment = {
+        param([string]$id)
+        return ($id -split '/')[-1]
+    }
+
     # Helper: Invoke Key Vault REST API
     $invokeApi = {
         param([string]$uri)
@@ -1228,42 +1261,88 @@ function Get-CertificateByThumbprint {
         return Invoke-RestMethod -Uri $uri -Method GET -Headers $headers
     }
 
-    # Build the base URI
     $vaultBaseUrl = "https://$VaultName.vault.azure.net"
-    $apiVersion = "2025-07-01"
+    $apiVersion = '2025-07-01'
+
+    # Step 1: enumerate certificates (one entry per cert name; x5t is the LATEST version's thumbprint)
+    # While iterating we also collect the certificate names so step 2 can fall back to per-cert version listings.
+    $certificateNames = New-Object 'System.Collections.Generic.List[string]'
     $uri = "$vaultBaseUrl/certificates?api-version=$apiVersion"
 
-    # Search for the certificate with matching thumbprint (handling pagination)
-    $foundCertName = $null
-    
     try {
-        :searchLoop do {
+        :latestLoop do {
             $response = & $invokeApi $uri
-            
+
             if ($response.value) {
                 foreach ($cert in $response.value) {
+                    # Capture the certificate name for the possible step-2 pass
+                    if ($cert.id) {
+                        # /certificates listing ids have the shape: <vaultBaseUrl>/certificates/<name>
+                        $name = & $lastSegment $cert.id
+                        if (-not [string]::IsNullOrEmpty($name)) {
+                            [void]$certificateNames.Add($name)
+                        }
+                    }
+
                     if ($cert.x5t) {
                         $certThumbprint = & $convertToHex $cert.x5t
-                        
                         if ($certThumbprint -eq $normalizedThumbprint) {
-                            # Extract certificate name from the ID URL
-                            $foundCertName = ($cert.id -split '/certificates/')[-1]
-                            break searchLoop
+                            # We matched against the latest-version thumbprint. The id of the listing
+                            # entry does NOT contain a version segment, so we resolve the latest version
+                            # id explicitly via /certificates/{name}.
+                            $certName = & $lastSegment $cert.id
+                            $bundleUri = "$vaultBaseUrl/certificates/$certName" + "?api-version=$apiVersion"
+                            $bundle = & $invokeApi $bundleUri
+                            $version = & $lastSegment $bundle.id
+                            return [pscustomobject]@{
+                                Name     = $certName
+                                Version  = $version
+                                IsLatest = $true
+                            }
                         }
                     }
                 }
             }
-            
-            # Check for pagination
+
             $uri = $response.nextLink
-            
         } while ($uri)
     }
     catch {
         throw [System.Exception]::new("Get-CertificateByThumbprint: Failed to enumerate certificates in vault '$VaultName'.", $_.Exception)
     }
 
-    return $foundCertName
+    # Step 2: no match against any latest version. Enumerate every cert's versions and compare x5t.
+    try {
+        foreach ($name in $certificateNames) {
+            $uri = "$vaultBaseUrl/certificates/$name/versions?api-version=$apiVersion"
+            do {
+                $response = & $invokeApi $uri
+                if ($response.value) {
+                    foreach ($ver in $response.value) {
+                        if ($ver.x5t) {
+                            $certThumbprint = & $convertToHex $ver.x5t
+                            if ($certThumbprint -eq $normalizedThumbprint) {
+                                # /certificates/{name}/versions listing ids have the shape:
+                                #   <vaultBaseUrl>/certificates/<name>/<version>
+                                $version = & $lastSegment $ver.id
+                                return [pscustomobject]@{
+                                    Name     = $name
+                                    Version  = $version
+                                    IsLatest = $false
+                                }
+                            }
+                        }
+                    }
+                }
+                $uri = $response.nextLink
+            } while ($uri)
+        }
+    }
+    catch {
+        throw [System.Exception]::new("Get-CertificateByThumbprint: Failed to enumerate certificate versions in vault '$VaultName'.", $_.Exception)
+    }
+
+    return $null
 }
 
 #endregion
@@ -1277,17 +1356,27 @@ function Get-CertificateByThumbprint {
 <#
 
 .SYNOPSIS
-    Revoke an existing certificate in Key Vault by sending a revocation request to the specified CA.
+    Revoke a specific version of a certificate by sending a revocation request to the CA, then
+    disable that version in Key Vault and tag it with audit metadata.
 
 .DESCRIPTION
-    This function revokes an existing certificate stored in Azure Key Vault by sending a revocation request to the specified Certificate Authority (CA).
-    The certificate is also deleted from the Key Vault after successful revocation.
+    This function revokes the specified version of a certificate stored in Azure Key Vault:
+      1. Loads the secret of the specific version to extract the X.509 serial number.
+      2. Submits a revocation request to the Certificate Authority (CA) for that serial.
+      3. Disables that Key Vault version (attributes.enabled=false) and tags it with
+         Revoked=true, RevokedAt, RevocationReason, RevokedJobId. Existing tags on the
+         version are preserved (read-merge-write).
+    The certificate object is NEVER deleted from Key Vault. Other versions of the same
+    certificate are not touched.
 
 .PARAMETER VaultName
     The name of the Azure Key Vault where the certificate is stored.
 
 .PARAMETER CertificateName
     The name of the certificate to revoke.
+
+.PARAMETER CertificateVersion
+    The version identifier of the certificate version to revoke.
 
 .PARAMETER RevocationReason
     The reason for revocation, specified as an integer value (0-6) according to the CRLReason codes:
@@ -1299,11 +1388,11 @@ function Get-CertificateByThumbprint {
         5 - Cessation of Operation
         6 - Certificate Hold
 
-.PARAMETER CA
-    The CA from which the certificate will be revoked.
+.PARAMETER JobId
+    The Automation runbook job id; written into the RevokedJobId tag for traceability.
 
 .EXAMPLE
-    New-CertificateRevocationRequest -VaultName "MyKeyVault" -CertificateName "MyCertificate" -RevocationReason 1 -CA "MyCA\MyInstance"
+    New-CertificateRevocationRequest -VaultName 'MyKeyVault' -CertificateName 'MyCertificate' -CertificateVersion 'abc123...' -RevocationReason 1 -JobId $jobId
 
 #>
 function New-CertificateRevocationRequest {
@@ -1316,43 +1405,48 @@ function New-CertificateRevocationRequest {
         [string]$CertificateName,
 
         [Parameter(Mandatory = $true)]
+        [string]$CertificateVersion,
+
+        [Parameter(Mandatory = $true)]
         [ValidateRange(0, 6)]
-        [Int64]$RevocationReason
+        [Int64]$RevocationReason,
+
+        [Parameter(Mandatory = $false)]
+        [string]$JobId
     )
 
-    # get the certificate from the key vault
-    Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "KeyVault: Certificate $($CertificateName): getting the certificate from key vault $VaultName to obtain details..."
+    # get the specific version of the certificate from the key vault, to extract its serial number
+    Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "KeyVault: Certificate $($CertificateName) version $($CertificateVersion): getting the version secret from key vault $VaultName to obtain details..."
     try {
-        $certBase64 = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertificateName -AsPlainText
+        $certBase64 = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertificateName -Version $CertificateVersion -AsPlainText
     }
     catch {
-        throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Error getting certificate $CertificateName from key vault $VaultName", $_.Exception)
+        throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Error getting certificate $CertificateName version $CertificateVersion from key vault $VaultName", $_.Exception)
     }
     if ([string]::IsNullOrEmpty($certBase64)) {
-        throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Certificate $CertificateName secret is empty in key vault $VaultName")
+        throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Certificate $CertificateName version $CertificateVersion secret is empty in key vault $VaultName")
     }
 
     # convert the base64 string to a byte array and create an X509Certificate2 object
     $certBytes = [Convert]::FromBase64String($certBase64)
     $certBase64 = $null
     $x509Cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($certBytes, [string]::Empty, 'Exportable')
-    # $x509Cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($certBytes, [string]::Empty, [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
 
-    # save the serial number
+    # save the serial number of this specific version
     $serialNumber = $x509Cert.SerialNumber
 
     # cleanup objects that are no longer needed
     $x509Cert = $null
     $certBytes = $null
 
-    Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "CA: Sending revocation request for certificate $CertificateName to the CA $CA using reason $($RevocationReason)..."
+    Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "CA: Sending revocation request for certificate $CertificateName version $CertificateVersion (serial $serialNumber) to the CA $CA using reason $($RevocationReason)..."
 
     try {
         $CertAdmin = New-Object -ComObject CertificateAuthority.Admin
         $CertAdmin.RevokeCertificate($CA, $serialNumber, $RevocationReason, 0)
     }
     catch {
-        throw [System.Exception]::new("New-CertificateRevocationRequest: CA: Error revoking certificate $CertificateName in CA $CA", $_.Exception)
+        throw [System.Exception]::new("New-CertificateRevocationRequest: CA: Error revoking certificate $CertificateName version $CertificateVersion (serial $serialNumber) in CA $CA", $_.Exception)
     }
     finally {
         if ($CertAdmin) {
@@ -1361,17 +1455,42 @@ function New-CertificateRevocationRequest {
         }
     }
 
-    Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "CA: Certificate $CertificateName revoked successfully in CA $($CA)."
+    Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "CA: Certificate $CertificateName version $CertificateVersion (serial $serialNumber) revoked successfully in CA $($CA)."
 
-    # remove the certificate from the key vault
-    Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "KeyVault: Removing certificate $CertificateName from key vault $($VaultName)..."
+    # disable the specific version in key vault and tag it with revocation audit metadata.
+    # The Key Vault Update Certificate PATCH endpoint replaces tags wholesale, so we must
+    # read the existing tags on this version, merge our revocation keys, and write back.
+    Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "KeyVault: Disabling certificate $CertificateName version $CertificateVersion in key vault $($VaultName) and tagging it as revoked..."
     try {
-        Remove-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -Force
+        $existingVersion = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -Version $CertificateVersion
     }
     catch {
-        throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Error removing certificate $CertificateName from key vault $VaultName", $_.Exception)
+        throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Error reading certificate $CertificateName version $CertificateVersion from key vault $VaultName for tag merge", $_.Exception)
     }
-    Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "KeyVault: Certificate $CertificateName removed from key vault $($VaultName)."
+
+    # build merged tag set: start from existing tags (if any), then overlay revocation metadata
+    $mergedTags = @{}
+    if ($null -ne $existingVersion -and $null -ne $existingVersion.Tags) {
+        foreach ($k in $existingVersion.Tags.Keys) {
+            $mergedTags[$k] = [string]$existingVersion.Tags[$k]
+        }
+    }
+    $mergedTags['Revoked']          = 'true'
+    $mergedTags['RevokedAt']        = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $mergedTags['RevocationReason'] = [string]$RevocationReason
+    if (-not [string]::IsNullOrEmpty($JobId)) {
+        $mergedTags['RevokedJobId'] = $JobId
+    }
+
+    # Update-AzKeyVaultCertificate wraps PATCH /certificates/{name}/{version}: -Enable $false and
+    # -Tag are applied in a single atomic call.
+    try {
+        $null = Update-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -Version $CertificateVersion -Enable $false -Tag $mergedTags -PassThru -ErrorAction Stop
+    }
+    catch {
+        throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Error disabling/tagging certificate $CertificateName version $CertificateVersion in key vault $VaultName", $_.Exception)
+    }
+    Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "KeyVault: Certificate $CertificateName version $CertificateVersion in key vault $($VaultName) has been disabled and tagged as revoked. The certificate object and other versions (if any) are left untouched."
 }
 
 #endregion
@@ -1623,6 +1742,23 @@ switch ($requestBody.type) {
         }
         if ($null -eq $cert) {
             Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Error getting certificate details for $CertificateName from vault $($VaultName): empty response! Certificate may not exist in the vault."
+        }
+
+        # If the latest version of this certificate was previously revoked by the runbook, the
+        # CertLC revocation flow tagged it with Revoked=true and set it to disabled. Auto-renewal
+        # in that situation would silently re-issue the certificate (new version, new serial) and
+        # effectively "un-revoke" the certificate name on the CA side. Skip the renewal in this
+        # case and require an explicit operator action (e.g. issue a brand new certificate or
+        # clear the Revoked tag manually).
+        $latestRevokedTag = $null
+        if ($null -ne $cert.Tags -and $cert.Tags.ContainsKey('Revoked')) {
+            $latestRevokedTag = [string]$cert.Tags['Revoked']
+        }
+        if ($latestRevokedTag -and $latestRevokedTag.Trim().ToLowerInvariant() -eq 'true') {
+            $revokedAt = if ($cert.Tags.ContainsKey('RevokedAt')) { [string]$cert.Tags['RevokedAt'] } else { '<unknown>' }
+            $revokedReason = if ($cert.Tags.ContainsKey('RevocationReason')) { [string]$cert.Tags['RevocationReason'] } else { '<unknown>' }
+            Write-CertLCLog -Section 'Dispatcher.Renewal' -Level 'Warning' -Message "Skipping auto-renewal of certificate $CertificateName in vault $($VaultName): the latest version is tagged as revoked (RevokedAt=$revokedAt, RevocationReason=$revokedReason). Issue a new certificate explicitly or clear the Revoked tag to resume auto-renewal."
+            return
         }
 
         # get NotifyTo from the certificate tags (optional)
@@ -1902,57 +2038,71 @@ switch ($requestBody.type) {
 
         if ($RevocationReason -notin 0, 1, 2, 3, 4, 5, 6) { Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "Revocation request validation: Invalid integer value for 'data.RevocationReason'. Supported: 0-6." }
 
-        # before processing the request, we need to find the certificate by thumbprint
-        Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Searching for certificate with thumbprint $CertificateThumbprint in key vault $VaultName..."
-        $CertificateName = $null
+        # before processing the request, we need to find the matching certificate version by thumbprint
+        Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Searching for certificate version with thumbprint $CertificateThumbprint in key vault $VaultName..."
+        $match = $null
         try {
-            $CertificateName = Get-CertificateByThumbprint -VaultName $VaultName -Thumbprint $CertificateThumbprint
+            $match = Get-CertificateByThumbprint -VaultName $VaultName -Thumbprint $CertificateThumbprint
         }
         catch {
             Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "Error finding certificate with thumbprint $CertificateThumbprint in vault $VaultName" -Inner $_.Exception
         }
-        if ($null -eq $CertificateName) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "No certificate found with thumbprint $CertificateThumbprint in vault $VaultName."
+        if ($null -eq $match) {
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "No certificate version found with thumbprint $CertificateThumbprint in vault $VaultName."
         }
-        Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Found certificate '$CertificateName' matching thumbprint $CertificateThumbprint in vault $VaultName."
+        $CertificateName    = $match.Name
+        $CertificateVersion = $match.Version
+        $IsLatestVersion    = [bool]$match.IsLatest
+        Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Found certificate '$CertificateName' version '$CertificateVersion' (IsLatest=$IsLatestVersion) matching thumbprint $CertificateThumbprint in vault $VaultName."
 
-        # Get the full certificate object to retrieve tags
+        # Get the matched certificate version to retrieve its tags (NotifyTo is read from the specific version,
+        # so older versions that carry their own NotifyTo are honored).
         $cert = $null
         try {
-            $cert = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName
+            $cert = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -Version $CertificateVersion
         }
         catch {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "Error getting certificate details for $CertificateName from vault $VaultName" -Inner $_.Exception
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "Error getting certificate details for $CertificateName version $CertificateVersion from vault $VaultName" -Inner $_.Exception
         }
         if ($null -eq $cert) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "Error getting certificate details for $CertificateName from vault $($VaultName): empty response!"
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "Error getting certificate details for $CertificateName version $CertificateVersion from vault $($VaultName): empty response!"
         }
 
-        # get NotifyTo from the certificate tags (optional)
+        # get NotifyTo from the certificate version tags (optional)
         $rawNotifyTo = $cert.Tags['NotifyTo']
         if ([string]::IsNullOrWhiteSpace($rawNotifyTo)) {
             $notifyTo = $null
-            Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "No NotifyTo addresses found for certificate $CertificateName in vault $VaultName."
+            Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "No NotifyTo addresses found for certificate $CertificateName version $CertificateVersion in vault $VaultName."
         }
         else {
-            Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "NotifyTo addresses found for certificate $CertificateName in vault ${VaultName}: $rawNotifyTo"
+            Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "NotifyTo addresses found for certificate $CertificateName version $CertificateVersion in vault ${VaultName}: $rawNotifyTo"
             $notifyTo = $rawNotifyTo.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
         }
 
         # end of validation. Now process the certificate revocation request
 
-        Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Performing certificate revocation request for certificate $CertificateName in vault $VaultName with reason $RevocationReason..."
+        Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Performing certificate revocation for certificate $CertificateName version $CertificateVersion in vault $VaultName with reason $RevocationReason..."
         try {
-            New-CertificateRevocationRequest -VaultName $VaultName -CertificateName $CertificateName -RevocationReason $RevocationReason
+            New-CertificateRevocationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateVersion $CertificateVersion -RevocationReason $RevocationReason -JobId $jobId
         }
         catch {
             Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message 'Error processing certificate revocation request' -Inner $_.Exception -NotifyTo $NotifyTo
         }
 
+        # If the revoked version was the latest version of the certificate, warn the operator:
+        # any consumer that requests this certificate without specifying a version will receive
+        # a "disabled" error from Key Vault until either a new version is created (e.g. via the
+        # renewal flow) or the version is manually re-enabled. Auto-renewal via the near-expiry
+        # event is suppressed for revoked versions (see DISPATCHER.RENEWAL).
+        if ($IsLatestVersion) {
+            Write-CertLCLog -Section 'Dispatcher.Revocation' -Level 'Warning' -Message "The revoked version $CertificateVersion is the LATEST version of certificate $CertificateName in vault $VaultName. Consumers requesting this certificate without specifying a version will now receive an error from Key Vault until a new version is created."
+        }
+
         # send notification email if requested and SMTP is configured
         if ($NotifyTo -and -not [string]::IsNullOrEmpty($SmtpServer)) {
-            $subject = "Certificate $CertificateName revoked successfully"
-            $fragment = [System.Net.WebUtility]::HtmlEncode("The certificate $CertificateName has been successfully revoked in CA and deleted from the Key Vault $VaultName.")
+            $subject = "Certificate $CertificateName version revoked successfully"
+            $fragmentText = "The version $CertificateVersion of certificate $CertificateName has been revoked at the CA and disabled in Key Vault $VaultName. The certificate object remains in the vault for audit purposes; other versions (if any) are unaffected."
+            $fragment = [System.Net.WebUtility]::HtmlEncode($fragmentText)
             $body = $CertificateNotificationEmailBodyHtml -replace '__CONTENT__', $fragment
             Send-NotificationEmail -SmtpServer $SmtpServer -FromAddress $fromAddress -To $NotifyTo -Subject $subject -Body $body -smtpCredential $SmtpCredential
         }
@@ -1961,7 +2111,7 @@ switch ($requestBody.type) {
         }
 
         # confirm revocation
-        Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Certificate $CertificateName was successfully revoked."
+        Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Certificate $CertificateName version $CertificateVersion was successfully revoked (CA: serial revoked; KeyVault: version disabled and tagged)."
     }
 
     #endregion

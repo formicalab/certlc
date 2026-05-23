@@ -75,10 +75,11 @@ CertLC provides end-to-end automation for managing certificates stored in Azure 
 
 ### Certificate Revocation Flow
 
-1. A revocation request with the certificate thumbprint is sent to the Storage Queue
+1. A revocation request with a certificate thumbprint (any version, current or older) is sent to the Storage Queue
 2. The Function App triggers the `certlc` runbook
-3. The runbook locates the certificate by thumbprint and submits a revocation request to the CA
-4. The certificate is removed from Key Vault after successful revocation
+3. The runbook locates the matching Key Vault version by thumbprint, extracts its serial number, and submits a revocation request to the CA for that serial
+4. The matching Key Vault version is set to `enabled = false` and tagged with audit metadata (`Revoked=true`, `RevokedAt`, `RevocationReason`, `RevokedJobId`). **No Key Vault objects are deleted by the runbook**; other versions of the same certificate are left untouched, and the certificate object remains in the vault for audit
+5. If the revoked version is the latest version of the certificate, subsequent `CertificateNearExpiry` events for that certificate are ignored (the renewal branch detects the `Revoked` tag on the latest version and skips auto-renewal)
 
 ### Statistics Collection
 

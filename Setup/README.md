@@ -314,6 +314,7 @@ The solution follows a secure-by-default architecture:
 - Role-based access control (RBAC) follows the principle of least privilege
 - Automation Account variables for sensitive data are encrypted
 - Key Vault uses RBAC authorization and soft delete protection
+- The runbook never deletes certificates from Key Vault: revocations are recorded by disabling the specific version and tagging it (`Revoked=true`, `RevokedAt`, `RevocationReason`, `RevokedJobId`). Vault soft-delete / purge-protection settings still apply to operator actions performed outside the runbook
 - Diagnostic settings enabled on critical resources (Automation Account, Key Vault) for audit logging
 
 ## RBAC Role Assignments
