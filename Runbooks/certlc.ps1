@@ -747,7 +747,7 @@ function Export-PfxWithGroupProtection {
     if ($hr) {
         throw 'Export-PfxWithGroupProtection: NCryptCreateProtectionDescriptor failed: 0x{0:X}' -f $hr
     }
-    Write-CertLCLog -Section 'Export-PfxWithGroupProtection' "Protection descriptor handle: $hDesc"
+    Write-CertLCLog -Section 'Export-PfxWithGroupProtection' -Message "Protection descriptor handle: $hDesc"
 
     try {
 
@@ -756,7 +756,7 @@ function Export-PfxWithGroupProtection {
         if ($store -eq [IntPtr]::Zero) {
             throw 'Export-PfxWithGroupProtection: CertOpenStore failed: 0x{0:X}' -f [Runtime.InteropServices.Marshal]::GetLastWin32Error()
         }
-        Write-CertLCLog -Section 'Export-PfxWithGroupProtection' "Memory store handle: $store"
+        Write-CertLCLog -Section 'Export-PfxWithGroupProtection' -Message "Memory store handle: $store"
 
         try {
 
@@ -782,7 +782,7 @@ function Export-PfxWithGroupProtection {
                 if (-not [Win32Native]::PFXExportCertStoreEx($store, [ref]$blob, $password, $pvPara, $flags)) {
                     throw ('Export-PfxWithGroupProtection:: size query failed: 0x{0:X}' -f [Runtime.InteropServices.Marshal]::GetLastWin32Error())
                 }
-                Write-CertLCLog -Section 'Export-PfxWithGroupProtection' "PFX size will be: $($blob.cbData) bytes"
+                Write-CertLCLog -Section 'Export-PfxWithGroupProtection' -Message "PFX size will be: $($blob.cbData) bytes"
 
                 # allocate memory for the PFX data (pass 2)
                 $blob.pbData = [Runtime.InteropServices.Marshal]::AllocHGlobal($blob.cbData)
@@ -800,7 +800,7 @@ function Export-PfxWithGroupProtection {
                     $bytes = New-Object byte[] $blob.cbData
                     [Runtime.InteropServices.Marshal]::Copy($blob.pbData, $bytes, 0, $blob.cbData)
                     [System.IO.File]::WriteAllBytes($PfxFile, $bytes)
-                    Write-CertLCLog -Section 'Export-PfxWithGroupProtection' "PFX exported to file: $PfxFile"
+                    Write-CertLCLog -Section 'Export-PfxWithGroupProtection' -Message "PFX exported to file: $PfxFile"
                 }
                 finally {
                     # free the allocated memory for PFX data
@@ -1660,7 +1660,7 @@ if ([string]::IsNullOrEmpty($jsonRequestBody)) {
         else { Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'WebhookData.RequestBody not recognized using regex!' }
     }
 
-    if ([string]::IsNullOrEmpty($requestBody)) {
+    if ($null -eq $requestBody) {
         Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'WebhookData.RequestBody is empty! Ensure the runbook is called from a webhook!'
     }
 }
@@ -1764,7 +1764,7 @@ switch ($requestBody.type) {
         # get NotifyTo from the certificate tags (optional)
         $rawNotifyTo = $cert.Tags['NotifyTo']
         if ([string]::IsNullOrWhiteSpace($rawNotifyTo)) {
-            $notifyTo = null
+            $notifyTo = $null
             Write-CertLCLog -Section 'Dispatcher.Renewal' -Message "No NotifyTo addresses found for certificate $CertificateName in vault $VaultName."
         }
         else {
@@ -1803,7 +1803,7 @@ switch ($requestBody.type) {
 
         # lookup the template name using the OID
         try {
-            Write-CertLCLog -Section 'Dispatcher.Renewal' "Looking up template name for OID: $oid"
+            Write-CertLCLog -Section 'Dispatcher.Renewal' -Message "Looking up template name for OID: $oid"
             $certificateTemplateName = Find-TemplateName -cnOrDisplayNameOrOid $oid
         }
         catch {
