@@ -368,6 +368,39 @@ function Send-NotificationEmail {
 
 #endregion
 
+#region ### Send-SuccessNotification ###
+
+#########################################
+# FUNCTIONS - Send-SuccessNotification  #
+#########################################
+
+# Shared success-email helper used by the dispatcher success paths (creation/renewal/revocation).
+# Returns silently if NotifyTo is empty. Logs a warning if NotifyTo is set but SmtpServer is not.
+function Send-SuccessNotification {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Section,
+        [Parameter(Mandatory)][string]$Subject,
+        [Parameter(Mandatory)][string]$BodyText,
+        [Parameter()][string[]]$NotifyTo,
+        [Parameter()][string]$SmtpServer,
+        [Parameter()][string]$FromAddress,
+        [Parameter()][pscredential]$SmtpCredential
+    )
+
+    if (-not $NotifyTo) { return }
+    if ([string]::IsNullOrEmpty($SmtpServer)) {
+        Write-CertLCLog -Section $Section -Level 'Warning' -Message 'Notification requested but SMTP is not configured. Skipping email notification.'
+        return
+    }
+
+    $fragment = [System.Net.WebUtility]::HtmlEncode($BodyText)
+    $body = $CertificateNotificationEmailBodyHtml -replace '__CONTENT__', $fragment
+    Send-NotificationEmail -SmtpServer $SmtpServer -FromAddress $FromAddress -To $NotifyTo -Subject $Subject -Body $body -SmtpCredential $SmtpCredential
+}
+
+#endregion
+
 #region ### Write-CertLCLogAndThrow ###
 
 #######################################
@@ -592,16 +625,9 @@ function Convert-PfxProtectToForTag {
         [string[]] $Value
     )
 
-    if (-not $Value -or $Value.Count -eq 0) { return '' }
-
-    # Trim, remove empties, dedupe (case-insensitive), preserve order of first occurrence
-    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    $clean = foreach ($v in $Value) {
-        $t = ($v | ForEach-Object { ($_ ?? '') }) -as [string]
-        $t = $t.Trim()
-        if ($t -and $seen.Add($t)) { $t }
-    }
-    return ($clean -join ';')
+    # Delegate normalization (trim, drop empties, collapse backslashes, dedupe) to Format-PfxProtectTo
+    # to keep both helpers in sync; then join with semicolons for tag storage.
+    return ((Format-PfxProtectTo -InputValue $Value) -join ';')
 }
 
 #endregion
@@ -1412,7 +1438,12 @@ function New-CertificateRevocationRequest {
         [Int64]$RevocationReason,
 
         [Parameter(Mandatory = $false)]
-        [string]$JobId
+        [string]$JobId,
+
+        # Optional: pre-fetched tags of the specific version (passed by the dispatcher to avoid a
+        # second Get-AzKeyVaultCertificate round-trip). If not provided, the function fetches them.
+        [Parameter(Mandatory = $false)]
+        [System.Collections.IDictionary]$ExistingTags
     )
 
     # get the specific version of the certificate from the key vault, to extract its serial number
@@ -1459,20 +1490,30 @@ function New-CertificateRevocationRequest {
 
     # disable the specific version in key vault and tag it with revocation audit metadata.
     # The Key Vault Update Certificate PATCH endpoint replaces tags wholesale, so we must
-    # read the existing tags on this version, merge our revocation keys, and write back.
+    # start from the existing tags on this version, merge our revocation keys, and write back.
     Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "KeyVault: Disabling certificate $CertificateName version $CertificateVersion in key vault $($VaultName) and tagging it as revoked..."
-    try {
-        $existingVersion = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -Version $CertificateVersion
+
+    # Source the existing tags: prefer the caller-provided snapshot to avoid a second round-trip;
+    # otherwise fetch the version now.
+    $sourceTags = $null
+    if ($PSBoundParameters.ContainsKey('ExistingTags') -and $null -ne $ExistingTags) {
+        $sourceTags = $ExistingTags
     }
-    catch {
-        throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Error reading certificate $CertificateName version $CertificateVersion from key vault $VaultName for tag merge", $_.Exception)
+    else {
+        try {
+            $existingVersion = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -Version $CertificateVersion
+        }
+        catch {
+            throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Error reading certificate $CertificateName version $CertificateVersion from key vault $VaultName for tag merge", $_.Exception)
+        }
+        if ($null -ne $existingVersion) { $sourceTags = $existingVersion.Tags }
     }
 
     # build merged tag set: start from existing tags (if any), then overlay revocation metadata
     $mergedTags = @{}
-    if ($null -ne $existingVersion -and $null -ne $existingVersion.Tags) {
-        foreach ($k in $existingVersion.Tags.Keys) {
-            $mergedTags[$k] = [string]$existingVersion.Tags[$k]
+    if ($null -ne $sourceTags) {
+        foreach ($k in $sourceTags.Keys) {
+            $mergedTags[$k] = [string]$sourceTags[$k]
         }
     }
     $mergedTags['Revoked']          = 'true'
@@ -1554,37 +1595,33 @@ if ([string]::IsNullOrEmpty($PfxRootFolder)) {
     Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-pfxrootfolder' is missing or empty. Ensure this variable exists in the automation account."
 }
 
-# Validate SMTP variables
-# Case 1: SmtpServer is empty or missing - all other SMTP variables must also be empty
+# Validate SMTP variables.
+# - If SmtpServer is empty, no other SMTP variable may be set.
+# - If SmtpServer is set, FromAddress is required; SmtpUser and SmtpPassword must be both set or both empty.
 if ([string]::IsNullOrEmpty($SmtpServer)) {
-    if (-not [string]::IsNullOrEmpty($FromAddress)) {
-        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtpfrom' is set, but 'certlc-smtpserver' is missing or empty. When SmtpServer is not configured, all other SMTP variables must be missing or empty."
-    }
-    if (-not [string]::IsNullOrEmpty($SmtpUser)) {
-        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtpuser' is set, but 'certlc-smtpserver' is missing or empty. When SmtpServer is not configured, all other SMTP variables must be missing or empty."
-    }
-    if (-not [string]::IsNullOrEmpty($SmtpPassword)) {
-        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtppassword' is set, but 'certlc-smtpserver' is missing or empty. When SmtpServer is not configured, all other SMTP variables must be missing or empty."
+    foreach ($pair in @(
+            @{ Name = 'certlc-smtpfrom';     Value = $FromAddress },
+            @{ Name = 'certlc-smtpuser';     Value = $SmtpUser },
+            @{ Name = 'certlc-smtppassword'; Value = $SmtpPassword }
+        )) {
+        if (-not [string]::IsNullOrEmpty($pair.Value)) {
+            Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable '$($pair.Name)' is set, but 'certlc-smtpserver' is missing or empty. When SmtpServer is not configured, all other SMTP variables must be missing or empty."
+        }
     }
     Write-CertLCLog -Section 'Dispatcher' -Message 'SMTP: Email notifications are disabled (SmtpServer is not configured).'
 }
-# Case 2: SmtpServer is set - validate FromAddress and authentication variables
 else {
     if ([string]::IsNullOrEmpty($FromAddress)) {
         Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtpserver' is set, but 'certlc-smtpfrom' is missing or empty. Both must be set to send email."
     }
-    # Check SmtpUser and SmtpPassword: both must be set or both must be empty
     $userSet = -not [string]::IsNullOrEmpty($SmtpUser)
     $passSet = -not [string]::IsNullOrEmpty($SmtpPassword)
-    if ($userSet -and -not $passSet) {
-        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtpuser' is set, but 'certlc-smtppassword' is missing or empty. Both must be set to use authentication, or both must be missing or empty for unauthenticated email."
-    }
-    if ($passSet -and -not $userSet) {
-        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtppassword' is set, but 'certlc-smtpuser' is missing or empty. Both must be set to use authentication, or both must be missing or empty for unauthenticated email."
+    if ($userSet -xor $passSet) {
+        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variables 'certlc-smtpuser' and 'certlc-smtppassword' must be both set (to use SMTP authentication) or both empty (for unauthenticated email). Currently only one of them is set."
     }
 }
 
-# prepare the smtp credentials (only if SmtpServer is configured)
+# Prepare the SMTP credentials (only if SmtpServer is configured)
 $SmtpCredential = $null
 if (-not [string]::IsNullOrEmpty($SmtpServer)) {
     if (-not [string]::IsNullOrEmpty($SmtpUser) -and -not [string]::IsNullOrEmpty($SmtpPassword)) {
@@ -1596,6 +1633,14 @@ if (-not [string]::IsNullOrEmpty($SmtpServer)) {
     else {
         Write-CertLCLog -Section 'Dispatcher' -Message 'SMTP: No authentication will be used to send email. Ensure the SMTP server allows unauthenticated email from this host!' -Level 'Warning'
     }
+}
+
+# Common SMTP arguments, splatted by Write-CertLCLogAndThrow and Send-SuccessNotification call sites.
+# Splatting an empty/null SmtpServer is intentional: the helpers treat that as "SMTP disabled".
+$smtpArgs = @{
+    SmtpServer     = $SmtpServer
+    FromAddress    = $FromAddress
+    SmtpCredential = $SmtpCredential
 }
 
 # Check if we have the jsonRequestBody parameter
@@ -1787,7 +1832,7 @@ switch ($requestBody.type) {
         # get the OID of the Certificate Template
         $templateExtension = $cert.Certificate.Extensions | Where-Object { $_.Oid.FriendlyName -eq 'Certificate Template Information' }
         if ($null -eq $templateExtension) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message 'Error getting template information from certificate: the Certificate Template Information extension was not found.' -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message 'Error getting template information from certificate: the Certificate Template Information extension was not found.' -NotifyTo $NotifyTo @smtpArgs
         }
         # $templateExtension.Format($false) returns a string like:
         # - Template=Flab-ShortWebServer(1.3.6.1.4.1.311.21.8.15431357.2613787.6440092.16459852.14380503.11.12399345.16691736), Major Version Number=100, Minor Version Number=5
@@ -1797,7 +1842,7 @@ switch ($requestBody.type) {
         # extract the OID using a regex working for both cases
         $regex = [regex]'(?<=Template=(?:[^\(]*\()?)(\d+(?:\.\d+)+)'
         if (-not $regex.IsMatch($asn)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Error getting OID from certificate: Template OID not found in string: $asn" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Error getting OID from certificate: Template OID not found in string: $asn" -NotifyTo $NotifyTo @smtpArgs
         }
         $oid = $regex.Match($asn).Value
 
@@ -1807,17 +1852,17 @@ switch ($requestBody.type) {
             $certificateTemplateName = Find-TemplateName -cnOrDisplayNameOrOid $oid
         }
         catch {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Error resolving template name for OID $oid" -Inner $_.Exception -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Error resolving template name for OID $oid" -Inner $_.Exception -NotifyTo $NotifyTo @smtpArgs
         }
         if ([string]::IsNullOrEmpty($certificateTemplateName)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Error resolving template name for OID $($oid): template not found in AD." -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Error resolving template name for OID $($oid): template not found in AD." -NotifyTo $NotifyTo @smtpArgs
         }
         Write-CertLCLog -Section 'Dispatcher.Renewal' -Message "Template name found for OID $($oid) is: $certificateTemplateName"
 
         # Hostname from the certificate tags
         $Hostname = $cert.Tags['Hostname']
         if ([string]::IsNullOrWhiteSpace($Hostname)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Missing mandatory Hostname tag on certificate $CertificateName in vault $VaultName." -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Missing mandatory Hostname tag on certificate $CertificateName in vault $VaultName." -NotifyTo $NotifyTo @smtpArgs
         }
         Write-CertLCLog -Section 'Dispatcher.Renewal' -Message "Hostname: $Hostname"
 
@@ -1826,7 +1871,7 @@ switch ($requestBody.type) {
         $PfxProtectTo = Convert-PfxProtectToFromTag -TagValue $rawPfxProtectTo
         # After normalization functions, simply checking truthiness is enough; avoid .Count under StrictMode on potential scalars
         if (-not $PfxProtectTo) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Missing mandatory PfxProtectTo tag on certificate $CertificateName in vault $VaultName." -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Missing mandatory PfxProtectTo tag on certificate $CertificateName in vault $VaultName." -NotifyTo $NotifyTo @smtpArgs
         }
         Write-CertLCLog -Section 'Dispatcher.Renewal' -Message "PfxProtectTo principals: $($PfxProtectTo -join ', ')"
 
@@ -1847,19 +1892,14 @@ switch ($requestBody.type) {
             New-CertificateCreationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplateName $certificateTemplateName -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -Hostname $Hostname -PfxProtectTo $PfxProtectTo -NotifyTo $NotifyTo
         }
         catch {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message 'Error processing certificate creation request' -Inner $_.Exception -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message 'Error processing certificate creation request' -Inner $_.Exception -NotifyTo $NotifyTo @smtpArgs
         }
 
         # send notification email if requested and SMTP is configured
-        if ($NotifyTo -and -not [string]::IsNullOrEmpty($SmtpServer)) {
-            $subject = "Certificate $CertificateName renewed successfully"
-            $fragment = [System.Net.WebUtility]::HtmlEncode("A new version of certificate $CertificateName has been successfully renewed in the Key Vault $VaultName.")
-            $body = $CertificateNotificationEmailBodyHtml -replace '__CONTENT__', $fragment
-            Send-NotificationEmail -SmtpServer $SmtpServer -FromAddress $fromAddress -To $NotifyTo -Subject $subject -Body $body -SmtpCredential $SmtpCredential
-        }
-        elseif ($NotifyTo -and [string]::IsNullOrEmpty($SmtpServer)) {
-            Write-CertLCLog -Section 'Dispatcher.Renewal' -Message "Notification requested but SMTP is not configured. Skipping email notification." -Level 'Warning'
-        }
+        Send-SuccessNotification -Section 'Dispatcher.Renewal' `
+            -Subject "Certificate $CertificateName renewed successfully" `
+            -BodyText "A new version of certificate $CertificateName has been successfully renewed in the Key Vault $VaultName." `
+            -NotifyTo $NotifyTo @smtpArgs
 
         # confirm renewal
         Write-CertLCLog -Section 'Dispatcher.Renewal' -Message "Certificate $CertificateName was successfully renewed."
@@ -1894,12 +1934,12 @@ switch ($requestBody.type) {
 
         # VaultName: presence and non-empty check
         if ([string]::IsNullOrEmpty($VaultName)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.VaultName' in request body!" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.VaultName' in request body!" -NotifyTo $NotifyTo @smtpArgs
         }
 
         # CertificateName: presence and non-empty check
         if ([string]::IsNullOrEmpty($CertificateName)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.ObjectName' in request body!" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.ObjectName' in request body!" -NotifyTo $NotifyTo @smtpArgs
         }
 
         # CertificateName: check if the certificate already exists in the key vault
@@ -1907,15 +1947,15 @@ switch ($requestBody.type) {
             $deletedCert = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -InRemovedState
         }
         catch {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message 'Error checking for deleted certificate' -Inner $_.Exception -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message 'Error checking for deleted certificate' -Inner $_.Exception -NotifyTo $NotifyTo @smtpArgs
         }
         if (($null -ne $deletedCert) -and ($null -ne $deletedCert.DeletedDate)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Certificate $CertificateName is deleted since $($deletedCert.DeletedDate). Purge it or use a different name." -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Certificate $CertificateName is deleted since $($deletedCert.DeletedDate). Purge it or use a different name." -NotifyTo $NotifyTo @smtpArgs
         }
 
         # CertificateTemplate: presence and non-empty check
         if ([string]::IsNullOrEmpty($CertificateTemplate)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.CertificateTemplate' in request body!" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.CertificateTemplate' in request body!" -NotifyTo $NotifyTo @smtpArgs
         }
 
         # CertificateTemplate: check if the template exists in AD; caller may have specified the template name (CN) or the display name or the OID. We need the 'name' attribute
@@ -1923,39 +1963,39 @@ switch ($requestBody.type) {
             $CertificateTemplateName = Find-TemplateName -cnOrDisplayNameOrOid $CertificateTemplate
         }
         catch {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message 'Error resolving template name' -Inner $_.Exception -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message 'Error resolving template name' -Inner $_.Exception -NotifyTo $NotifyTo @smtpArgs
         }
         if ([string]::IsNullOrEmpty($CertificateTemplateName)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Certificate template $CertificateTemplate not found in Active Directory!" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Certificate template $CertificateTemplate not found in Active Directory!" -NotifyTo $NotifyTo @smtpArgs
         }
 
         # CertificateSubject: presence and non-empty check
         if ([string]::IsNullOrEmpty($CertificateSubject)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.CertificateSubject' in request body!" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.CertificateSubject' in request body!" -NotifyTo $NotifyTo @smtpArgs
         }
 
         # DnsNames (optional, but if specified, must be an array)
         if ($CertificateDnsNames -and $CertificateDnsNames -isnot [array]) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Parameter 'CertificateDnsNames' is not an array!" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Parameter 'CertificateDnsNames' is not an array!" -NotifyTo $NotifyTo @smtpArgs
         }
 
         # Hostname
         if ([string]::IsNullOrWhiteSpace($Hostname)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.Hostname' in request body!" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.Hostname' in request body!" -NotifyTo $NotifyTo @smtpArgs
         }
         $Hostname = $Hostname.Trim().ToLower()
         if ($Hostname -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9\-\.]{0,253})$') {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Hostname '$Hostname' is not valid!" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Hostname '$Hostname' is not valid!" -NotifyTo $NotifyTo @smtpArgs
         }
 
         # PfxProtectTo
         if (-not $PfxProtectTo) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing mandatory parameter 'PfxProtectTo'!" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing mandatory parameter 'PfxProtectTo'!" -NotifyTo $NotifyTo @smtpArgs
         }
         $PfxProtectTo = Format-PfxProtectTo -InputValue $PfxProtectTo
         # Avoid .Count: Format-PfxProtectTo guarantees array; empty array evaluates to $false
         if (-not $PfxProtectTo) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message 'PfxProtectTo list is empty after normalization!' -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message 'PfxProtectTo list is empty after normalization!' -NotifyTo $NotifyTo @smtpArgs
         }
 
         # end of validation. Now process the new certificate request
@@ -1971,19 +2011,14 @@ switch ($requestBody.type) {
             New-CertificateCreationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplateName $CertificateTemplateName -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -Hostname $Hostname -PfxProtectTo $PfxProtectTo -NotifyTo $NotifyTo
         }
         catch {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message 'Error processing new certificate request' -Inner $_.Exception -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message 'Error processing new certificate request' -Inner $_.Exception -NotifyTo $NotifyTo @smtpArgs
         }
 
         # send notification email if requested and SMTP is configured
-        if ($NotifyTo -and -not [string]::IsNullOrEmpty($SmtpServer)) {
-            $subject = "Certificate $CertificateName created successfully"
-            $fragment = [System.Net.WebUtility]::HtmlEncode("A new certificate $CertificateName has been successfully created in the Key Vault $VaultName.")
-            $body = $CertificateNotificationEmailBodyHtml -replace '__CONTENT__', $fragment
-            Send-NotificationEmail -SmtpServer $SmtpServer -FromAddress $fromAddress -To $NotifyTo -Subject $subject -Body $body -SmtpCredential $SmtpCredential
-        }
-        elseif ($NotifyTo -and [string]::IsNullOrEmpty($SmtpServer)) {
-            Write-CertLCLog -Section 'Dispatcher.Creation' -Message "Notification requested but SMTP is not configured. Skipping email notification." -Level 'Warning'
-        }
+        Send-SuccessNotification -Section 'Dispatcher.Creation' `
+            -Subject "Certificate $CertificateName created successfully" `
+            -BodyText "A new certificate $CertificateName has been successfully created in the Key Vault $VaultName." `
+            -NotifyTo $NotifyTo @smtpArgs
 
         # confirm creation
         Write-CertLCLog -Section 'Dispatcher.Creation' -Message "Certificate $CertificateName was successfully created."
@@ -2083,7 +2118,9 @@ switch ($requestBody.type) {
 
         Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Performing certificate revocation for certificate $CertificateName version $CertificateVersion in vault $VaultName with reason $RevocationReason..."
         try {
-            New-CertificateRevocationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateVersion $CertificateVersion -RevocationReason $RevocationReason -JobId $jobId
+            # Pass the already-fetched version tags so New-CertificateRevocationRequest does not
+            # need a second Get-AzKeyVaultCertificate round-trip just to merge them.
+            New-CertificateRevocationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateVersion $CertificateVersion -RevocationReason $RevocationReason -JobId $jobId -ExistingTags $cert.Tags
         }
         catch {
             Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message 'Error processing certificate revocation request' -Inner $_.Exception -NotifyTo $NotifyTo
@@ -2099,16 +2136,10 @@ switch ($requestBody.type) {
         }
 
         # send notification email if requested and SMTP is configured
-        if ($NotifyTo -and -not [string]::IsNullOrEmpty($SmtpServer)) {
-            $subject = "Certificate $CertificateName version revoked successfully"
-            $fragmentText = "The version $CertificateVersion of certificate $CertificateName has been revoked at the CA and disabled in Key Vault $VaultName. The certificate object remains in the vault for audit purposes; other versions (if any) are unaffected."
-            $fragment = [System.Net.WebUtility]::HtmlEncode($fragmentText)
-            $body = $CertificateNotificationEmailBodyHtml -replace '__CONTENT__', $fragment
-            Send-NotificationEmail -SmtpServer $SmtpServer -FromAddress $fromAddress -To $NotifyTo -Subject $subject -Body $body -smtpCredential $SmtpCredential
-        }
-        elseif ($NotifyTo -and [string]::IsNullOrEmpty($SmtpServer)) {
-            Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Notification requested but SMTP is not configured. Skipping email notification." -Level 'Warning'
-        }
+        Send-SuccessNotification -Section 'Dispatcher.Revocation' `
+            -Subject "Certificate $CertificateName version revoked successfully" `
+            -BodyText "The version $CertificateVersion of certificate $CertificateName has been revoked at the CA and disabled in Key Vault $VaultName. The certificate object remains in the vault for audit purposes; other versions (if any) are unaffected." `
+            -NotifyTo $NotifyTo @smtpArgs
 
         # confirm revocation
         Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Certificate $CertificateName version $CertificateVersion was successfully revoked (CA: serial revoked; KeyVault: version disabled and tagged)."
