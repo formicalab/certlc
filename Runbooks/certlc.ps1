@@ -522,6 +522,112 @@ function Write-CertLCLogAndThrow {
 
 #endregion
 
+#region ### Invoke-WithRetry ###
+
+##############################
+# FUNCTIONS - Invoke-WithRetry #
+##############################
+
+<#
+.SYNOPSIS
+    Execute a script block with retries on transient failures (HTTP 408/429/5xx and common
+    network / AD / COM exceptions). Intended for IDEMPOTENT operations only (GET REST calls,
+    AD reads, etc.). NEVER wrap a non-idempotent operation such as a certificate import,
+    a CertRequest.Submit, or an Update-AzKeyVaultCertificate -- a retry could double-apply.
+
+.PARAMETER ScriptBlock
+    The block to execute. Must be safe to re-run on transient failures (idempotent).
+    Pass it with .GetNewClosure() if it references variables from the caller's scope.
+
+.PARAMETER OperationName
+    Short label included in retry / failure log lines.
+
+.PARAMETER Section
+    Log section, propagated to Write-CertLCLog. Defaults to 'Invoke-WithRetry'.
+
+.PARAMETER MaxAttempts
+    Total attempts including the first one. Defaults to 4 (initial + 3 retries).
+
+.PARAMETER InitialDelayMs
+    Base delay (ms) before the first retry. Subsequent delays grow exponentially with jitter,
+    capped at 30 seconds. Defaults to 500.
+
+.NOTES
+    Retry-After response headers (sent by Key Vault and other Azure services on 429 / 503) are
+    honoured when present and take precedence over the computed backoff.
+#>
+function Invoke-WithRetry {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [Parameter(Mandatory)][string]$OperationName,
+        [Parameter()][string]$Section = 'Invoke-WithRetry',
+        [Parameter()][int]$MaxAttempts = 4,
+        [Parameter()][int]$InitialDelayMs = 500
+    )
+
+    # HTTP status codes considered transient.
+    $retryableHttp = @(408, 429, 500, 502, 503, 504)
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            return & $ScriptBlock
+        }
+        catch {
+            $err = $_
+            $ex  = $err.Exception
+            $isLastAttempt = ($attempt -ge $MaxAttempts)
+
+            # Try to read an HTTP status code if this is an Invoke-RestMethod / Invoke-WebRequest failure.
+            $statusCode  = $null
+            $retryAfterMs = $null
+            $respProp = $ex.PSObject.Properties['Response']
+            if ($null -ne $respProp -and $null -ne $respProp.Value) {
+                try { $statusCode = [int]$respProp.Value.StatusCode } catch { $statusCode = $null }
+                try {
+                    $ra = $respProp.Value.Headers.RetryAfter
+                    if ($null -ne $ra -and $null -ne $ra.Delta) {
+                        $retryAfterMs = [int]$ra.Delta.TotalMilliseconds
+                    }
+                }
+                catch { $retryAfterMs = $null }
+            }
+
+            # Decide whether this exception is worth retrying.
+            $shouldRetry = $false
+            if ($null -ne $statusCode -and $retryableHttp -contains $statusCode) {
+                $shouldRetry = $true
+            }
+            elseif ($ex -is [System.Net.Http.HttpRequestException] -or
+                    $ex -is [System.TimeoutException] -or
+                    $ex -is [System.IO.IOException] -or
+                    $ex -is [System.Net.WebException] -or
+                    $ex -is [System.Runtime.InteropServices.COMException]) {
+                $shouldRetry = $true
+            }
+
+            if (-not $shouldRetry -or $isLastAttempt) {
+                throw
+            }
+
+            # Backoff: Retry-After if present, otherwise exponential with jitter capped at 30s.
+            if ($null -ne $retryAfterMs -and $retryAfterMs -gt 0) {
+                $delayMs = [Math]::Min($retryAfterMs, 30000)
+            }
+            else {
+                $delayMs = [Math]::Min(30000, $InitialDelayMs * [Math]::Pow(2, $attempt - 1))
+                $delayMs += (Get-Random -Minimum 0 -Maximum $InitialDelayMs)
+            }
+
+            $statusInfo = if ($null -ne $statusCode) { "HTTP $statusCode" } else { $ex.GetType().Name }
+            Write-CertLCLog -Section $Section -Level 'Warning' -Message "[$OperationName] Attempt $attempt of $($MaxAttempts) failed ($statusInfo): $($ex.Message). Retrying after $([int]$delayMs)ms..."
+            Start-Sleep -Milliseconds ([int]$delayMs)
+        }
+    }
+}
+
+#endregion
+
 #region ### Format-PfxProtectTo ###
 
 ####################################
@@ -901,7 +1007,9 @@ function Find-TemplateName {
         -replace "`0",  '\00'
     $searcher.Filter = "(&(objectClass=pKICertificateTemplate)(|(cn=$escaped)(displayName=$escaped)(msPKI-Cert-Template-OID=$escaped)))"
     $searcher.PropertiesToLoad.Add('name') | Out-Null
-    $result = $searcher.FindOne()
+    # AD reads are idempotent; retry transient DC unavailability (COMException etc.).
+    $findOne = { $searcher.FindOne() }.GetNewClosure()
+    $result = Invoke-WithRetry -ScriptBlock $findOne -OperationName "AD template lookup '$cnOrDisplayNameOrOid'" -Section 'Find-TemplateName'
     if ($null -eq $result) {
         return [string]::Empty
     }
@@ -1307,8 +1415,14 @@ function Get-CertificateByThumbprint {
     $secureToken = $tokenResult.Token
     $invokeApi = {
         param([string]$uri)
-        # $secureToken is captured from the enclosing scope
-        return Invoke-RestMethod -Uri $uri -Method GET -Authentication Bearer -Token $secureToken -ContentType 'application/json'
+        # $secureToken lives in the enclosing function scope. GetNewClosure() only captures
+        # variables that are LOCAL to the script block where it is invoked, so we first pull
+        # the token into this scope before creating the closure.
+        $tok = $secureToken
+        $op = {
+            Invoke-RestMethod -Uri $uri -Method GET -Authentication Bearer -Token $tok -ContentType 'application/json'
+        }.GetNewClosure()
+        return Invoke-WithRetry -ScriptBlock $op -OperationName "KV GET $uri" -Section 'Get-CertificateByThumbprint'
     }
 
     $vaultBaseUrl = "https://$VaultName.vault.azure.net"
