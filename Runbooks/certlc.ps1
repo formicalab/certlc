@@ -311,7 +311,7 @@ function Write-CertLCLog {
 .PARAMETER SmtpServer
     The SMTP server to use for sending the email.
 
-.PARAMETER fromAddress
+.PARAMETER FromAddress
     The from address to use for the email.
 
 .PARAMETER To
@@ -323,12 +323,12 @@ function Write-CertLCLog {
 .PARAMETER Body
     The body of the email (HTML format).
 
-.PARAMETER smtpCredential
+.PARAMETER SmtpCredential
     An optional PSCredential for SMTP authentication.
 
 .EXAMPLE
     $smtpCredential = Get-Credential -UserName "smtpuser" -Message "Enter SMTP password"
-    Send-NotificationEmail -SmtpServer "smtp.example.com" -fromAddress "<sender@example.com>" -To "<recipient@example.com>" -Subject "Test Email" -Body "<h1>This is a test email</h1>" -smtpCredential $smtpCredential
+    Send-NotificationEmail -SmtpServer "smtp.example.com" -FromAddress "<sender@example.com>" -To "<recipient@example.com>" -Subject "Test Email" -Body "<h1>This is a test email</h1>" -SmtpCredential $smtpCredential
 
 .NOTES
     This function does not throw on failure, but logs a warning instead, to avoid a loop if called from Write-CertLCLogAndThrow.
@@ -340,22 +340,22 @@ function Send-NotificationEmail {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$SmtpServer,
-        [Parameter(Mandatory)][string]$fromAddress,
+        [Parameter(Mandatory)][string]$FromAddress,
         [Parameter(Mandatory)][string[]]$To,
         [Parameter(Mandatory)][string]$Subject,
         [Parameter(Mandatory)][string]$Body,
-        [Parameter()][pscredential]$smtpCredential
+        [Parameter()][pscredential]$SmtpCredential
     )
 
     try {
 
-        if ($null -eq $smtpCredential) {
+        if ($null -eq $SmtpCredential) {
             # send without authentication
-            Send-MailMessage -SmtpServer $SmtpServer -From $fromAddress -To $To -Subject $Subject -Body $Body -BodyAsHtml:$true -WarningAction:SilentlyContinue
+            Send-MailMessage -SmtpServer $SmtpServer -From $FromAddress -To $To -Subject $Subject -Body $Body -BodyAsHtml:$true -WarningAction:SilentlyContinue
         }
         else {
             # send with authentication
-            Send-MailMessage -SmtpServer $SmtpServer -From $fromAddress -To $To -Subject $Subject -Body $Body -BodyAsHtml:$true -Credential $smtpCredential -WarningAction:SilentlyContinue
+            Send-MailMessage -SmtpServer $SmtpServer -From $FromAddress -To $To -Subject $Subject -Body $Body -BodyAsHtml:$true -Credential $SmtpCredential -WarningAction:SilentlyContinue
         }
 
         Write-CertLCLog -Message "Notification email sent to: $($To -join ', ')" -Section 'Send-NotificationEmail'
@@ -438,7 +438,7 @@ function Send-SuccessNotification {
     .PARAMETER SmtpServer
         The SMTP server to use for sending email notifications.
 
-    .PARAMETER fromAddress
+    .PARAMETER FromAddress
         The from address to use for sending email notifications.
 
     .PARAMETER SmtpCredential
@@ -452,7 +452,7 @@ function Send-SuccessNotification {
         # some code that may fail
     }
     catch {
-        Write-CertLCLogAndThrow -Message "Operation failed" -Section "MyFunction" -CorrelationId $correlationId -InnerException $_.Exception -Context @{ detail = "additional info" } -NotifyTo @("admin@example.com") -SmtpServer "smtp.example.com" -fromAddress "noreply@example.com" -SmtpCredential $smtpCredential
+        Write-CertLCLogAndThrow -Message "Operation failed" -Section "MyFunction" -CorrelationId $correlationId -InnerException $_.Exception -Context @{ detail = "additional info" } -NotifyTo @("admin@example.com") -SmtpServer "smtp.example.com" -FromAddress "noreply@example.com" -SmtpCredential $smtpCredential
     }
 
 #>
@@ -467,7 +467,7 @@ function Write-CertLCLogAndThrow {
         [Parameter()][hashtable]$Context,
         [Parameter()][string[]]$NotifyTo,
         [Parameter()][string]$SmtpServer,
-        [Parameter()][string]$fromAddress,
+        [Parameter()][string]$FromAddress,
         [Parameter()][pscredential]$SmtpCredential
     )
 
@@ -505,7 +505,7 @@ function Write-CertLCLogAndThrow {
 
         $fragment = [System.Net.WebUtility]::HtmlEncode($fragment)
         $body = $CertificateErrorEmailBodyHtml -replace '__CONTENT__', $fragment
-        Send-NotificationEmail -SmtpServer $SmtpServer -fromAddress $fromAddress -To $NotifyTo -Subject $subject -Body $body -SmtpCredential $SmtpCredential
+        Send-NotificationEmail -SmtpServer $SmtpServer -FromAddress $FromAddress -To $NotifyTo -Subject $subject -Body $body -SmtpCredential $SmtpCredential
     }
     elseif ($NotifyTo -and [string]::IsNullOrEmpty($SmtpServer)) {
         Write-CertLCLog -Level 'Warning' -Message "Error notification requested but SMTP is not configured. Skipping email notification." -Section $Section
@@ -1048,16 +1048,21 @@ function New-CertificateCreationRequest {
         $CertRequest = New-Object -ComObject CertificateAuthority.Request
         $CertRequestStatus = $CertRequest.Submit(0x1, $csr, "CertificateTemplate:$CertificateTemplateName", $CA)
 
+        # ICertRequest::Submit disposition codes (see wincrypt.h)
+        $CR_DISP_DENIED            = 2
+        $CR_DISP_ISSUED            = 3
+        $CR_DISP_UNDER_SUBMISSION  = 5
+
         switch ($CertRequestStatus) {
-            2 {
+            $CR_DISP_DENIED {
                 throw [System.Exception]::new("New-CertificateCreationRequest: CA: Request was denied. Check the CA $CA for details.")
             }
-            3 {
+            $CR_DISP_ISSUED {
                 Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "CA: Certificate Request for $CertificateName submitted successfully."
                 $CertEncoded = $CertRequest.GetCertificate(0x0)
                 Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "Certificate received from CA $CA"
             }
-            5 {
+            $CR_DISP_UNDER_SUBMISSION {
                 throw [System.Exception]::new("New-CertificateCreationRequest: CA: Request to $CA is pending. This runbook expects immediate issuance. Review template/CA configuration.")
             }
             default {
@@ -1564,7 +1569,7 @@ catch {
 }
 
 # set context
-Set-AzContext -SubscriptionName $AzureConnection.Subscription -DefaultProfile $AzureConnection | Out-Null
+Set-AzContext -SubscriptionId $AzureConnection.Subscription.Id -DefaultProfile $AzureConnection | Out-Null
 
 # Check if the script is running on Azure or on hybrid worker; assign jobId accordingly.
 # https://rakhesh.com/azure/azure-automation-powershell-variables/
@@ -1638,7 +1643,7 @@ $SmtpCredential = $null
 if (-not [string]::IsNullOrEmpty($SmtpServer)) {
     if (-not [string]::IsNullOrEmpty($SmtpUser) -and -not [string]::IsNullOrEmpty($SmtpPassword)) {
         $SmtpSecurePassword = ConvertTo-SecureString -String $SmtpPassword -AsPlainText -Force
-        $SmtpCredential = New-Object System.Management.Automation.PSCredential ($SmtpUser, $SmtpSecurePassword)
+        $SmtpCredential = [pscredential]::new($SmtpUser, $SmtpSecurePassword)
         $SmtpSecurePassword = $null
         Write-CertLCLog -Section 'Dispatcher' -Message 'SMTP: Authentication will be used to send email.'
     }
