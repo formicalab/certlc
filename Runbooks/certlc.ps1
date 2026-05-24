@@ -968,7 +968,11 @@ function New-CertificateCreationRequest {
         [Parameter(Mandatory = $true)][string]$CA,
         [Parameter(Mandatory = $true)][string]$Hostname,
         [Parameter(Mandatory = $true)][string[]]$PfxProtectTo,
-        [Parameter()][string[]]$NotifyTo
+        [Parameter()][string[]]$NotifyTo,
+        # R3: when this request is the second leg of an auto-renewal, the dispatcher
+        # passes the current Automation job id; it is stamped on the new version's tags
+        # for audit symmetry with RevokedJobId.
+        [Parameter()][string]$RenewedJobId
     )
 
     # prepare tags for the certificate
@@ -983,6 +987,9 @@ function New-CertificateCreationRequest {
     # NotifyTo may arrive as a single string or an array; avoid using .Count on a scalar string
     if ($NotifyTo) {
         $tags['NotifyTo'] = (@($NotifyTo) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ';'
+    }
+    if (-not [string]::IsNullOrEmpty($RenewedJobId)) {
+        $tags['RenewedJobId'] = $RenewedJobId
     }
 
     # create certificate CSR - if a previous request is in progress, reuse it
@@ -1906,7 +1913,7 @@ switch ($requestBody.type) {
         Write-CertLCLog -Section 'Dispatcher.Renewal' -Message 'The operation will now continue as a new certificate creation request. See next log entries for details.'
 
         try {
-            New-CertificateCreationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplateName $certificateTemplateName -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -Hostname $Hostname -PfxProtectTo $PfxProtectTo -NotifyTo $NotifyTo
+            New-CertificateCreationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplateName $certificateTemplateName -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -Hostname $Hostname -PfxProtectTo $PfxProtectTo -NotifyTo $NotifyTo -RenewedJobId $jobId
         }
         catch {
             Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message 'Error processing certificate creation request' -Inner $_.Exception -NotifyTo $NotifyTo @smtpArgs
