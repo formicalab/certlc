@@ -888,7 +888,18 @@ function Find-TemplateName {
     $searchRoot = "LDAP://CN=Certificate Templates,CN=Public Key Services,CN=Services,$configDN"
     $entry = [ADSI]$searchRoot
     $searcher = New-Object DirectoryServices.DirectorySearcher $entry
-    $searcher.Filter = "(&(objectClass=pKICertificateTemplate)(|(cn=$cnOrDisplayNameOrOid)(displayName=$cnOrDisplayNameOrOid)(msPKI-Cert-Template-OID=$cnOrDisplayNameOrOid)))"
+
+    # S2: escape the search value per RFC 4515 before interpolation into the LDAP filter.
+    # Defence-in-depth: today $cnOrDisplayNameOrOid comes from trusted sources (Event Grid
+    # payload or CertEnroll OID), but escaping costs nothing and prevents future regressions
+    # if the input ever becomes user-controlled. Escapes: \ * ( ) NUL -> \5c \2a \28 \29 \00.
+    $escaped = $cnOrDisplayNameOrOid `
+        -replace '\\', '\5c' `
+        -replace '\*',  '\2a' `
+        -replace '\(',  '\28' `
+        -replace '\)',  '\29' `
+        -replace "`0",  '\00'
+    $searcher.Filter = "(&(objectClass=pKICertificateTemplate)(|(cn=$escaped)(displayName=$escaped)(msPKI-Cert-Template-OID=$escaped)))"
     $searcher.PropertiesToLoad.Add('name') | Out-Null
     $result = $searcher.FindOne()
     if ($null -eq $result) {
