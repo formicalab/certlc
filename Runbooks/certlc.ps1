@@ -1274,17 +1274,18 @@ function Get-CertificateByThumbprint {
     }
 
     # Helper: Invoke Key Vault REST API
+    # S1 fix: fetch the access token ONCE at function entry (not per page) and pass it to
+    # Invoke-RestMethod as a SecureString via -Authentication Bearer -Token. PowerShell 7 then
+    # builds the Authorization header internally without ever materializing the token into a
+    # managed (immutable, GC-bound) plaintext String. The previous implementation called
+    # PtrToStringBSTR(SecureStringToBSTR(...)) on every page, both materializing the token and
+    # leaking the BSTR buffer (no ZeroFreeBSTR).
+    $tokenResult = Get-AzAccessToken -ResourceTypeName KeyVault -AsSecureString
+    $secureToken = $tokenResult.Token
     $invokeApi = {
         param([string]$uri)
-        $tokenResult = Get-AzAccessToken -ResourceTypeName KeyVault -AsSecureString
-        $accessToken = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR(
-            [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($tokenResult.Token)
-        )
-        $headers = @{
-            'Authorization' = "Bearer $accessToken"
-            'Content-Type'  = 'application/json'
-        }
-        return Invoke-RestMethod -Uri $uri -Method GET -Headers $headers
+        # $secureToken is captured from the enclosing scope
+        return Invoke-RestMethod -Uri $uri -Method GET -Authentication Bearer -Token $secureToken -ContentType 'application/json'
     }
 
     $vaultBaseUrl = "https://$VaultName.vault.azure.net"
@@ -1296,7 +1297,7 @@ function Get-CertificateByThumbprint {
     $uri = "$vaultBaseUrl/certificates?api-version=$apiVersion"
 
     try {
-        :latestLoop do {
+        do {
             $response = & $invokeApi $uri
 
             if ($response.value) {
