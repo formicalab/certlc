@@ -2252,6 +2252,22 @@ switch ($requestBody.type) {
             $notifyTo = $rawNotifyTo.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
         }
 
+        # Idempotency guard: if this version is already marked as revoked, exit cleanly with a
+        # clear message instead of attempting the revocation again. Without this check the flow
+        # would proceed and fail later inside New-CertificateRevocationRequest at the
+        # Get-AzKeyVaultSecret call (Key Vault refuses to release the secret material of a
+        # disabled version), producing a misleading "Error getting certificate from key vault"
+        # log line. Mirrors the renewal-side check that skips auto-renewal of revoked versions.
+        $revokedTag = if ($cert.Tags -and $cert.Tags.ContainsKey('Revoked')) { [string]$cert.Tags['Revoked'] } else { $null }
+        if ($revokedTag -and $revokedTag.Trim().ToLowerInvariant() -eq 'true') {
+            $revokedAt     = if ($cert.Tags.ContainsKey('RevokedAt'))        { [string]$cert.Tags['RevokedAt'] }        else { '<unknown>' }
+            $revokedReason = if ($cert.Tags.ContainsKey('RevocationReason')) { [string]$cert.Tags['RevocationReason'] } else { '<unknown>' }
+            $revokedJobId  = if ($cert.Tags.ContainsKey('RevokedJobId'))     { [string]$cert.Tags['RevokedJobId'] }     else { '<unknown>' }
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' `
+                -Message "Certificate '$CertificateName' version '$CertificateVersion' (thumbprint $CertificateThumbprint) is ALREADY REVOKED (RevokedAt=$revokedAt, RevocationReason=$revokedReason, RevokedJobId=$revokedJobId). Ignoring duplicate revocation request." `
+                -NotifyTo $notifyTo @smtpArgs
+        }
+
         # end of validation. Now process the certificate revocation request
 
         Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Performing certificate revocation for certificate $CertificateName version $CertificateVersion in vault $VaultName with reason $RevocationReason..."
