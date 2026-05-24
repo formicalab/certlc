@@ -70,23 +70,29 @@ CertLC provides end-to-end automation for managing certificates stored in Azure 
 1. Azure Key Vault raises a `CertificateNearExpiry` event when a certificate approaches expiration
 2. Event Grid captures the event and delivers it to the Storage Queue
 3. The Function App triggers the renewal process through the Automation runbook
-4. The Hybrid Worker requests a renewed certificate from the Enterprise CA
+4. The Hybrid Worker requests a renewed certificate from the Enterprise CA. The new version is tagged with `RenewedJobId=<automation-job-id>` for traceability back to the renewal job
 5. The renewed certificate replaces the expiring one in Key Vault
+6. **Revoked-latest short-circuit**: if the latest version of the certificate carries `Revoked=true`, the renewal branch logs a warning and exits without contacting the CA. Auto-renewal resumes only after an operator either issues a new version explicitly or clears the `Revoked` tag
 
 ### Certificate Revocation Flow
 
 1. A revocation request with a certificate thumbprint (any version, current or older) is sent to the Storage Queue
 2. The Function App triggers the `certlc` runbook
-3. The runbook locates the matching Key Vault version by thumbprint, extracts its serial number, and submits a revocation request to the CA for that serial
-4. The matching Key Vault version is set to `enabled = false` and tagged with audit metadata (`Revoked=true`, `RevokedAt`, `RevocationReason`, `RevokedJobId`). **No Key Vault objects are deleted by the runbook**; other versions of the same certificate are left untouched, and the certificate object remains in the vault for audit
-5. If the revoked version is the latest version of the certificate, subsequent `CertificateNearExpiry` events for that certificate are ignored (the renewal branch detects the `Revoked` tag on the latest version and skips auto-renewal)
+3. The runbook locates the matching Key Vault version by thumbprint (LDAP-safe lookup, then a direct REST GET of the version metadata to read its `x5t`)
+4. **Idempotency guard**: if the version already carries `Revoked=true`, the runbook fails fast with an `ALREADY REVOKED` log line that includes the previous `RevokedAt`, `RevocationReason`, and `RevokedJobId`. The CA is not called again and existing tags are preserved
+5. Otherwise, the runbook extracts the version's serial number and submits a revocation request to the CA for that serial
+6. The matching Key Vault version is set to `enabled = false` and tagged with audit metadata (`Revoked=true`, `RevokedAt`, `RevocationReason`, `RevokedJobId`). Existing tags on the version (e.g. `NotifyTo`, `Hostname`, `PfxProtectTo`) are preserved. **No Key Vault objects are deleted by the runbook**; other versions of the same certificate are left untouched, and the certificate object remains in the vault for audit
 
 ### Statistics Collection
 
-1. The `certlcstats` runbook runs on a schedule (hourly by default)
+1. The `certlcstats` runbook runs on a schedule (hourly by default, disabled until manually linked)
 2. It enumerates all certificates in Key Vault and collects metadata
 3. Certificate data is published to a custom Log Analytics table via Data Collection Rule
 4. Azure Monitor Workbooks can visualize certificate inventory and expiration timelines
+
+### Resilience
+
+Idempotent Key Vault and LDAP reads (certificate-version listing, version metadata GET, AD template discovery) are wrapped in an exponential-backoff retry helper that recovers from transient HTTP 408/429/5xx, `Retry-After` throttling, and common network exceptions. Mutating calls (CA enrollment / revocation, tag writes) are **not** retried automatically — they are surfaced to the operator to avoid duplicate side-effects.
 
 ## Repository Structure
 
