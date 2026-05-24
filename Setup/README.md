@@ -252,6 +252,7 @@ The deployment requires the following parameters (configured in `parameters.dev.
 | `logAnalyticsWorkspaceName` | Name for the Log Analytics Workspace |
 | `applicationInsightsName` | Name for the Application Insights instance |
 | `automationAccountName` | Name for the Automation Account |
+| `runbookName` | Name of the primary runbook placeholder created on the Automation Account (default `certlc`). The actual `certlc.ps1` code is uploaded post-deployment |
 | `runtimeEnvironmentName` | Name of the custom PowerShell 7.6 runtime environment created on the Automation Account and used by both runbooks (default `certlc-PowerShell-7-6`; names cannot contain dots) |
 | `hybridWorkerGroupName` | Name for the Hybrid Worker Group |
 | `keyVaultName` | Name for the Key Vault |
@@ -314,6 +315,7 @@ The solution follows a secure-by-default architecture:
 - Role-based access control (RBAC) follows the principle of least privilege
 - Automation Account variables for sensitive data are encrypted
 - Key Vault uses RBAC authorization and soft delete protection
+- The runbook never deletes certificates from Key Vault: revocations are recorded by disabling the specific version and tagging it (`Revoked=true`, `RevokedAt`, `RevocationReason`, `RevokedJobId`). Renewed versions are likewise tagged with `RenewedJobId` for traceability. A duplicate revocation against an already-revoked version is rejected up-front with an `ALREADY REVOKED` error and the previous audit tags are preserved. Vault soft-delete / purge-protection settings still apply to operator actions performed outside the runbook
 - Diagnostic settings enabled on critical resources (Automation Account, Key Vault) for audit logging
 
 ## RBAC Role Assignments

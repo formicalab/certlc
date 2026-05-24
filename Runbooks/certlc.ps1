@@ -101,6 +101,18 @@ For certificate revocation requests, the body has a structure like this:
   }
 }
 
+Revocation semantics:
+- The thumbprint may refer to ANY version of the certificate in the key vault (latest or older).
+  The runbook locates the specific version whose x5t matches the supplied thumbprint.
+- The CA revokes the corresponding serial number using the supplied reason code.
+- In Key Vault, the matched version is set to attributes.enabled=false and tagged with
+  Revoked=true, RevokedAt=<UTC ISO-8601>, RevocationReason=<n>, RevokedJobId=<automation job id>.
+  Existing tags on the version (e.g. NotifyTo, Hostname, PfxProtectTo) are preserved.
+- The certificate object and other versions of the same certificate are NEVER deleted or modified.
+- If the revoked version is the latest version of the certificate, a warning is logged and
+  any subsequent CertificateNearExpiry event for the same certificate is ignored by the
+  renewal flow (it checks the latest version's Revoked tag and exits without renewing).
+
 You can also pass the RequestBody parameter explicitly, which must be a JSON string with the same structure as above.
 In this case, use the Start-AzAutomationRunbook cmdlet to start the runbook, passing the jsonRequestBody parameter:
 
@@ -299,7 +311,7 @@ function Write-CertLCLog {
 .PARAMETER SmtpServer
     The SMTP server to use for sending the email.
 
-.PARAMETER fromAddress
+.PARAMETER FromAddress
     The from address to use for the email.
 
 .PARAMETER To
@@ -311,12 +323,12 @@ function Write-CertLCLog {
 .PARAMETER Body
     The body of the email (HTML format).
 
-.PARAMETER smtpCredential
+.PARAMETER SmtpCredential
     An optional PSCredential for SMTP authentication.
 
 .EXAMPLE
     $smtpCredential = Get-Credential -UserName "smtpuser" -Message "Enter SMTP password"
-    Send-NotificationEmail -SmtpServer "smtp.example.com" -fromAddress "<sender@example.com>" -To "<recipient@example.com>" -Subject "Test Email" -Body "<h1>This is a test email</h1>" -smtpCredential $smtpCredential
+    Send-NotificationEmail -SmtpServer "smtp.example.com" -FromAddress "<sender@example.com>" -To "<recipient@example.com>" -Subject "Test Email" -Body "<h1>This is a test email</h1>" -SmtpCredential $smtpCredential
 
 .NOTES
     This function does not throw on failure, but logs a warning instead, to avoid a loop if called from Write-CertLCLogAndThrow.
@@ -328,22 +340,22 @@ function Send-NotificationEmail {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$SmtpServer,
-        [Parameter(Mandatory)][string]$fromAddress,
+        [Parameter(Mandatory)][string]$FromAddress,
         [Parameter(Mandatory)][string[]]$To,
         [Parameter(Mandatory)][string]$Subject,
         [Parameter(Mandatory)][string]$Body,
-        [Parameter()][pscredential]$smtpCredential
+        [Parameter()][pscredential]$SmtpCredential
     )
 
     try {
 
-        if ($null -eq $smtpCredential) {
+        if ($null -eq $SmtpCredential) {
             # send without authentication
-            Send-MailMessage -SmtpServer $SmtpServer -From $fromAddress -To $To -Subject $Subject -Body $Body -BodyAsHtml:$true -WarningAction:SilentlyContinue
+            Send-MailMessage -SmtpServer $SmtpServer -From $FromAddress -To $To -Subject $Subject -Body $Body -BodyAsHtml:$true -WarningAction:SilentlyContinue
         }
         else {
             # send with authentication
-            Send-MailMessage -SmtpServer $SmtpServer -From $fromAddress -To $To -Subject $Subject -Body $Body -BodyAsHtml:$true -Credential $smtpCredential -WarningAction:SilentlyContinue
+            Send-MailMessage -SmtpServer $SmtpServer -From $FromAddress -To $To -Subject $Subject -Body $Body -BodyAsHtml:$true -Credential $SmtpCredential -WarningAction:SilentlyContinue
         }
 
         Write-CertLCLog -Message "Notification email sent to: $($To -join ', ')" -Section 'Send-NotificationEmail'
@@ -352,6 +364,39 @@ function Send-NotificationEmail {
         # don't throw if email sending fails, just log the error
         Write-CertLCLog -Level 'Warning' -Message "Error sending notification email to $($To -join ', '): $($_.Exception.Message)" -Section 'Send-NotificationEmail'
     }
+}
+
+#endregion
+
+#region ### Send-SuccessNotification ###
+
+#########################################
+# FUNCTIONS - Send-SuccessNotification  #
+#########################################
+
+# Shared success-email helper used by the dispatcher success paths (creation/renewal/revocation).
+# Returns silently if NotifyTo is empty. Logs a warning if NotifyTo is set but SmtpServer is not.
+function Send-SuccessNotification {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Section,
+        [Parameter(Mandatory)][string]$Subject,
+        [Parameter(Mandatory)][string]$BodyText,
+        [Parameter()][string[]]$NotifyTo,
+        [Parameter()][string]$SmtpServer,
+        [Parameter()][string]$FromAddress,
+        [Parameter()][pscredential]$SmtpCredential
+    )
+
+    if (-not $NotifyTo) { return }
+    if ([string]::IsNullOrEmpty($SmtpServer)) {
+        Write-CertLCLog -Section $Section -Level 'Warning' -Message 'Notification requested but SMTP is not configured. Skipping email notification.'
+        return
+    }
+
+    $fragment = [System.Net.WebUtility]::HtmlEncode($BodyText)
+    $body = $CertificateNotificationEmailBodyHtml -replace '__CONTENT__', $fragment
+    Send-NotificationEmail -SmtpServer $SmtpServer -FromAddress $FromAddress -To $NotifyTo -Subject $Subject -Body $body -SmtpCredential $SmtpCredential
 }
 
 #endregion
@@ -393,7 +438,7 @@ function Send-NotificationEmail {
     .PARAMETER SmtpServer
         The SMTP server to use for sending email notifications.
 
-    .PARAMETER fromAddress
+    .PARAMETER FromAddress
         The from address to use for sending email notifications.
 
     .PARAMETER SmtpCredential
@@ -407,7 +452,7 @@ function Send-NotificationEmail {
         # some code that may fail
     }
     catch {
-        Write-CertLCLogAndThrow -Message "Operation failed" -Section "MyFunction" -CorrelationId $correlationId -InnerException $_.Exception -Context @{ detail = "additional info" } -NotifyTo @("admin@example.com") -SmtpServer "smtp.example.com" -fromAddress "noreply@example.com" -SmtpCredential $smtpCredential
+        Write-CertLCLogAndThrow -Message "Operation failed" -Section "MyFunction" -CorrelationId $correlationId -InnerException $_.Exception -Context @{ detail = "additional info" } -NotifyTo @("admin@example.com") -SmtpServer "smtp.example.com" -FromAddress "noreply@example.com" -SmtpCredential $smtpCredential
     }
 
 #>
@@ -422,7 +467,7 @@ function Write-CertLCLogAndThrow {
         [Parameter()][hashtable]$Context,
         [Parameter()][string[]]$NotifyTo,
         [Parameter()][string]$SmtpServer,
-        [Parameter()][string]$fromAddress,
+        [Parameter()][string]$FromAddress,
         [Parameter()][pscredential]$SmtpCredential
     )
 
@@ -460,7 +505,7 @@ function Write-CertLCLogAndThrow {
 
         $fragment = [System.Net.WebUtility]::HtmlEncode($fragment)
         $body = $CertificateErrorEmailBodyHtml -replace '__CONTENT__', $fragment
-        Send-NotificationEmail -SmtpServer $SmtpServer -fromAddress $fromAddress -To $NotifyTo -Subject $subject -Body $body -SmtpCredential $SmtpCredential
+        Send-NotificationEmail -SmtpServer $SmtpServer -FromAddress $FromAddress -To $NotifyTo -Subject $subject -Body $body -SmtpCredential $SmtpCredential
     }
     elseif ($NotifyTo -and [string]::IsNullOrEmpty($SmtpServer)) {
         Write-CertLCLog -Level 'Warning' -Message "Error notification requested but SMTP is not configured. Skipping email notification." -Section $Section
@@ -473,6 +518,112 @@ function Write-CertLCLogAndThrow {
         throw ([System.Exception]::new($Message, $InnerException))
     }
     throw ([System.Exception]::new($Message))
+}
+
+#endregion
+
+#region ### Invoke-WithRetry ###
+
+##############################
+# FUNCTIONS - Invoke-WithRetry #
+##############################
+
+<#
+.SYNOPSIS
+    Execute a script block with retries on transient failures (HTTP 408/429/5xx and common
+    network / AD / COM exceptions). Intended for IDEMPOTENT operations only (GET REST calls,
+    AD reads, etc.). NEVER wrap a non-idempotent operation such as a certificate import,
+    a CertRequest.Submit, or an Update-AzKeyVaultCertificate -- a retry could double-apply.
+
+.PARAMETER ScriptBlock
+    The block to execute. Must be safe to re-run on transient failures (idempotent).
+    Pass it with .GetNewClosure() if it references variables from the caller's scope.
+
+.PARAMETER OperationName
+    Short label included in retry / failure log lines.
+
+.PARAMETER Section
+    Log section, propagated to Write-CertLCLog. Defaults to 'Invoke-WithRetry'.
+
+.PARAMETER MaxAttempts
+    Total attempts including the first one. Defaults to 4 (initial + 3 retries).
+
+.PARAMETER InitialDelayMs
+    Base delay (ms) before the first retry. Subsequent delays grow exponentially with jitter,
+    capped at 30 seconds. Defaults to 500.
+
+.NOTES
+    Retry-After response headers (sent by Key Vault and other Azure services on 429 / 503) are
+    honoured when present and take precedence over the computed backoff.
+#>
+function Invoke-WithRetry {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [Parameter(Mandatory)][string]$OperationName,
+        [Parameter()][string]$Section = 'Invoke-WithRetry',
+        [Parameter()][int]$MaxAttempts = 4,
+        [Parameter()][int]$InitialDelayMs = 500
+    )
+
+    # HTTP status codes considered transient.
+    $retryableHttp = @(408, 429, 500, 502, 503, 504)
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            return & $ScriptBlock
+        }
+        catch {
+            $err = $_
+            $ex  = $err.Exception
+            $isLastAttempt = ($attempt -ge $MaxAttempts)
+
+            # Try to read an HTTP status code if this is an Invoke-RestMethod / Invoke-WebRequest failure.
+            $statusCode  = $null
+            $retryAfterMs = $null
+            $respProp = $ex.PSObject.Properties['Response']
+            if ($null -ne $respProp -and $null -ne $respProp.Value) {
+                try { $statusCode = [int]$respProp.Value.StatusCode } catch { $statusCode = $null }
+                try {
+                    $ra = $respProp.Value.Headers.RetryAfter
+                    if ($null -ne $ra -and $null -ne $ra.Delta) {
+                        $retryAfterMs = [int]$ra.Delta.TotalMilliseconds
+                    }
+                }
+                catch { $retryAfterMs = $null }
+            }
+
+            # Decide whether this exception is worth retrying.
+            $shouldRetry = $false
+            if ($null -ne $statusCode -and $retryableHttp -contains $statusCode) {
+                $shouldRetry = $true
+            }
+            elseif ($ex -is [System.Net.Http.HttpRequestException] -or
+                    $ex -is [System.TimeoutException] -or
+                    $ex -is [System.IO.IOException] -or
+                    $ex -is [System.Net.WebException] -or
+                    $ex -is [System.Runtime.InteropServices.COMException]) {
+                $shouldRetry = $true
+            }
+
+            if (-not $shouldRetry -or $isLastAttempt) {
+                throw
+            }
+
+            # Backoff: Retry-After if present, otherwise exponential with jitter capped at 30s.
+            if ($null -ne $retryAfterMs -and $retryAfterMs -gt 0) {
+                $delayMs = [Math]::Min($retryAfterMs, 30000)
+            }
+            else {
+                $delayMs = [Math]::Min(30000, $InitialDelayMs * [Math]::Pow(2, $attempt - 1))
+                $delayMs += (Get-Random -Minimum 0 -Maximum $InitialDelayMs)
+            }
+
+            $statusInfo = if ($null -ne $statusCode) { "HTTP $statusCode" } else { $ex.GetType().Name }
+            Write-CertLCLog -Section $Section -Level 'Warning' -Message "[$OperationName] Attempt $attempt of $($MaxAttempts) failed ($statusInfo): $($ex.Message). Retrying after $([int]$delayMs)ms..."
+            Start-Sleep -Milliseconds ([int]$delayMs)
+        }
+    }
 }
 
 #endregion
@@ -580,16 +731,9 @@ function Convert-PfxProtectToForTag {
         [string[]] $Value
     )
 
-    if (-not $Value -or $Value.Count -eq 0) { return '' }
-
-    # Trim, remove empties, dedupe (case-insensitive), preserve order of first occurrence
-    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    $clean = foreach ($v in $Value) {
-        $t = ($v | ForEach-Object { ($_ ?? '') }) -as [string]
-        $t = $t.Trim()
-        if ($t -and $seen.Add($t)) { $t }
-    }
-    return ($clean -join ';')
+    # Delegate normalization (trim, drop empties, collapse backslashes, dedupe) to Format-PfxProtectTo
+    # to keep both helpers in sync; then join with semicolons for tag storage.
+    return ((Format-PfxProtectTo -InputValue $Value) -join ';')
 }
 
 #endregion
@@ -735,7 +879,7 @@ function Export-PfxWithGroupProtection {
     if ($hr) {
         throw 'Export-PfxWithGroupProtection: NCryptCreateProtectionDescriptor failed: 0x{0:X}' -f $hr
     }
-    Write-CertLCLog -Section 'Export-PfxWithGroupProtection' "Protection descriptor handle: $hDesc"
+    Write-CertLCLog -Section 'Export-PfxWithGroupProtection' -Message "Protection descriptor handle: $hDesc"
 
     try {
 
@@ -744,7 +888,7 @@ function Export-PfxWithGroupProtection {
         if ($store -eq [IntPtr]::Zero) {
             throw 'Export-PfxWithGroupProtection: CertOpenStore failed: 0x{0:X}' -f [Runtime.InteropServices.Marshal]::GetLastWin32Error()
         }
-        Write-CertLCLog -Section 'Export-PfxWithGroupProtection' "Memory store handle: $store"
+        Write-CertLCLog -Section 'Export-PfxWithGroupProtection' -Message "Memory store handle: $store"
 
         try {
 
@@ -770,7 +914,7 @@ function Export-PfxWithGroupProtection {
                 if (-not [Win32Native]::PFXExportCertStoreEx($store, [ref]$blob, $password, $pvPara, $flags)) {
                     throw ('Export-PfxWithGroupProtection:: size query failed: 0x{0:X}' -f [Runtime.InteropServices.Marshal]::GetLastWin32Error())
                 }
-                Write-CertLCLog -Section 'Export-PfxWithGroupProtection' "PFX size will be: $($blob.cbData) bytes"
+                Write-CertLCLog -Section 'Export-PfxWithGroupProtection' -Message "PFX size will be: $($blob.cbData) bytes"
 
                 # allocate memory for the PFX data (pass 2)
                 $blob.pbData = [Runtime.InteropServices.Marshal]::AllocHGlobal($blob.cbData)
@@ -788,7 +932,7 @@ function Export-PfxWithGroupProtection {
                     $bytes = New-Object byte[] $blob.cbData
                     [Runtime.InteropServices.Marshal]::Copy($blob.pbData, $bytes, 0, $blob.cbData)
                     [System.IO.File]::WriteAllBytes($PfxFile, $bytes)
-                    Write-CertLCLog -Section 'Export-PfxWithGroupProtection' "PFX exported to file: $PfxFile"
+                    Write-CertLCLog -Section 'Export-PfxWithGroupProtection' -Message "PFX exported to file: $PfxFile"
                 }
                 finally {
                     # free the allocated memory for PFX data
@@ -850,9 +994,22 @@ function Find-TemplateName {
     $searchRoot = "LDAP://CN=Certificate Templates,CN=Public Key Services,CN=Services,$configDN"
     $entry = [ADSI]$searchRoot
     $searcher = New-Object DirectoryServices.DirectorySearcher $entry
-    $searcher.Filter = "(&(objectClass=pKICertificateTemplate)(|(cn=$cnOrDisplayNameOrOid)(displayName=$cnOrDisplayNameOrOid)(msPKI-Cert-Template-OID=$cnOrDisplayNameOrOid)))"
+
+    # S2: escape the search value per RFC 4515 before interpolation into the LDAP filter.
+    # Defence-in-depth: today $cnOrDisplayNameOrOid comes from trusted sources (Event Grid
+    # payload or CertEnroll OID), but escaping costs nothing and prevents future regressions
+    # if the input ever becomes user-controlled. Escapes: \ * ( ) NUL -> \5c \2a \28 \29 \00.
+    $escaped = $cnOrDisplayNameOrOid `
+        -replace '\\', '\5c' `
+        -replace '\*',  '\2a' `
+        -replace '\(',  '\28' `
+        -replace '\)',  '\29' `
+        -replace "`0",  '\00'
+    $searcher.Filter = "(&(objectClass=pKICertificateTemplate)(|(cn=$escaped)(displayName=$escaped)(msPKI-Cert-Template-OID=$escaped)))"
     $searcher.PropertiesToLoad.Add('name') | Out-Null
-    $result = $searcher.FindOne()
+    # AD reads are idempotent; retry transient DC unavailability (COMException etc.).
+    $findOne = { $searcher.FindOne() }.GetNewClosure()
+    $result = Invoke-WithRetry -ScriptBlock $findOne -OperationName "AD template lookup '$cnOrDisplayNameOrOid'" -Section 'Find-TemplateName'
     if ($null -eq $result) {
         return [string]::Empty
     }
@@ -919,7 +1076,11 @@ function New-CertificateCreationRequest {
         [Parameter(Mandatory = $true)][string]$CA,
         [Parameter(Mandatory = $true)][string]$Hostname,
         [Parameter(Mandatory = $true)][string[]]$PfxProtectTo,
-        [Parameter()][string[]]$NotifyTo
+        [Parameter()][string[]]$NotifyTo,
+        # R3: when this request is the second leg of an auto-renewal, the dispatcher
+        # passes the current Automation job id; it is stamped on the new version's tags
+        # for audit symmetry with RevokedJobId.
+        [Parameter()][string]$RenewedJobId
     )
 
     # prepare tags for the certificate
@@ -934,6 +1095,9 @@ function New-CertificateCreationRequest {
     # NotifyTo may arrive as a single string or an array; avoid using .Count on a scalar string
     if ($NotifyTo) {
         $tags['NotifyTo'] = (@($NotifyTo) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ';'
+    }
+    if (-not [string]::IsNullOrEmpty($RenewedJobId)) {
+        $tags['RenewedJobId'] = $RenewedJobId
     }
 
     # create certificate CSR - if a previous request is in progress, reuse it
@@ -999,16 +1163,21 @@ function New-CertificateCreationRequest {
         $CertRequest = New-Object -ComObject CertificateAuthority.Request
         $CertRequestStatus = $CertRequest.Submit(0x1, $csr, "CertificateTemplate:$CertificateTemplateName", $CA)
 
+        # ICertRequest::Submit disposition codes (see wincrypt.h)
+        $CR_DISP_DENIED            = 2
+        $CR_DISP_ISSUED            = 3
+        $CR_DISP_UNDER_SUBMISSION  = 5
+
         switch ($CertRequestStatus) {
-            2 {
+            $CR_DISP_DENIED {
                 throw [System.Exception]::new("New-CertificateCreationRequest: CA: Request was denied. Check the CA $CA for details.")
             }
-            3 {
+            $CR_DISP_ISSUED {
                 Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "CA: Certificate Request for $CertificateName submitted successfully."
                 $CertEncoded = $CertRequest.GetCertificate(0x0)
                 Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "Certificate received from CA $CA"
             }
-            5 {
+            $CR_DISP_UNDER_SUBMISSION {
                 throw [System.Exception]::new("New-CertificateCreationRequest: CA: Request to $CA is pending. This runbook expects immediate issuance. Review template/CA configuration.")
             }
             default {
@@ -1158,34 +1327,49 @@ function New-CertificateCreationRequest {
 <#
 
 .SYNOPSIS
-    Finds a certificate in Azure Key Vault by thumbprint and returns its name.
+    Finds a certificate version in Azure Key Vault by thumbprint.
 
 .DESCRIPTION
-    This function searches for a certificate in the specified Azure Key Vault using the
-    Key Vault REST API. Given a thumbprint, it enumerates all certificates (with pagination)
-    and returns the certificate name if found, or $null if not found.
+    Searches the specified Azure Key Vault for the version of any certificate whose thumbprint
+    (x5t) matches the supplied value. The thumbprint may correspond to any version of any
+    certificate - current ("latest") or older.
+
+    Algorithm:
+      1. List certificates with GET /certificates?api-version=2025-07-01 (one entry per
+         certificate name; the x5t exposed there is the thumbprint of the latest version
+         only). If a match is found here, the matched version is the latest version of that
+         certificate.
+      2. If no match in step 1, for each certificate listed in step 1 enumerate its versions
+         via GET /certificates/{name}/versions?api-version=2025-07-01 and compare x5t.
+
+    Pagination is handled for both listings via nextLink.
 
 .PARAMETER VaultName
     The name of the Azure Key Vault to query.
 
 .PARAMETER Thumbprint
-    The thumbprint of the certificate to find (hex format).
+    The thumbprint of the certificate version to find (hex format; spaces, dashes and
+    colons are stripped and case is normalized to uppercase).
 
 .OUTPUTS
-    String - The name of the certificate in the vault, or $null if not found.
+    [pscustomobject] with properties:
+      - Name     : certificate name in the vault
+      - Version  : version identifier of the matched version
+      - IsLatest : $true if the matched version is the latest version of the certificate
+    Returns $null when no version with the supplied thumbprint exists in the vault.
 
 .EXAMPLE
-    $certName = Get-CertificateByThumbprint -VaultName "mykeyvault" -Thumbprint "7CB8B52E7BA87B221534BB9B04A7FFF2D3FA59BA"
-    if ($certName) { Write-Host "Found: $certName" }
+    $match = Get-CertificateByThumbprint -VaultName 'mykeyvault' -Thumbprint '7CB8B52E7BA87B221534BB9B04A7FFF2D3FA59BA'
+    if ($match) { "Found $($match.Name) version $($match.Version) (latest: $($match.IsLatest))" }
 
 .NOTES
     Uses Key Vault REST API version 2025-07-01.
-    Requires an active Azure context with appropriate Key Vault permissions.
+    Requires an active Azure context with the certificates/list permission on the vault.
 
 #>
 
 function Get-CertificateByThumbprint {
-    [OutputType([string])]
+    [OutputType([pscustomobject])]
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
@@ -1197,7 +1381,7 @@ function Get-CertificateByThumbprint {
 
     # Normalize the input thumbprint (remove spaces, dashes, colons; convert to uppercase)
     $normalizedThumbprint = ($Thumbprint -replace '[^a-fA-F0-9]', '').ToUpper()
-    
+
     if ([string]::IsNullOrEmpty($normalizedThumbprint)) {
         throw [System.ArgumentException]::new('Get-CertificateByThumbprint: Thumbprint is empty after normalization.', 'Thumbprint')
     }
@@ -1214,56 +1398,115 @@ function Get-CertificateByThumbprint {
         return ($bytes | ForEach-Object { $_.ToString('X2') }) -join ''
     }
 
-    # Helper: Invoke Key Vault REST API
-    $invokeApi = {
-        param([string]$uri)
-        $tokenResult = Get-AzAccessToken -ResourceTypeName KeyVault -AsSecureString
-        $accessToken = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR(
-            [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($tokenResult.Token)
-        )
-        $headers = @{
-            'Authorization' = "Bearer $accessToken"
-            'Content-Type'  = 'application/json'
-        }
-        return Invoke-RestMethod -Uri $uri -Method GET -Headers $headers
+    # Helper: Extract the last URL segment (certificate name or version) from a KV resource id
+    $lastSegment = {
+        param([string]$id)
+        return ($id -split '/')[-1]
     }
 
-    # Build the base URI
+    # Helper: Invoke Key Vault REST API
+    # S1 fix: fetch the access token ONCE at function entry (not per page) and pass it to
+    # Invoke-RestMethod as a SecureString via -Authentication Bearer -Token. PowerShell 7 then
+    # builds the Authorization header internally without ever materializing the token into a
+    # managed (immutable, GC-bound) plaintext String. The previous implementation called
+    # PtrToStringBSTR(SecureStringToBSTR(...)) on every page, both materializing the token and
+    # leaking the BSTR buffer (no ZeroFreeBSTR).
+    $tokenResult = Get-AzAccessToken -ResourceTypeName KeyVault -AsSecureString
+    $secureToken = $tokenResult.Token
+    $invokeApi = {
+        param([string]$uri)
+        # $secureToken lives in the enclosing function scope. GetNewClosure() only captures
+        # variables that are LOCAL to the script block where it is invoked, so we first pull
+        # the token into this scope before creating the closure.
+        $tok = $secureToken
+        $op = {
+            Invoke-RestMethod -Uri $uri -Method GET -Authentication Bearer -Token $tok -ContentType 'application/json'
+        }.GetNewClosure()
+        return Invoke-WithRetry -ScriptBlock $op -OperationName "KV GET $uri" -Section 'Get-CertificateByThumbprint'
+    }
+
     $vaultBaseUrl = "https://$VaultName.vault.azure.net"
-    $apiVersion = "2025-07-01"
+    $apiVersion = '2025-07-01'
+
+    # Step 1: enumerate certificates (one entry per cert name; x5t is the LATEST version's thumbprint)
+    # While iterating we also collect the certificate names so step 2 can fall back to per-cert version listings.
+    $certificateNames = New-Object 'System.Collections.Generic.List[string]'
     $uri = "$vaultBaseUrl/certificates?api-version=$apiVersion"
 
-    # Search for the certificate with matching thumbprint (handling pagination)
-    $foundCertName = $null
-    
     try {
-        :searchLoop do {
+        do {
             $response = & $invokeApi $uri
-            
+
             if ($response.value) {
                 foreach ($cert in $response.value) {
+                    # Capture the certificate name for the possible step-2 pass
+                    if ($cert.id) {
+                        # /certificates listing ids have the shape: <vaultBaseUrl>/certificates/<name>
+                        $name = & $lastSegment $cert.id
+                        if (-not [string]::IsNullOrEmpty($name)) {
+                            [void]$certificateNames.Add($name)
+                        }
+                    }
+
                     if ($cert.x5t) {
                         $certThumbprint = & $convertToHex $cert.x5t
-                        
                         if ($certThumbprint -eq $normalizedThumbprint) {
-                            # Extract certificate name from the ID URL
-                            $foundCertName = ($cert.id -split '/certificates/')[-1]
-                            break searchLoop
+                            # We matched against the latest-version thumbprint. The id of the listing
+                            # entry does NOT contain a version segment, so we resolve the latest version
+                            # id explicitly via /certificates/{name}.
+                            $certName = & $lastSegment $cert.id
+                            $bundleUri = "$vaultBaseUrl/certificates/$certName" + "?api-version=$apiVersion"
+                            $bundle = & $invokeApi $bundleUri
+                            $version = & $lastSegment $bundle.id
+                            return [pscustomobject]@{
+                                Name     = $certName
+                                Version  = $version
+                                IsLatest = $true
+                            }
                         }
                     }
                 }
             }
-            
-            # Check for pagination
+
             $uri = $response.nextLink
-            
         } while ($uri)
     }
     catch {
         throw [System.Exception]::new("Get-CertificateByThumbprint: Failed to enumerate certificates in vault '$VaultName'.", $_.Exception)
     }
 
-    return $foundCertName
+    # Step 2: no match against any latest version. Enumerate every cert's versions and compare x5t.
+    try {
+        foreach ($name in $certificateNames) {
+            $uri = "$vaultBaseUrl/certificates/$name/versions?api-version=$apiVersion"
+            do {
+                $response = & $invokeApi $uri
+                if ($response.value) {
+                    foreach ($ver in $response.value) {
+                        if ($ver.x5t) {
+                            $certThumbprint = & $convertToHex $ver.x5t
+                            if ($certThumbprint -eq $normalizedThumbprint) {
+                                # /certificates/{name}/versions listing ids have the shape:
+                                #   <vaultBaseUrl>/certificates/<name>/<version>
+                                $version = & $lastSegment $ver.id
+                                return [pscustomobject]@{
+                                    Name     = $name
+                                    Version  = $version
+                                    IsLatest = $false
+                                }
+                            }
+                        }
+                    }
+                }
+                $uri = $response.nextLink
+            } while ($uri)
+        }
+    }
+    catch {
+        throw [System.Exception]::new("Get-CertificateByThumbprint: Failed to enumerate certificate versions in vault '$VaultName'.", $_.Exception)
+    }
+
+    return $null
 }
 
 #endregion
@@ -1277,17 +1520,27 @@ function Get-CertificateByThumbprint {
 <#
 
 .SYNOPSIS
-    Revoke an existing certificate in Key Vault by sending a revocation request to the specified CA.
+    Revoke a specific version of a certificate by sending a revocation request to the CA, then
+    disable that version in Key Vault and tag it with audit metadata.
 
 .DESCRIPTION
-    This function revokes an existing certificate stored in Azure Key Vault by sending a revocation request to the specified Certificate Authority (CA).
-    The certificate is also deleted from the Key Vault after successful revocation.
+    This function revokes the specified version of a certificate stored in Azure Key Vault:
+      1. Loads the secret of the specific version to extract the X.509 serial number.
+      2. Submits a revocation request to the Certificate Authority (CA) for that serial.
+      3. Disables that Key Vault version (attributes.enabled=false) and tags it with
+         Revoked=true, RevokedAt, RevocationReason, RevokedJobId. Existing tags on the
+         version are preserved (read-merge-write).
+    The certificate object is NEVER deleted from Key Vault. Other versions of the same
+    certificate are not touched.
 
 .PARAMETER VaultName
     The name of the Azure Key Vault where the certificate is stored.
 
 .PARAMETER CertificateName
     The name of the certificate to revoke.
+
+.PARAMETER CertificateVersion
+    The version identifier of the certificate version to revoke.
 
 .PARAMETER RevocationReason
     The reason for revocation, specified as an integer value (0-6) according to the CRLReason codes:
@@ -1299,11 +1552,11 @@ function Get-CertificateByThumbprint {
         5 - Cessation of Operation
         6 - Certificate Hold
 
-.PARAMETER CA
-    The CA from which the certificate will be revoked.
+.PARAMETER JobId
+    The Automation runbook job id; written into the RevokedJobId tag for traceability.
 
 .EXAMPLE
-    New-CertificateRevocationRequest -VaultName "MyKeyVault" -CertificateName "MyCertificate" -RevocationReason 1 -CA "MyCA\MyInstance"
+    New-CertificateRevocationRequest -VaultName 'MyKeyVault' -CertificateName 'MyCertificate' -CertificateVersion 'abc123...' -RevocationReason 1 -JobId $jobId
 
 #>
 function New-CertificateRevocationRequest {
@@ -1316,43 +1569,53 @@ function New-CertificateRevocationRequest {
         [string]$CertificateName,
 
         [Parameter(Mandatory = $true)]
+        [string]$CertificateVersion,
+
+        [Parameter(Mandatory = $true)]
         [ValidateRange(0, 6)]
-        [Int64]$RevocationReason
+        [Int64]$RevocationReason,
+
+        [Parameter(Mandatory = $false)]
+        [string]$JobId,
+
+        # Optional: pre-fetched tags of the specific version (passed by the dispatcher to avoid a
+        # second Get-AzKeyVaultCertificate round-trip). If not provided, the function fetches them.
+        [Parameter(Mandatory = $false)]
+        [System.Collections.IDictionary]$ExistingTags
     )
 
-    # get the certificate from the key vault
-    Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "KeyVault: Certificate $($CertificateName): getting the certificate from key vault $VaultName to obtain details..."
+    # get the specific version of the certificate from the key vault, to extract its serial number
+    Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "KeyVault: Certificate $($CertificateName) version $($CertificateVersion): getting the version secret from key vault $VaultName to obtain details..."
     try {
-        $certBase64 = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertificateName -AsPlainText
+        $certBase64 = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertificateName -Version $CertificateVersion -AsPlainText
     }
     catch {
-        throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Error getting certificate $CertificateName from key vault $VaultName", $_.Exception)
+        throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Error getting certificate $CertificateName version $CertificateVersion from key vault $VaultName", $_.Exception)
     }
     if ([string]::IsNullOrEmpty($certBase64)) {
-        throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Certificate $CertificateName secret is empty in key vault $VaultName")
+        throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Certificate $CertificateName version $CertificateVersion secret is empty in key vault $VaultName")
     }
 
     # convert the base64 string to a byte array and create an X509Certificate2 object
     $certBytes = [Convert]::FromBase64String($certBase64)
     $certBase64 = $null
     $x509Cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($certBytes, [string]::Empty, 'Exportable')
-    # $x509Cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($certBytes, [string]::Empty, [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
 
-    # save the serial number
+    # save the serial number of this specific version
     $serialNumber = $x509Cert.SerialNumber
 
     # cleanup objects that are no longer needed
     $x509Cert = $null
     $certBytes = $null
 
-    Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "CA: Sending revocation request for certificate $CertificateName to the CA $CA using reason $($RevocationReason)..."
+    Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "CA: Sending revocation request for certificate $CertificateName version $CertificateVersion (serial $serialNumber) to the CA $CA using reason $($RevocationReason)..."
 
     try {
         $CertAdmin = New-Object -ComObject CertificateAuthority.Admin
         $CertAdmin.RevokeCertificate($CA, $serialNumber, $RevocationReason, 0)
     }
     catch {
-        throw [System.Exception]::new("New-CertificateRevocationRequest: CA: Error revoking certificate $CertificateName in CA $CA", $_.Exception)
+        throw [System.Exception]::new("New-CertificateRevocationRequest: CA: Error revoking certificate $CertificateName version $CertificateVersion (serial $serialNumber) in CA $CA", $_.Exception)
     }
     finally {
         if ($CertAdmin) {
@@ -1361,17 +1624,52 @@ function New-CertificateRevocationRequest {
         }
     }
 
-    Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "CA: Certificate $CertificateName revoked successfully in CA $($CA)."
+    Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "CA: Certificate $CertificateName version $CertificateVersion (serial $serialNumber) revoked successfully in CA $($CA)."
 
-    # remove the certificate from the key vault
-    Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "KeyVault: Removing certificate $CertificateName from key vault $($VaultName)..."
+    # disable the specific version in key vault and tag it with revocation audit metadata.
+    # The Key Vault Update Certificate PATCH endpoint replaces tags wholesale, so we must
+    # start from the existing tags on this version, merge our revocation keys, and write back.
+    Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "KeyVault: Disabling certificate $CertificateName version $CertificateVersion in key vault $($VaultName) and tagging it as revoked..."
+
+    # Source the existing tags: prefer the caller-provided snapshot to avoid a second round-trip;
+    # otherwise fetch the version now.
+    $sourceTags = $null
+    if ($PSBoundParameters.ContainsKey('ExistingTags') -and $null -ne $ExistingTags) {
+        $sourceTags = $ExistingTags
+    }
+    else {
+        try {
+            $existingVersion = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -Version $CertificateVersion
+        }
+        catch {
+            throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Error reading certificate $CertificateName version $CertificateVersion from key vault $VaultName for tag merge", $_.Exception)
+        }
+        if ($null -ne $existingVersion) { $sourceTags = $existingVersion.Tags }
+    }
+
+    # build merged tag set: start from existing tags (if any), then overlay revocation metadata
+    $mergedTags = @{}
+    if ($null -ne $sourceTags) {
+        foreach ($k in $sourceTags.Keys) {
+            $mergedTags[$k] = [string]$sourceTags[$k]
+        }
+    }
+    $mergedTags['Revoked']          = 'true'
+    $mergedTags['RevokedAt']        = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $mergedTags['RevocationReason'] = [string]$RevocationReason
+    if (-not [string]::IsNullOrEmpty($JobId)) {
+        $mergedTags['RevokedJobId'] = $JobId
+    }
+
+    # Update-AzKeyVaultCertificate wraps PATCH /certificates/{name}/{version}: -Enable $false and
+    # -Tag are applied in a single atomic call.
     try {
-        Remove-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -Force
+        $null = Update-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -Version $CertificateVersion -Enable $false -Tag $mergedTags -PassThru -ErrorAction Stop
     }
     catch {
-        throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Error removing certificate $CertificateName from key vault $VaultName", $_.Exception)
+        throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Error disabling/tagging certificate $CertificateName version $CertificateVersion in key vault $VaultName", $_.Exception)
     }
-    Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "KeyVault: Certificate $CertificateName removed from key vault $($VaultName)."
+    Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "KeyVault: Certificate $CertificateName version $CertificateVersion in key vault $($VaultName) has been disabled and tagged as revoked. The certificate object and other versions (if any) are left untouched."
 }
 
 #endregion
@@ -1392,7 +1690,7 @@ catch {
 }
 
 # set context
-Set-AzContext -SubscriptionName $AzureConnection.Subscription -DefaultProfile $AzureConnection | Out-Null
+Set-AzContext -SubscriptionId $AzureConnection.Subscription.Id -DefaultProfile $AzureConnection | Out-Null
 
 # Check if the script is running on Azure or on hybrid worker; assign jobId accordingly.
 # https://rakhesh.com/azure/azure-automation-powershell-variables/
@@ -1435,48 +1733,52 @@ if ([string]::IsNullOrEmpty($PfxRootFolder)) {
     Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-pfxrootfolder' is missing or empty. Ensure this variable exists in the automation account."
 }
 
-# Validate SMTP variables
-# Case 1: SmtpServer is empty or missing - all other SMTP variables must also be empty
+# Validate SMTP variables.
+# - If SmtpServer is empty, no other SMTP variable may be set.
+# - If SmtpServer is set, FromAddress is required; SmtpUser and SmtpPassword must be both set or both empty.
 if ([string]::IsNullOrEmpty($SmtpServer)) {
-    if (-not [string]::IsNullOrEmpty($FromAddress)) {
-        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtpfrom' is set, but 'certlc-smtpserver' is missing or empty. When SmtpServer is not configured, all other SMTP variables must be missing or empty."
-    }
-    if (-not [string]::IsNullOrEmpty($SmtpUser)) {
-        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtpuser' is set, but 'certlc-smtpserver' is missing or empty. When SmtpServer is not configured, all other SMTP variables must be missing or empty."
-    }
-    if (-not [string]::IsNullOrEmpty($SmtpPassword)) {
-        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtppassword' is set, but 'certlc-smtpserver' is missing or empty. When SmtpServer is not configured, all other SMTP variables must be missing or empty."
+    foreach ($pair in @(
+            @{ Name = 'certlc-smtpfrom';     Value = $FromAddress },
+            @{ Name = 'certlc-smtpuser';     Value = $SmtpUser },
+            @{ Name = 'certlc-smtppassword'; Value = $SmtpPassword }
+        )) {
+        if (-not [string]::IsNullOrEmpty($pair.Value)) {
+            Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable '$($pair.Name)' is set, but 'certlc-smtpserver' is missing or empty. When SmtpServer is not configured, all other SMTP variables must be missing or empty."
+        }
     }
     Write-CertLCLog -Section 'Dispatcher' -Message 'SMTP: Email notifications are disabled (SmtpServer is not configured).'
 }
-# Case 2: SmtpServer is set - validate FromAddress and authentication variables
 else {
     if ([string]::IsNullOrEmpty($FromAddress)) {
         Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtpserver' is set, but 'certlc-smtpfrom' is missing or empty. Both must be set to send email."
     }
-    # Check SmtpUser and SmtpPassword: both must be set or both must be empty
     $userSet = -not [string]::IsNullOrEmpty($SmtpUser)
     $passSet = -not [string]::IsNullOrEmpty($SmtpPassword)
-    if ($userSet -and -not $passSet) {
-        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtpuser' is set, but 'certlc-smtppassword' is missing or empty. Both must be set to use authentication, or both must be missing or empty for unauthenticated email."
-    }
-    if ($passSet -and -not $userSet) {
-        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtppassword' is set, but 'certlc-smtpuser' is missing or empty. Both must be set to use authentication, or both must be missing or empty for unauthenticated email."
+    if ($userSet -xor $passSet) {
+        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variables 'certlc-smtpuser' and 'certlc-smtppassword' must be both set (to use SMTP authentication) or both empty (for unauthenticated email). Currently only one of them is set."
     }
 }
 
-# prepare the smtp credentials (only if SmtpServer is configured)
+# Prepare the SMTP credentials (only if SmtpServer is configured)
 $SmtpCredential = $null
 if (-not [string]::IsNullOrEmpty($SmtpServer)) {
     if (-not [string]::IsNullOrEmpty($SmtpUser) -and -not [string]::IsNullOrEmpty($SmtpPassword)) {
         $SmtpSecurePassword = ConvertTo-SecureString -String $SmtpPassword -AsPlainText -Force
-        $SmtpCredential = New-Object System.Management.Automation.PSCredential ($SmtpUser, $SmtpSecurePassword)
+        $SmtpCredential = [pscredential]::new($SmtpUser, $SmtpSecurePassword)
         $SmtpSecurePassword = $null
         Write-CertLCLog -Section 'Dispatcher' -Message 'SMTP: Authentication will be used to send email.'
     }
     else {
         Write-CertLCLog -Section 'Dispatcher' -Message 'SMTP: No authentication will be used to send email. Ensure the SMTP server allows unauthenticated email from this host!' -Level 'Warning'
     }
+}
+
+# Common SMTP arguments, splatted by Write-CertLCLogAndThrow and Send-SuccessNotification call sites.
+# Splatting an empty/null SmtpServer is intentional: the helpers treat that as "SMTP disabled".
+$smtpArgs = @{
+    SmtpServer     = $SmtpServer
+    FromAddress    = $FromAddress
+    SmtpCredential = $SmtpCredential
 }
 
 # Check if we have the jsonRequestBody parameter
@@ -1541,7 +1843,7 @@ if ([string]::IsNullOrEmpty($jsonRequestBody)) {
         else { Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'WebhookData.RequestBody not recognized using regex!' }
     }
 
-    if ([string]::IsNullOrEmpty($requestBody)) {
+    if ($null -eq $requestBody) {
         Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'WebhookData.RequestBody is empty! Ensure the runbook is called from a webhook!'
     }
 }
@@ -1625,10 +1927,27 @@ switch ($requestBody.type) {
             Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Error getting certificate details for $CertificateName from vault $($VaultName): empty response! Certificate may not exist in the vault."
         }
 
+        # If the latest version of this certificate was previously revoked by the runbook, the
+        # CertLC revocation flow tagged it with Revoked=true and set it to disabled. Auto-renewal
+        # in that situation would silently re-issue the certificate (new version, new serial) and
+        # effectively "un-revoke" the certificate name on the CA side. Skip the renewal in this
+        # case and require an explicit operator action (e.g. issue a brand new certificate or
+        # clear the Revoked tag manually).
+        $latestRevokedTag = $null
+        if ($null -ne $cert.Tags -and $cert.Tags.ContainsKey('Revoked')) {
+            $latestRevokedTag = [string]$cert.Tags['Revoked']
+        }
+        if ($latestRevokedTag -and $latestRevokedTag.Trim().ToLowerInvariant() -eq 'true') {
+            $revokedAt = if ($cert.Tags.ContainsKey('RevokedAt')) { [string]$cert.Tags['RevokedAt'] } else { '<unknown>' }
+            $revokedReason = if ($cert.Tags.ContainsKey('RevocationReason')) { [string]$cert.Tags['RevocationReason'] } else { '<unknown>' }
+            Write-CertLCLog -Section 'Dispatcher.Renewal' -Level 'Warning' -Message "Skipping auto-renewal of certificate $CertificateName in vault $($VaultName): the latest version is tagged as revoked (RevokedAt=$revokedAt, RevocationReason=$revokedReason). Issue a new certificate explicitly or clear the Revoked tag to resume auto-renewal."
+            return
+        }
+
         # get NotifyTo from the certificate tags (optional)
         $rawNotifyTo = $cert.Tags['NotifyTo']
         if ([string]::IsNullOrWhiteSpace($rawNotifyTo)) {
-            $notifyTo = null
+            $notifyTo = $null
             Write-CertLCLog -Section 'Dispatcher.Renewal' -Message "No NotifyTo addresses found for certificate $CertificateName in vault $VaultName."
         }
         else {
@@ -1651,7 +1970,7 @@ switch ($requestBody.type) {
         # get the OID of the Certificate Template
         $templateExtension = $cert.Certificate.Extensions | Where-Object { $_.Oid.FriendlyName -eq 'Certificate Template Information' }
         if ($null -eq $templateExtension) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message 'Error getting template information from certificate: the Certificate Template Information extension was not found.' -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message 'Error getting template information from certificate: the Certificate Template Information extension was not found.' -NotifyTo $NotifyTo @smtpArgs
         }
         # $templateExtension.Format($false) returns a string like:
         # - Template=Flab-ShortWebServer(1.3.6.1.4.1.311.21.8.15431357.2613787.6440092.16459852.14380503.11.12399345.16691736), Major Version Number=100, Minor Version Number=5
@@ -1661,27 +1980,27 @@ switch ($requestBody.type) {
         # extract the OID using a regex working for both cases
         $regex = [regex]'(?<=Template=(?:[^\(]*\()?)(\d+(?:\.\d+)+)'
         if (-not $regex.IsMatch($asn)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Error getting OID from certificate: Template OID not found in string: $asn" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Error getting OID from certificate: Template OID not found in string: $asn" -NotifyTo $NotifyTo @smtpArgs
         }
         $oid = $regex.Match($asn).Value
 
         # lookup the template name using the OID
         try {
-            Write-CertLCLog -Section 'Dispatcher.Renewal' "Looking up template name for OID: $oid"
+            Write-CertLCLog -Section 'Dispatcher.Renewal' -Message "Looking up template name for OID: $oid"
             $certificateTemplateName = Find-TemplateName -cnOrDisplayNameOrOid $oid
         }
         catch {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Error resolving template name for OID $oid" -Inner $_.Exception -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Error resolving template name for OID $oid" -Inner $_.Exception -NotifyTo $NotifyTo @smtpArgs
         }
         if ([string]::IsNullOrEmpty($certificateTemplateName)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Error resolving template name for OID $($oid): template not found in AD." -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Error resolving template name for OID $($oid): template not found in AD." -NotifyTo $NotifyTo @smtpArgs
         }
         Write-CertLCLog -Section 'Dispatcher.Renewal' -Message "Template name found for OID $($oid) is: $certificateTemplateName"
 
         # Hostname from the certificate tags
         $Hostname = $cert.Tags['Hostname']
         if ([string]::IsNullOrWhiteSpace($Hostname)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Missing mandatory Hostname tag on certificate $CertificateName in vault $VaultName." -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Missing mandatory Hostname tag on certificate $CertificateName in vault $VaultName." -NotifyTo $NotifyTo @smtpArgs
         }
         Write-CertLCLog -Section 'Dispatcher.Renewal' -Message "Hostname: $Hostname"
 
@@ -1690,7 +2009,7 @@ switch ($requestBody.type) {
         $PfxProtectTo = Convert-PfxProtectToFromTag -TagValue $rawPfxProtectTo
         # After normalization functions, simply checking truthiness is enough; avoid .Count under StrictMode on potential scalars
         if (-not $PfxProtectTo) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Missing mandatory PfxProtectTo tag on certificate $CertificateName in vault $VaultName." -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Missing mandatory PfxProtectTo tag on certificate $CertificateName in vault $VaultName." -NotifyTo $NotifyTo @smtpArgs
         }
         Write-CertLCLog -Section 'Dispatcher.Renewal' -Message "PfxProtectTo principals: $($PfxProtectTo -join ', ')"
 
@@ -1708,22 +2027,17 @@ switch ($requestBody.type) {
         Write-CertLCLog -Section 'Dispatcher.Renewal' -Message 'The operation will now continue as a new certificate creation request. See next log entries for details.'
 
         try {
-            New-CertificateCreationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplateName $certificateTemplateName -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -Hostname $Hostname -PfxProtectTo $PfxProtectTo -NotifyTo $NotifyTo
+            New-CertificateCreationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplateName $certificateTemplateName -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -Hostname $Hostname -PfxProtectTo $PfxProtectTo -NotifyTo $NotifyTo -RenewedJobId $jobId
         }
         catch {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message 'Error processing certificate creation request' -Inner $_.Exception -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message 'Error processing certificate creation request' -Inner $_.Exception -NotifyTo $NotifyTo @smtpArgs
         }
 
         # send notification email if requested and SMTP is configured
-        if ($NotifyTo -and -not [string]::IsNullOrEmpty($SmtpServer)) {
-            $subject = "Certificate $CertificateName renewed successfully"
-            $fragment = [System.Net.WebUtility]::HtmlEncode("A new version of certificate $CertificateName has been successfully renewed in the Key Vault $VaultName.")
-            $body = $CertificateNotificationEmailBodyHtml -replace '__CONTENT__', $fragment
-            Send-NotificationEmail -SmtpServer $SmtpServer -FromAddress $fromAddress -To $NotifyTo -Subject $subject -Body $body -SmtpCredential $SmtpCredential
-        }
-        elseif ($NotifyTo -and [string]::IsNullOrEmpty($SmtpServer)) {
-            Write-CertLCLog -Section 'Dispatcher.Renewal' -Message "Notification requested but SMTP is not configured. Skipping email notification." -Level 'Warning'
-        }
+        Send-SuccessNotification -Section 'Dispatcher.Renewal' `
+            -Subject "Certificate $CertificateName renewed successfully" `
+            -BodyText "A new version of certificate $CertificateName has been successfully renewed in the Key Vault $VaultName." `
+            -NotifyTo $NotifyTo @smtpArgs
 
         # confirm renewal
         Write-CertLCLog -Section 'Dispatcher.Renewal' -Message "Certificate $CertificateName was successfully renewed."
@@ -1758,12 +2072,12 @@ switch ($requestBody.type) {
 
         # VaultName: presence and non-empty check
         if ([string]::IsNullOrEmpty($VaultName)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.VaultName' in request body!" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.VaultName' in request body!" -NotifyTo $NotifyTo @smtpArgs
         }
 
         # CertificateName: presence and non-empty check
         if ([string]::IsNullOrEmpty($CertificateName)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.ObjectName' in request body!" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.ObjectName' in request body!" -NotifyTo $NotifyTo @smtpArgs
         }
 
         # CertificateName: check if the certificate already exists in the key vault
@@ -1771,15 +2085,15 @@ switch ($requestBody.type) {
             $deletedCert = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -InRemovedState
         }
         catch {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message 'Error checking for deleted certificate' -Inner $_.Exception -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message 'Error checking for deleted certificate' -Inner $_.Exception -NotifyTo $NotifyTo @smtpArgs
         }
         if (($null -ne $deletedCert) -and ($null -ne $deletedCert.DeletedDate)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Certificate $CertificateName is deleted since $($deletedCert.DeletedDate). Purge it or use a different name." -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Certificate $CertificateName is deleted since $($deletedCert.DeletedDate). Purge it or use a different name." -NotifyTo $NotifyTo @smtpArgs
         }
 
         # CertificateTemplate: presence and non-empty check
         if ([string]::IsNullOrEmpty($CertificateTemplate)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.CertificateTemplate' in request body!" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.CertificateTemplate' in request body!" -NotifyTo $NotifyTo @smtpArgs
         }
 
         # CertificateTemplate: check if the template exists in AD; caller may have specified the template name (CN) or the display name or the OID. We need the 'name' attribute
@@ -1787,39 +2101,39 @@ switch ($requestBody.type) {
             $CertificateTemplateName = Find-TemplateName -cnOrDisplayNameOrOid $CertificateTemplate
         }
         catch {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message 'Error resolving template name' -Inner $_.Exception -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message 'Error resolving template name' -Inner $_.Exception -NotifyTo $NotifyTo @smtpArgs
         }
         if ([string]::IsNullOrEmpty($CertificateTemplateName)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Certificate template $CertificateTemplate not found in Active Directory!" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Certificate template $CertificateTemplate not found in Active Directory!" -NotifyTo $NotifyTo @smtpArgs
         }
 
         # CertificateSubject: presence and non-empty check
         if ([string]::IsNullOrEmpty($CertificateSubject)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.CertificateSubject' in request body!" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.CertificateSubject' in request body!" -NotifyTo $NotifyTo @smtpArgs
         }
 
         # DnsNames (optional, but if specified, must be an array)
         if ($CertificateDnsNames -and $CertificateDnsNames -isnot [array]) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Parameter 'CertificateDnsNames' is not an array!" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Parameter 'CertificateDnsNames' is not an array!" -NotifyTo $NotifyTo @smtpArgs
         }
 
         # Hostname
         if ([string]::IsNullOrWhiteSpace($Hostname)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.Hostname' in request body!" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.Hostname' in request body!" -NotifyTo $NotifyTo @smtpArgs
         }
         $Hostname = $Hostname.Trim().ToLower()
         if ($Hostname -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9\-\.]{0,253})$') {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Hostname '$Hostname' is not valid!" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Hostname '$Hostname' is not valid!" -NotifyTo $NotifyTo @smtpArgs
         }
 
         # PfxProtectTo
         if (-not $PfxProtectTo) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing mandatory parameter 'PfxProtectTo'!" -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing mandatory parameter 'PfxProtectTo'!" -NotifyTo $NotifyTo @smtpArgs
         }
         $PfxProtectTo = Format-PfxProtectTo -InputValue $PfxProtectTo
         # Avoid .Count: Format-PfxProtectTo guarantees array; empty array evaluates to $false
         if (-not $PfxProtectTo) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message 'PfxProtectTo list is empty after normalization!' -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message 'PfxProtectTo list is empty after normalization!' -NotifyTo $NotifyTo @smtpArgs
         }
 
         # end of validation. Now process the new certificate request
@@ -1835,19 +2149,14 @@ switch ($requestBody.type) {
             New-CertificateCreationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplateName $CertificateTemplateName -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -Hostname $Hostname -PfxProtectTo $PfxProtectTo -NotifyTo $NotifyTo
         }
         catch {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message 'Error processing new certificate request' -Inner $_.Exception -NotifyTo $NotifyTo -SmtpServer $SmtpServer -FromAddress $FromAddress -SmtpCredential $SmtpCredential
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message 'Error processing new certificate request' -Inner $_.Exception -NotifyTo $NotifyTo @smtpArgs
         }
 
         # send notification email if requested and SMTP is configured
-        if ($NotifyTo -and -not [string]::IsNullOrEmpty($SmtpServer)) {
-            $subject = "Certificate $CertificateName created successfully"
-            $fragment = [System.Net.WebUtility]::HtmlEncode("A new certificate $CertificateName has been successfully created in the Key Vault $VaultName.")
-            $body = $CertificateNotificationEmailBodyHtml -replace '__CONTENT__', $fragment
-            Send-NotificationEmail -SmtpServer $SmtpServer -FromAddress $fromAddress -To $NotifyTo -Subject $subject -Body $body -SmtpCredential $SmtpCredential
-        }
-        elseif ($NotifyTo -and [string]::IsNullOrEmpty($SmtpServer)) {
-            Write-CertLCLog -Section 'Dispatcher.Creation' -Message "Notification requested but SMTP is not configured. Skipping email notification." -Level 'Warning'
-        }
+        Send-SuccessNotification -Section 'Dispatcher.Creation' `
+            -Subject "Certificate $CertificateName created successfully" `
+            -BodyText "A new certificate $CertificateName has been successfully created in the Key Vault $VaultName." `
+            -NotifyTo $NotifyTo @smtpArgs
 
         # confirm creation
         Write-CertLCLog -Section 'Dispatcher.Creation' -Message "Certificate $CertificateName was successfully created."
@@ -1902,66 +2211,92 @@ switch ($requestBody.type) {
 
         if ($RevocationReason -notin 0, 1, 2, 3, 4, 5, 6) { Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "Revocation request validation: Invalid integer value for 'data.RevocationReason'. Supported: 0-6." }
 
-        # before processing the request, we need to find the certificate by thumbprint
-        Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Searching for certificate with thumbprint $CertificateThumbprint in key vault $VaultName..."
-        $CertificateName = $null
+        # before processing the request, we need to find the matching certificate version by thumbprint
+        Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Searching for certificate version with thumbprint $CertificateThumbprint in key vault $VaultName..."
+        $match = $null
         try {
-            $CertificateName = Get-CertificateByThumbprint -VaultName $VaultName -Thumbprint $CertificateThumbprint
+            $match = Get-CertificateByThumbprint -VaultName $VaultName -Thumbprint $CertificateThumbprint
         }
         catch {
             Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "Error finding certificate with thumbprint $CertificateThumbprint in vault $VaultName" -Inner $_.Exception
         }
-        if ($null -eq $CertificateName) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "No certificate found with thumbprint $CertificateThumbprint in vault $VaultName."
+        if ($null -eq $match) {
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "No certificate version found with thumbprint $CertificateThumbprint in vault $VaultName."
         }
-        Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Found certificate '$CertificateName' matching thumbprint $CertificateThumbprint in vault $VaultName."
+        $CertificateName    = $match.Name
+        $CertificateVersion = $match.Version
+        $IsLatestVersion    = [bool]$match.IsLatest
+        Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Found certificate '$CertificateName' version '$CertificateVersion' (IsLatest=$IsLatestVersion) matching thumbprint $CertificateThumbprint in vault $VaultName."
 
-        # Get the full certificate object to retrieve tags
+        # Get the matched certificate version to retrieve its tags (NotifyTo is read from the specific version,
+        # so older versions that carry their own NotifyTo are honored).
         $cert = $null
         try {
-            $cert = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName
+            $cert = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -Version $CertificateVersion
         }
         catch {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "Error getting certificate details for $CertificateName from vault $VaultName" -Inner $_.Exception
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "Error getting certificate details for $CertificateName version $CertificateVersion from vault $VaultName" -Inner $_.Exception
         }
         if ($null -eq $cert) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "Error getting certificate details for $CertificateName from vault $($VaultName): empty response!"
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "Error getting certificate details for $CertificateName version $CertificateVersion from vault $($VaultName): empty response!"
         }
 
-        # get NotifyTo from the certificate tags (optional)
+        # get NotifyTo from the certificate version tags (optional)
         $rawNotifyTo = $cert.Tags['NotifyTo']
         if ([string]::IsNullOrWhiteSpace($rawNotifyTo)) {
             $notifyTo = $null
-            Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "No NotifyTo addresses found for certificate $CertificateName in vault $VaultName."
+            Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "No NotifyTo addresses found for certificate $CertificateName version $CertificateVersion in vault $VaultName."
         }
         else {
-            Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "NotifyTo addresses found for certificate $CertificateName in vault ${VaultName}: $rawNotifyTo"
+            Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "NotifyTo addresses found for certificate $CertificateName version $CertificateVersion in vault ${VaultName}: $rawNotifyTo"
             $notifyTo = $rawNotifyTo.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+        }
+
+        # Idempotency guard: if this version is already marked as revoked, exit cleanly with a
+        # clear message instead of attempting the revocation again. Without this check the flow
+        # would proceed and fail later inside New-CertificateRevocationRequest at the
+        # Get-AzKeyVaultSecret call (Key Vault refuses to release the secret material of a
+        # disabled version), producing a misleading "Error getting certificate from key vault"
+        # log line. Mirrors the renewal-side check that skips auto-renewal of revoked versions.
+        $revokedTag = if ($cert.Tags -and $cert.Tags.ContainsKey('Revoked')) { [string]$cert.Tags['Revoked'] } else { $null }
+        if ($revokedTag -and $revokedTag.Trim().ToLowerInvariant() -eq 'true') {
+            $revokedAt     = if ($cert.Tags.ContainsKey('RevokedAt'))        { [string]$cert.Tags['RevokedAt'] }        else { '<unknown>' }
+            $revokedReason = if ($cert.Tags.ContainsKey('RevocationReason')) { [string]$cert.Tags['RevocationReason'] } else { '<unknown>' }
+            $revokedJobId  = if ($cert.Tags.ContainsKey('RevokedJobId'))     { [string]$cert.Tags['RevokedJobId'] }     else { '<unknown>' }
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' `
+                -Message "Certificate '$CertificateName' version '$CertificateVersion' (thumbprint $CertificateThumbprint) is ALREADY REVOKED (RevokedAt=$revokedAt, RevocationReason=$revokedReason, RevokedJobId=$revokedJobId). Ignoring duplicate revocation request." `
+                -NotifyTo $notifyTo @smtpArgs
         }
 
         # end of validation. Now process the certificate revocation request
 
-        Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Performing certificate revocation request for certificate $CertificateName in vault $VaultName with reason $RevocationReason..."
+        Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Performing certificate revocation for certificate $CertificateName version $CertificateVersion in vault $VaultName with reason $RevocationReason..."
         try {
-            New-CertificateRevocationRequest -VaultName $VaultName -CertificateName $CertificateName -RevocationReason $RevocationReason
+            # Pass the already-fetched version tags so New-CertificateRevocationRequest does not
+            # need a second Get-AzKeyVaultCertificate round-trip just to merge them.
+            New-CertificateRevocationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateVersion $CertificateVersion -RevocationReason $RevocationReason -JobId $jobId -ExistingTags $cert.Tags
         }
         catch {
             Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message 'Error processing certificate revocation request' -Inner $_.Exception -NotifyTo $NotifyTo
         }
 
-        # send notification email if requested and SMTP is configured
-        if ($NotifyTo -and -not [string]::IsNullOrEmpty($SmtpServer)) {
-            $subject = "Certificate $CertificateName revoked successfully"
-            $fragment = [System.Net.WebUtility]::HtmlEncode("The certificate $CertificateName has been successfully revoked in CA and deleted from the Key Vault $VaultName.")
-            $body = $CertificateNotificationEmailBodyHtml -replace '__CONTENT__', $fragment
-            Send-NotificationEmail -SmtpServer $SmtpServer -FromAddress $fromAddress -To $NotifyTo -Subject $subject -Body $body -smtpCredential $SmtpCredential
-        }
-        elseif ($NotifyTo -and [string]::IsNullOrEmpty($SmtpServer)) {
-            Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Notification requested but SMTP is not configured. Skipping email notification." -Level 'Warning'
+        # If the revoked version was the latest version of the certificate, warn the operator:
+        # any consumer that requests this certificate without specifying a version will receive
+        # a "disabled" error from Key Vault until either a new version is created (e.g. via the
+        # renewal flow) or the version is manually re-enabled. Auto-renewal via the near-expiry
+        # event is suppressed for revoked versions (see DISPATCHER.RENEWAL).
+        if ($IsLatestVersion) {
+            Write-CertLCLog -Section 'Dispatcher.Revocation' -Level 'Warning' -Message "The revoked version $CertificateVersion is the LATEST version of certificate $CertificateName in vault $VaultName. Consumers requesting this certificate without specifying a version will now receive an error from Key Vault until a new version is created."
         }
 
+        # send notification email if requested and SMTP is configured
+        Send-SuccessNotification -Section 'Dispatcher.Revocation' `
+            -Subject "Certificate $CertificateName version revoked successfully" `
+            -BodyText "The version $CertificateVersion of certificate $CertificateName has been revoked at the CA and disabled in Key Vault $VaultName. The certificate object remains in the vault for audit purposes; other versions (if any) are unaffected." `
+            -NotifyTo $NotifyTo @smtpArgs
+
         # confirm revocation
-        Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Certificate $CertificateName was successfully revoked."
+        Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Certificate $CertificateName version $CertificateVersion was successfully revoked (CA: serial revoked; KeyVault: version disabled and tagged)."
     }
 
     #endregion
