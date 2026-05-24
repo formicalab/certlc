@@ -1697,14 +1697,34 @@ Set-AzContext -SubscriptionId $AzureConnection.Subscription.Id -DefaultProfile $
 # TODO: decide if we want to use $jobId as correlation id in the logs
 
 if ($env:AZUREPS_HOST_ENVIRONMENT -eq 'AzureAutomation/') {
-    # We are in a Hybrid Runbook Worker
-    $jobId = $env:PSPrivateMetadata
-    Write-CertLCLog -Section 'Dispatcher' -Message "Runbook running with job id $jobId on hybrid worker $($env:COMPUTERNAME)."
+    # Hybrid Runbook Worker. Collect every place the job id might live, then pick the first
+    # candidate that parses as a real GUID. This bypasses all the per-worker quirks
+    # (env var holding "System.Collections.Hashtable", $PSPrivateMetadata exposing the JobId
+    # as a nested @{Guid='...'} hashtable, $PSCommandPath sometimes not being the <jobId>.ps1
+    # script, etc.). We log every candidate so the diagnostic is always visible.
+    $candidates = [System.Collections.Generic.List[string]]::new()
+    if (-not [string]::IsNullOrEmpty($PSCommandPath)) {
+        $candidates.Add([System.IO.Path]::GetFileNameWithoutExtension($PSCommandPath))
+    }
+    $meta = Get-Variable -Name 'PSPrivateMetadata' -ErrorAction Ignore
+    if ($null -ne $meta -and $meta.Value -is [System.Collections.IDictionary] -and $meta.Value.Contains('JobId')) {
+        $j = $meta.Value['JobId']
+        $candidates.Add("$j")
+        if ($j -is [System.Collections.IDictionary] -and $j.Contains('Guid')) { $candidates.Add("$($j['Guid'])") }
+    }
+    if (-not [string]::IsNullOrEmpty($env:PSPrivateMetadata)) {
+        $candidates.Add($env:PSPrivateMetadata)
+    }
+    $jobId = ''
+    foreach ($c in $candidates) {
+        $g = [Guid]::Empty
+        if ([Guid]::TryParse($c, [ref]$g)) { $jobId = $g.Guid; break }
+    }
+    Write-CertLCLog -Section 'Dispatcher' -Message "Runbook running with job id '$jobId' on hybrid worker $($env:COMPUTERNAME). JobId candidates: [$($candidates -join ' | ')]."
 }
 elseif ($env:AZUREPS_HOST_ENVIRONMENT -eq 'AzureAutomation') {
-    # We are in Azure Automation
-    $jobId = $PSPrivateMetadata.JobId
-    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "Runbook running with job id $jobId in Azure Automation. This runbook must be executed by a hybrid worker instead!"
+    # Azure Automation sandbox: not supported (we require the hybrid worker for CA access).
+    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'Runbook running in Azure Automation sandbox. This runbook must be executed by a hybrid worker instead!'
 }
 else {
     # We are in a local environment - not supported anymore because we cannot get the encrypted variables from the automation account in this case
