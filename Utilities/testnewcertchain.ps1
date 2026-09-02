@@ -20,7 +20,7 @@
   Name of the Key Vault certificate and output PFX base name.
 
 .PARAMETER CertificateTemplate
-  AD CS certificate template name.
+    Internal AD CS certificate template name (CN), not the display name.
 
 .PARAMETER CA
   AD CS configuration string in ServerName\CAName format.
@@ -66,19 +66,19 @@
 [CmdletBinding()]
 param (
     [Parameter(Mandatory)]
-    [ValidateNotNullOrEmpty()]
+    [ValidatePattern('^[A-Za-z0-9-]{3,24}$')]
     [string] $VaultName,
 
     [Parameter(Mandatory)]
-    [ValidateNotNullOrEmpty()]
+    [ValidatePattern('^[A-Za-z0-9-]+$')]
     [string] $CertName,
 
     [Parameter(Mandatory)]
-    [ValidateNotNullOrEmpty()]
+    [ValidatePattern('^\S+$')]
     [string] $CertificateTemplate,
 
     [Parameter(Mandatory)]
-    [ValidatePattern('^.+\\.+$')]
+    [ValidatePattern('^[^\\]+\\[^\\]+$')]
     [string] $CA,
 
     [Parameter(Mandatory)]
@@ -114,62 +114,6 @@ function Test-DistinguishedNameEqual {
     )
 
     [Convert]::ToBase64String($Left.RawData) -ceq [Convert]::ToBase64String($Right.RawData)
-}
-
-function Resolve-CertificateTemplateName {
-    [OutputType([string])]
-    param (
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string] $Identifier
-    )
-
-    $rootDse = $null
-    $searchRoot = $null
-    $searcher = $null
-    try {
-        $rootDse = [DirectoryServices.DirectoryEntry]::new('LDAP://RootDSE')
-        $configurationNamingContext = [string] $rootDse.Properties['configurationNamingContext'][0]
-        $searchRoot = [DirectoryServices.DirectoryEntry]::new(
-            "LDAP://CN=Certificate Templates,CN=Public Key Services,CN=Services,$configurationNamingContext"
-        )
-        $searcher = [DirectoryServices.DirectorySearcher]::new($searchRoot)
-
-        $escapedIdentifier = $Identifier `
-            -replace '\\', '\5c' `
-            -replace '\*', '\2a' `
-            -replace '\(', '\28' `
-            -replace '\)', '\29' `
-            -replace "`0", '\00'
-        $searcher.Filter = "(&(objectClass=pKICertificateTemplate)(|(cn=$escapedIdentifier)(displayName=$escapedIdentifier)(msPKI-Cert-Template-OID=$escapedIdentifier)))"
-        $null = $searcher.PropertiesToLoad.Add('name')
-        $result = $searcher.FindOne()
-        if ($null -eq $result -or $result.Properties['name'].Count -eq 0) {
-            throw "Certificate template '$Identifier' was not found in Active Directory by CN, display name, or OID."
-        }
-
-        [string] $result.Properties['name'][0]
-    }
-    catch {
-        $lookupError = $_.Exception.Message
-        if ($Identifier -match '\s') {
-            throw "Could not resolve certificate template '$Identifier' through Active Directory: $lookupError The supplied value contains whitespace and appears to be a display name. Supply the template's internal name (CN), for example 'FlabShortWebServer'."
-        }
-
-        Write-Warning "Could not resolve certificate template '$Identifier' through Active Directory: $lookupError Using the supplied value verbatim as the template's internal name (CN)."
-        $Identifier
-    }
-    finally {
-        foreach ($disposable in @($searcher, $searchRoot, $rootDse)) {
-            if ($null -eq $disposable) { continue }
-            try {
-                ([IDisposable] $disposable).Dispose()
-            }
-            catch {
-                Write-Verbose "Ignoring certificate template lookup cleanup failure: $($_.Exception.Message)"
-            }
-        }
-    }
 }
 
 function Get-CaRequestDiagnostic {
@@ -222,21 +166,33 @@ function ConvertFrom-Base64Pkcs7 {
     Write-Output -NoEnumerate $collection
 }
 
-function Get-OrderedCaResponseChain {
+function Get-OrderedCertificateChain {
     [OutputType([System.Security.Cryptography.X509Certificates.X509Certificate2[]])]
     param (
         [Parameter(Mandatory)]
-        [System.Security.Cryptography.X509Certificates.X509Certificate2Collection] $Certificates
+        [System.Security.Cryptography.X509Certificates.X509Certificate2Collection] $Certificates,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('CaResponse', 'KeyVaultSecret')]
+        [string] $Source,
+
+        [Parameter()]
+        [switch] $ExcludeRoot
     )
 
-    $leafCandidates = @($Certificates | Where-Object {
-        $basicConstraints = $_.Extensions |
-            Where-Object { $_ -is [Security.Cryptography.X509Certificates.X509BasicConstraintsExtension] } |
-            Select-Object -First 1
-        $null -eq $basicConstraints -or -not $basicConstraints.CertificateAuthority
-    })
+    $leafCandidates = if ($Source -eq 'KeyVaultSecret') {
+        @($Certificates | Where-Object HasPrivateKey)
+    }
+    else {
+        @($Certificates | Where-Object {
+            $basicConstraints = $_.Extensions |
+                Where-Object { $_ -is [Security.Cryptography.X509Certificates.X509BasicConstraintsExtension] } |
+                Select-Object -First 1
+            $null -eq $basicConstraints -or -not $basicConstraints.CertificateAuthority
+        })
+    }
     if ($leafCandidates.Count -ne 1) {
-        throw "Expected exactly one end-entity certificate in the AD CS PKCS#7 response; found $($leafCandidates.Count)."
+        throw "Expected exactly one leaf certificate in $Source; found $($leafCandidates.Count)."
     }
 
     $remaining = [Collections.Generic.List[Security.Cryptography.X509Certificates.X509Certificate2]]::new()
@@ -258,7 +214,7 @@ function Get-OrderedCaResponseChain {
             Test-DistinguishedNameEqual -Left $_.SubjectName -Right $current.IssuerName
         })
         if ($issuers.Count -ne 1) {
-            throw "Expected one issuer for '$($current.Subject)' in the AD CS PKCS#7 response; found $($issuers.Count)."
+            throw "Expected one issuer for '$($current.Subject)' in $Source; found $($issuers.Count)."
         }
 
         $current = $issuers[0]
@@ -266,13 +222,68 @@ function Get-OrderedCaResponseChain {
     }
 
     if ($remaining.Count -gt 0) {
-        throw "The AD CS PKCS#7 response contains $($remaining.Count) certificate(s) outside the leaf's issuer chain."
+        throw "$Source contains $($remaining.Count) certificate(s) outside the leaf's issuer chain."
     }
     if (-not (Test-DistinguishedNameEqual -Left $ordered[$ordered.Count - 1].SubjectName -Right $ordered[$ordered.Count - 1].IssuerName)) {
-        throw 'The AD CS PKCS#7 response does not terminate in a self-issued root certificate.'
+        throw "$Source does not terminate in a self-issued root certificate."
+    }
+
+    if ($ExcludeRoot) {
+        $ordered.RemoveAt($ordered.Count - 1)
+        if ($ordered.Count -lt 2) {
+            throw "$Source contains no intermediate CA certificate after the root is excluded."
+        }
     }
 
     $ordered.ToArray()
+}
+
+function Assert-CertificateSet {
+    param (
+        [Parameter(Mandatory)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2[]] $Expected,
+
+        [Parameter(Mandatory)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2Collection] $Actual,
+
+        [Parameter(Mandatory)]
+        [string] $Context
+    )
+
+    $expectedThumbprints = @($Expected.Thumbprint | Sort-Object -Unique)
+    $actualThumbprints = @($Actual.Thumbprint | Sort-Object -Unique)
+    $missing = @($expectedThumbprints | Where-Object { $_ -notin $actualThumbprints })
+    $unexpected = @($actualThumbprints | Where-Object { $_ -notin $expectedThumbprints })
+    if ($Expected.Count -ne $Actual.Count -or $missing.Count -gt 0 -or $unexpected.Count -gt 0) {
+        throw "$Context certificate mismatch. Expected $($Expected.Count), found $($Actual.Count). Missing: $($missing -join ', '); unexpected: $($unexpected -join ', ')."
+    }
+}
+
+function Assert-CertificateChain {
+    param (
+        [Parameter(Mandatory)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2[]] $Certificates
+    )
+
+    $chain = [Security.Cryptography.X509Certificates.X509Chain]::new()
+    try {
+        $chain.ChainPolicy.RevocationMode = [Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+        $chain.ChainPolicy.DisableCertificateDownloads = $true
+        $chain.ChainPolicy.TrustMode = [Security.Cryptography.X509Certificates.X509ChainTrustMode]::CustomRootTrust
+        $null = $chain.ChainPolicy.CustomTrustStore.Add($Certificates[-1])
+        if ($Certificates.Count -gt 2) {
+            foreach ($certificate in $Certificates[1..($Certificates.Count - 2)]) {
+                $null = $chain.ChainPolicy.ExtraStore.Add($certificate)
+            }
+        }
+        if (-not $chain.Build($Certificates[0])) {
+            $status = ($chain.ChainStatus.StatusInformation | ForEach-Object { $_.Trim() }) -join '; '
+            throw "AD CS returned an invalid certificate chain: $status"
+        }
+    }
+    finally {
+        $chain.Dispose()
+    }
 }
 
 function Merge-KeyVaultCertificateChain {
@@ -286,7 +297,10 @@ function Merge-KeyVaultCertificateChain {
         [string] $CertificateName,
 
         [Parameter(Mandatory)]
-        [Security.Cryptography.X509Certificates.X509Certificate2[]] $Certificates
+        [Security.Cryptography.X509Certificates.X509Certificate2[]] $Certificates,
+
+        [Parameter(Mandatory)]
+        [Security.SecureString] $Token
     )
 
     $x5c = @($Certificates | ForEach-Object {
@@ -295,76 +309,53 @@ function Merge-KeyVaultCertificateChain {
     $body = @{ x5c = $x5c } | ConvertTo-Json -Depth 3 -Compress
     $escapedCertificateName = [Uri]::EscapeDataString($CertificateName)
     $uri = "https://$VaultName.vault.azure.net/certificates/$escapedCertificateName/pending/merge?api-version=2025-07-01"
-    $token = (Get-AzAccessToken -ResourceTypeName KeyVault -AsSecureString).Token
-
     Write-Verbose "Submitting $($x5c.Count) explicitly encoded certificates to the Key Vault pending merge API."
     Invoke-RestMethod `
         -Uri $uri `
         -Method Post `
         -Authentication Bearer `
-        -Token $token `
+        -Token $Token `
         -ContentType 'application/json' `
         -Body $body
 }
 
-function Get-OrderedCertificateChain {
-    [OutputType([System.Security.Cryptography.X509Certificates.X509Certificate2[]])]
+function Get-KeyVaultCertificateSecretValue {
+    [OutputType([string])]
     param (
         [Parameter(Mandatory)]
-        [System.Security.Cryptography.X509Certificates.X509Certificate2Collection] $Certificates
+        [ValidateNotNullOrEmpty()]
+        [string] $VaultName,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $SecretId,
+
+        [Parameter(Mandatory)]
+        [Security.SecureString] $Token
     )
 
-    $privateKeyCertificates = @($Certificates | Where-Object { $_.HasPrivateKey })
-    if ($privateKeyCertificates.Count -ne 1) {
-        throw "Expected exactly one certificate with a private key in the Key Vault PKCS#12 secret; found $($privateKeyCertificates.Count)."
+    $secretUri = [Uri] $SecretId
+    $expectedHost = "$VaultName.vault.azure.net"
+    if (-not $secretUri.IsAbsoluteUri -or $secretUri.Scheme -ine 'https' -or $secretUri.Host -ine $expectedHost) {
+        throw "Key Vault merge returned an unexpected secret ID '$SecretId'. Expected an HTTPS URL on '$expectedHost'."
     }
 
-    $leaf = $privateKeyCertificates[0]
-    $remaining = [Collections.Generic.List[System.Security.Cryptography.X509Certificates.X509Certificate2]]::new()
-    foreach ($certificate in $Certificates) {
-        if ($certificate.Thumbprint -cne $leaf.Thumbprint) {
-            $remaining.Add($certificate)
-        }
+    $uri = "$($secretUri.AbsoluteUri.TrimEnd('/'))?api-version=2025-07-01"
+    $secret = Invoke-RestMethod `
+        -Uri $uri `
+        -Method Get `
+        -Authentication Bearer `
+        -Token $Token `
+        -ContentType 'application/json'
+
+    if ($secret.contentType -ine 'application/x-pkcs12') {
+        throw "The merged Key Vault secret has unexpected content type '$($secret.contentType)'; expected 'application/x-pkcs12'."
+    }
+    if ([string]::IsNullOrWhiteSpace($secret.value)) {
+        throw "Key Vault returned an empty value for versioned secret '$SecretId'."
     }
 
-    $chain = [Collections.Generic.List[System.Security.Cryptography.X509Certificates.X509Certificate2]]::new()
-    $current = $leaf
-    while ($null -ne $current) {
-        $chain.Add($current)
-
-        if (Test-DistinguishedNameEqual -Left $current.SubjectName -Right $current.IssuerName) {
-            break
-        }
-
-        $issuers = @($remaining | Where-Object {
-            Test-DistinguishedNameEqual -Left $_.SubjectName -Right $current.IssuerName
-        })
-        if ($issuers.Count -eq 0) {
-            throw "The PKCS#12 chain is incomplete: issuer '$($current.Issuer)' for '$($current.Subject)' is missing."
-        }
-        if ($issuers.Count -gt 1) {
-            throw "The PKCS#12 chain is ambiguous: multiple certificates match issuer '$($current.Issuer)'."
-        }
-
-        $current = $issuers[0]
-        $null = $remaining.Remove($current)
-    }
-
-    if ($remaining.Count -gt 0) {
-        throw "The Key Vault PKCS#12 secret contains $($remaining.Count) certificate(s) outside the leaf's issuer chain."
-    }
-
-    $lastCertificate = $chain[$chain.Count - 1]
-    if (-not (Test-DistinguishedNameEqual -Left $lastCertificate.SubjectName -Right $lastCertificate.IssuerName)) {
-        throw 'The returned certificate chain does not terminate in a self-issued root certificate.'
-    }
-
-    $chain.RemoveAt($chain.Count - 1)
-    if ($chain.Count -lt 2) {
-        throw 'After excluding the root, the chain contains no issuing CA certificate. The leaf appears to have been issued directly by the root CA.'
-    }
-
-    $chain.ToArray()
+    [string] $secret.value
 }
 
 function Export-SidProtectedPfx {
@@ -425,7 +416,10 @@ public static class CertLCChainNative
     $store = [IntPtr]::Zero
     $descriptorPointer = [IntPtr]::Zero
     $blob = [CertLCChainNative+Blob]::new()
-    $password = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(40))
+    $pfxBytes = $null
+    $passwordBytes = [Security.Cryptography.RandomNumberGenerator]::GetBytes(40)
+    $password = [Convert]::ToBase64String($passwordBytes)
+    [Array]::Clear($passwordBytes, 0, $passwordBytes.Length)
 
     try {
         $result = [CertLCChainNative]::NCryptCreateProtectionDescriptor($ProtectionRule, 0, [ref] $descriptorHandle)
@@ -463,6 +457,9 @@ public static class CertLCChainNative
     }
     finally {
         $password = $null
+        if ($null -ne $pfxBytes) {
+            [Array]::Clear($pfxBytes, 0, $pfxBytes.Length)
+        }
         if ($blob.pbData -ne [IntPtr]::Zero) {
             [Runtime.InteropServices.Marshal]::FreeHGlobal($blob.pbData)
         }
@@ -481,6 +478,7 @@ public static class CertLCChainNative
 if (-not (Get-AzContext -ErrorAction SilentlyContinue)) {
     throw 'No authenticated Az context exists. Run Connect-AzAccount and select the intended subscription before invoking this utility.'
 }
+$keyVaultToken = (Get-AzAccessToken -ResourceTypeName KeyVault -AsSecureString).Token
 
 $effectiveDnsNames = @($CertificateDnsNames |
     Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
@@ -497,6 +495,7 @@ $protectionSids = foreach ($principal in $PfxProtectTo) {
         throw "Could not resolve PfxProtectTo principal '$principal' to a SID: $($_.Exception.Message)"
     }
 }
+$protectionSids = @($protectionSids | Sort-Object -Unique)
 $protectionRule = ($protectionSids | ForEach-Object { "SID=$_" }) -join ' OR '
 
 if (-not $PfxPath) {
@@ -511,13 +510,9 @@ if ((Test-Path -LiteralPath $resolvedPfxPath) -and -not $Force) {
     throw "Output PFX '$resolvedPfxPath' already exists. Use -Force to replace it."
 }
 
-$resolvedCertificateTemplate = Resolve-CertificateTemplateName -Identifier $CertificateTemplate
-Write-Verbose "Using AD CS template name '$resolvedCertificateTemplate' (input: '$CertificateTemplate')."
-
 $tags = @{
-    CertificateTemplateName = $resolvedCertificateTemplate
+    CertificateTemplateName = $CertificateTemplate
     PfxProtectTo            = $PfxProtectTo -join ';'
-    ChainTestUtility        = 'true'
 }
 
 $operation = Get-AzKeyVaultCertificateOperation -VaultName $VaultName -Name $CertName -ErrorAction SilentlyContinue
@@ -539,13 +534,16 @@ else {
     $request = Add-AzKeyVaultCertificate -VaultName $VaultName -Name $CertName -CertificatePolicy $policy -Tag $tags
     $csr = $request.CertificateSigningRequest
 }
+if ([string]::IsNullOrWhiteSpace($csr)) {
+    throw "Key Vault returned an empty CSR for certificate '$CertName'."
+}
 
 $certificateRequest = $null
 $pkcs7Response = $null
 try {
-    Write-Verbose "Submitting the CSR to '$CA' with template '$resolvedCertificateTemplate'."
+    Write-Verbose "Submitting the CSR to '$CA' with template '$CertificateTemplate'."
     $certificateRequest = New-Object -ComObject CertificateAuthority.Request
-    $disposition = $certificateRequest.Submit(0x1, $csr, "CertificateTemplate:$resolvedCertificateTemplate", $CA)
+    $disposition = $certificateRequest.Submit(0x1, $csr, "CertificateTemplate:$CertificateTemplate", $CA)
     $caDiagnostic = Get-CaRequestDiagnostic -CertificateRequest $certificateRequest
 
     switch ($disposition) {
@@ -565,10 +563,19 @@ finally {
 }
 
 $caResponseCertificates = ConvertFrom-Base64Pkcs7 -Content $pkcs7Response
-if ($caResponseCertificates.Count -lt 2) {
-    throw "AD CS returned PKCS#7 containing only $($caResponseCertificates.Count) certificate(s); CR_OUT_CHAIN did not provide an issuer chain."
+try {
+    if ($caResponseCertificates.Count -lt 2) {
+        throw "AD CS returned PKCS#7 containing only $($caResponseCertificates.Count) certificate(s); CR_OUT_CHAIN did not provide an issuer chain."
+    }
+    $caChain = Get-OrderedCertificateChain -Certificates $caResponseCertificates -Source CaResponse
+    Assert-CertificateChain -Certificates $caChain
 }
-$caChain = Get-OrderedCaResponseChain -Certificates $caResponseCertificates
+catch {
+    foreach ($certificate in $caResponseCertificates) {
+        $certificate.Dispose()
+    }
+    throw
+}
 Write-Verbose "AD CS PKCS#7 physically contains $($caChain.Count) certificates in a complete leaf-to-root chain."
 foreach ($certificate in $caChain) {
     Write-Verbose "CA response member: $($certificate.Subject) (issuer: $($certificate.Issuer))"
@@ -577,72 +584,69 @@ foreach ($certificate in $caChain) {
 $certificateBytes = $null
 $keyVaultCertificates = $null
 $exportedSubjects = @()
+$temporaryPfxPath = Join-Path $outputDirectory ".$([IO.Path]::GetFileName($resolvedPfxPath)).$([guid]::NewGuid().ToString('N')).tmp"
 try {
     Write-Verbose "Merging the explicit certificate chain into pending Key Vault certificate '$CertName'."
     $mergedCertificate = Merge-KeyVaultCertificateChain `
         -VaultName $VaultName `
         -CertificateName $CertName `
-        -Certificates $caChain
-    if ($null -eq $mergedCertificate -or [string]::IsNullOrWhiteSpace($mergedCertificate.id)) {
+        -Certificates $caChain `
+        -Token $keyVaultToken
+    if ($null -eq $mergedCertificate -or
+        [string]::IsNullOrWhiteSpace($mergedCertificate.id) -or
+        [string]::IsNullOrWhiteSpace($mergedCertificate.sid)) {
         throw 'The Key Vault pending merge API returned no certificate bundle.'
     }
 
-    Write-Verbose "Retrieving the merged PKCS#12 secret for '$CertName'."
-    $secretBase64 = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertName -AsPlainText
-    if ([string]::IsNullOrWhiteSpace($secretBase64)) {
-        throw "Key Vault returned an empty certificate secret for '$CertName'."
-    }
+    Write-Verbose "Retrieving the exact merged PKCS#12 secret version '$($mergedCertificate.sid)'."
+    $secretBase64 = Get-KeyVaultCertificateSecretValue `
+        -VaultName $VaultName `
+        -SecretId $mergedCertificate.sid `
+        -Token $keyVaultToken
 
     $certificateBytes = [Convert]::FromBase64String($secretBase64)
     $secretBase64 = $null
     $keyVaultCertificates = [Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
+    $importFlags = [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable -bor
+        [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
 
     $keyVaultCertificates.Import(
         $certificateBytes,
         [string]::Empty,
-        [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
+        $importFlags
     )
 
-    $submittedThumbprints = @($caChain.Thumbprint | Sort-Object -Unique)
-    $keyVaultThumbprints = @($keyVaultCertificates.Thumbprint | Sort-Object -Unique)
-    $missingFromKeyVault = @($submittedThumbprints | Where-Object { $_ -notin $keyVaultThumbprints })
-    if ($keyVaultThumbprints.Count -ne $submittedThumbprints.Count -or $missingFromKeyVault.Count -gt 0) {
-        throw "Key Vault chain persistence validation failed: submitted $($submittedThumbprints.Count) certificates but its downloaded PKCS#12 secret contains $($keyVaultThumbprints.Count). Missing thumbprints: $($missingFromKeyVault -join ', ')."
-    }
-    Write-Verbose "Verified the Key Vault PKCS#12 secret physically contains all $($keyVaultThumbprints.Count) submitted chain certificates."
+    Assert-CertificateSet -Expected $caChain -Actual $keyVaultCertificates -Context 'Key Vault persistence'
+    Write-Verbose "Verified the Key Vault PKCS#12 secret physically contains all $($keyVaultCertificates.Count) submitted chain certificates."
 
-    $exportChain = Get-OrderedCertificateChain -Certificates $keyVaultCertificates
+    $exportChain = Get-OrderedCertificateChain -Certificates $keyVaultCertificates -Source KeyVaultSecret -ExcludeRoot
     $exportedSubjects = @($exportChain | ForEach-Object { $_.Subject })
     Write-Verbose "Exporting $($exportChain.Count) certificates solely from the Key Vault PKCS#12 secret after excluding the root."
     foreach ($certificate in $exportChain) {
         Write-Verbose "PFX member: $($certificate.Subject) (issuer: $($certificate.Issuer), private key: $($certificate.HasPrivateKey))"
     }
 
-    Export-SidProtectedPfx -Certificates $exportChain -ProtectionRule $protectionRule -OutputPath $resolvedPfxPath
+    Export-SidProtectedPfx -Certificates $exportChain -ProtectionRule $protectionRule -OutputPath $temporaryPfxPath
 
     $verificationCertificates = [Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
     try {
         $verificationCertificates.Import(
-            $resolvedPfxPath,
+            $temporaryPfxPath,
             [string]::Empty,
-            [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
+            $importFlags
         )
-        $expectedThumbprints = @($exportChain.Thumbprint | Sort-Object -Unique)
-        $actualThumbprints = @($verificationCertificates.Thumbprint | Sort-Object -Unique)
-        if ($actualThumbprints.Count -ne $expectedThumbprints.Count -or
-            @($expectedThumbprints | Where-Object { $_ -notin $actualThumbprints }).Count -gt 0) {
-            Remove-Item -LiteralPath $resolvedPfxPath -Force -ErrorAction SilentlyContinue
-            throw "Export verification failed: expected $($expectedThumbprints.Count) embedded certificates but reopened PFX contained $($actualThumbprints.Count). The incomplete PFX was removed."
-        }
-        Write-Verbose "Verified the exported PFX physically contains all $($actualThumbprints.Count) expected certificates."
+        Assert-CertificateSet -Expected $exportChain -Actual $verificationCertificates -Context 'Exported PFX'
+        Write-Verbose "Verified the exported PFX physically contains all $($verificationCertificates.Count) expected certificates."
     }
     finally {
         foreach ($certificate in $verificationCertificates) {
             $certificate.Dispose()
         }
     }
+    [IO.File]::Move($temporaryPfxPath, $resolvedPfxPath, [bool] $Force)
 }
 finally {
+    Remove-Item -LiteralPath $temporaryPfxPath -Force -ErrorAction SilentlyContinue
     if ($null -ne $certificateBytes) {
         [Array]::Clear($certificateBytes, 0, $certificateBytes.Length)
     }
