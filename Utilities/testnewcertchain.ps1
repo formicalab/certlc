@@ -44,7 +44,7 @@
   .\testnewcertchain.ps1 `
     -VaultName 'flazkv-certlc-itn-001' `
     -CertName 'cert001' `
-    -CertificateTemplate 'Flab Short WebServer' `
+    -CertificateTemplate 'FlabShortWebServer' `
     -CA 'ca01.lab.local\Lab Issuing CA' `
     -PfxProtectTo @('lab\marcello') `
     -Subject 'CN=www.example.com' `
@@ -151,7 +151,12 @@ function Resolve-CertificateTemplateName {
         [string] $result.Properties['name'][0]
     }
     catch {
-        Write-Warning "Could not resolve certificate template '$Identifier' through Active Directory: $($_.Exception.Message) Using the supplied value verbatim; it must be the template's internal name (CN), not its display name."
+        $lookupError = $_.Exception.Message
+        if ($Identifier -match '\s') {
+            throw "Could not resolve certificate template '$Identifier' through Active Directory: $lookupError The supplied value contains whitespace and appears to be a display name. Supply the template's internal name (CN), for example 'FlabShortWebServer'."
+        }
+
+        Write-Warning "Could not resolve certificate template '$Identifier' through Active Directory: $lookupError Using the supplied value verbatim as the template's internal name (CN)."
         $Identifier
     }
     finally {
@@ -392,7 +397,7 @@ if ((Test-Path -LiteralPath $resolvedPfxPath) -and -not $Force) {
 }
 
 $resolvedCertificateTemplate = Resolve-CertificateTemplateName -Identifier $CertificateTemplate
-Write-Verbose "Resolved certificate template '$CertificateTemplate' to AD template name '$resolvedCertificateTemplate'."
+Write-Verbose "Using AD CS template name '$resolvedCertificateTemplate' (input: '$CertificateTemplate')."
 
 $tags = @{
     CertificateTemplateName = $resolvedCertificateTemplate
