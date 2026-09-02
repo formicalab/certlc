@@ -192,6 +192,36 @@ function Get-CaRequestDiagnostic {
     "Request ID: $requestId; CA message: $dispositionMessage; last status: $statusText"
 }
 
+function ConvertFrom-Base64Pkcs7 {
+    [OutputType([System.Security.Cryptography.X509Certificates.X509Certificate2Collection])]
+    param (
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $Content
+    )
+
+    $base64 = $Content -replace '(?m)^-----[^\r\n]+-----\s*$', '' -replace '\s', ''
+    try {
+        $bytes = [Convert]::FromBase64String($base64)
+    }
+    catch {
+        throw "The CA chain response is not valid Base64 PKCS#7: $($_.Exception.Message)"
+    }
+
+    $collection = [Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
+    try {
+        $collection.Import($bytes)
+    }
+    catch {
+        throw "The CA chain response could not be decoded as PKCS#7: $($_.Exception.Message)"
+    }
+    finally {
+        [Array]::Clear($bytes, 0, $bytes.Length)
+    }
+
+    $collection
+}
+
 function Get-OrderedCertificateChain {
     [OutputType([System.Security.Cryptography.X509Certificates.X509Certificate2[]])]
     param (
@@ -449,6 +479,15 @@ finally {
     }
 }
 
+$caCertificates = ConvertFrom-Base64Pkcs7 -Content $pkcs7Response
+if ($caCertificates.Count -lt 2) {
+    throw "AD CS returned PKCS#7 containing only $($caCertificates.Count) certificate(s); CR_OUT_CHAIN did not provide an issuer chain."
+}
+Write-Verbose "AD CS PKCS#7 physically contains $($caCertificates.Count) certificates."
+foreach ($certificate in $caCertificates) {
+    Write-Verbose "CA response member: $($certificate.Subject) (issuer: $($certificate.Issuer))"
+}
+
 $temporaryPkcs7Path = Join-Path ([IO.Path]::GetTempPath()) "$([guid]::NewGuid().ToString('N')).p7b"
 try {
     Set-Content -LiteralPath $temporaryPkcs7Path -Value $pkcs7Response -Encoding ascii
@@ -470,27 +509,63 @@ if ([string]::IsNullOrWhiteSpace($secretBase64)) {
 
 $certificateBytes = [Convert]::FromBase64String($secretBase64)
 $secretBase64 = $null
-$certificates = [Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
+$keyVaultCertificates = [Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
+$combinedCertificates = [Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
 $exportedSubjects = @()
 try {
-    $certificates.Import(
+    $keyVaultCertificates.Import(
         $certificateBytes,
         [string]::Empty,
         [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
     )
 
-    $exportChain = Get-OrderedCertificateChain -Certificates $certificates
+    foreach ($certificate in $keyVaultCertificates) {
+        $null = $combinedCertificates.Add($certificate)
+    }
+    foreach ($certificate in $caCertificates) {
+        if ($certificate.Thumbprint -notin $combinedCertificates.Thumbprint) {
+            $null = $combinedCertificates.Add($certificate)
+        }
+    }
+
+    $exportChain = Get-OrderedCertificateChain -Certificates $combinedCertificates
     $exportedSubjects = @($exportChain | ForEach-Object { $_.Subject })
-    Write-Verbose "The merged secret contains $($certificates.Count) certificates; exporting $($exportChain.Count) after excluding the root."
+    Write-Verbose "The Key Vault secret contains $($keyVaultCertificates.Count) certificate(s)."
+    Write-Verbose "Exporting $($exportChain.Count) certificates from the combined Key Vault leaf and CA chain after excluding the root."
     foreach ($certificate in $exportChain) {
         Write-Verbose "PFX member: $($certificate.Subject) (issuer: $($certificate.Issuer), private key: $($certificate.HasPrivateKey))"
     }
 
     Export-SidProtectedPfx -Certificates $exportChain -ProtectionRule $protectionRule -OutputPath $resolvedPfxPath
+
+    $verificationCertificates = [Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
+    try {
+        $verificationCertificates.Import(
+            $resolvedPfxPath,
+            [string]::Empty,
+            [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
+        )
+        $expectedThumbprints = @($exportChain.Thumbprint | Sort-Object -Unique)
+        $actualThumbprints = @($verificationCertificates.Thumbprint | Sort-Object -Unique)
+        if ($actualThumbprints.Count -ne $expectedThumbprints.Count -or
+            @($expectedThumbprints | Where-Object { $_ -notin $actualThumbprints }).Count -gt 0) {
+            Remove-Item -LiteralPath $resolvedPfxPath -Force -ErrorAction SilentlyContinue
+            throw "Export verification failed: expected $($expectedThumbprints.Count) embedded certificates but reopened PFX contained $($actualThumbprints.Count). The incomplete PFX was removed."
+        }
+        Write-Verbose "Verified the exported PFX physically contains all $($actualThumbprints.Count) expected certificates."
+    }
+    finally {
+        foreach ($certificate in $verificationCertificates) {
+            $certificate.Dispose()
+        }
+    }
 }
 finally {
     [Array]::Clear($certificateBytes, 0, $certificateBytes.Length)
-    foreach ($certificate in $certificates) {
+    foreach ($certificate in $keyVaultCertificates) {
+        $certificate.Dispose()
+    }
+    foreach ($certificate in $caCertificates) {
         $certificate.Dispose()
     }
 }
