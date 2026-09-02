@@ -31,6 +31,9 @@
 .PARAMETER CertificateDnsNames
   Optional DNS subject alternative names.
 
+.PARAMETER Hostname
+    Hostname of the server where the certificate will be used. Stored in the Key Vault certificate tags.
+
 .PARAMETER PfxProtectTo
   Domain users or groups allowed to decrypt the PFX, such as DOMAIN\User.
 
@@ -49,6 +52,7 @@
     -PfxProtectTo @('lab\marcello') `
     -Subject 'CN=www.example.com' `
     -CertificateDnsNames @('www.example.com') `
+    -Hostname 'webserver01' `
     -PfxPath '.\cert001.pfx' `
     -Verbose
 
@@ -87,6 +91,10 @@ param (
 
     [Parameter()]
     [string[]] $CertificateDnsNames,
+
+    [Parameter(Mandatory)]
+    [ValidateNotNullOrEmpty()]
+    [string] $Hostname,
 
     [Parameter(Mandatory)]
     [ValidateNotNullOrEmpty()]
@@ -484,10 +492,25 @@ $effectiveDnsNames = @($CertificateDnsNames |
     Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
     Select-Object -Unique)
 
-$protectionSids = foreach ($principal in $PfxProtectTo) {
-    if ([string]::IsNullOrWhiteSpace($principal)) {
+$Hostname = $Hostname.Trim().ToLowerInvariant()
+if ($Hostname -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,253})$') {
+    throw "Hostname '$Hostname' is not valid."
+}
+
+$normalizedPfxProtectTo = [Collections.Generic.List[string]]::new()
+$seenPrincipals = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+foreach ($rawPrincipal in $PfxProtectTo) {
+    if ([string]::IsNullOrWhiteSpace($rawPrincipal)) {
         throw 'PfxProtectTo cannot contain an empty principal.'
     }
+
+    $principal = $rawPrincipal.Trim() -replace '\\{2,}', '\'
+    if ($seenPrincipals.Add($principal)) {
+        $normalizedPfxProtectTo.Add($principal)
+    }
+}
+
+$protectionSids = foreach ($principal in $normalizedPfxProtectTo) {
     try {
         ([Security.Principal.NTAccount] $principal).Translate([Security.Principal.SecurityIdentifier]).Value
     }
@@ -512,7 +535,8 @@ if ((Test-Path -LiteralPath $resolvedPfxPath) -and -not $Force) {
 
 $tags = @{
     CertificateTemplateName = $CertificateTemplate
-    PfxProtectTo            = $PfxProtectTo -join ';'
+    Hostname                = $Hostname
+    PfxProtectTo            = $normalizedPfxProtectTo -join ';'
 }
 
 $operation = Get-AzKeyVaultCertificateOperation -VaultName $VaultName -Name $CertName -ErrorAction SilentlyContinue
@@ -597,6 +621,46 @@ try {
         [string]::IsNullOrWhiteSpace($mergedCertificate.sid)) {
         throw 'The Key Vault pending merge API returned no certificate bundle.'
     }
+
+    $certificateUri = [Uri] $mergedCertificate.id
+    if (-not $certificateUri.IsAbsoluteUri -or
+        $certificateUri.Scheme -ine 'https' -or
+        $certificateUri.Host -ine "$VaultName.vault.azure.net") {
+        throw "Key Vault merge returned an unexpected certificate ID '$($mergedCertificate.id)'."
+    }
+
+    $certificatePath = $certificateUri.AbsolutePath.Trim('/').Split('/')
+    if ($certificatePath.Count -ne 3 -or
+        $certificatePath[0] -ine 'certificates' -or
+        [Uri]::UnescapeDataString($certificatePath[1]) -cne $CertName -or
+        [string]::IsNullOrWhiteSpace($certificatePath[2])) {
+        throw "Key Vault merge returned an unexpected certificate ID '$($mergedCertificate.id)'."
+    }
+
+    $mergedTags = @{}
+    $mergedTagProperty = $mergedCertificate.PSObject.Properties['tags']
+    if ($null -ne $mergedTagProperty -and $null -ne $mergedTagProperty.Value) {
+        foreach ($property in $mergedTagProperty.Value.PSObject.Properties) {
+            $mergedTags[$property.Name] = [string] $property.Value
+        }
+    }
+    foreach ($tag in $tags.GetEnumerator()) {
+        $mergedTags[$tag.Key] = $tag.Value
+    }
+
+    $taggedCertificate = Update-AzKeyVaultCertificate `
+        -VaultName $VaultName `
+        -Name $CertName `
+        -Version $certificatePath[2] `
+        -Tag $mergedTags `
+        -PassThru
+    foreach ($tag in $tags.GetEnumerator()) {
+        $actualTagValue = if ($null -eq $taggedCertificate.Tags) { $null } else { [string] $taggedCertificate.Tags[$tag.Key] }
+        if ($actualTagValue -cne [string] $tag.Value) {
+            throw "Key Vault certificate version '$($certificatePath[2])' is missing mandatory tag '$($tag.Key)'."
+        }
+    }
+    Write-Verbose "Verified mandatory tags on Key Vault certificate version '$($certificatePath[2])'."
 
     Write-Verbose "Retrieving the exact merged PKCS#12 secret version '$($mergedCertificate.sid)'."
     $secretBase64 = Get-KeyVaultCertificateSecretValue `
