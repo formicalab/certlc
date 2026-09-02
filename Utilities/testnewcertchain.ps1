@@ -150,10 +150,20 @@ function Resolve-CertificateTemplateName {
 
         [string] $result.Properties['name'][0]
     }
+    catch {
+        Write-Warning "Could not resolve certificate template '$Identifier' through Active Directory: $($_.Exception.Message) Using the supplied value verbatim; it must be the template's internal name (CN), not its display name."
+        $Identifier
+    }
     finally {
-        if ($null -ne $searcher) { $searcher.Dispose() }
-        if ($null -ne $searchRoot) { $searchRoot.Dispose() }
-        if ($null -ne $rootDse) { $rootDse.Dispose() }
+        foreach ($disposable in @($searcher, $searchRoot, $rootDse)) {
+            if ($null -eq $disposable) { continue }
+            try {
+                ([IDisposable] $disposable).Dispose()
+            }
+            catch {
+                Write-Verbose "Ignoring certificate template lookup cleanup failure: $($_.Exception.Message)"
+            }
+        }
     }
 }
 
