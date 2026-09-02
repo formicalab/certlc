@@ -116,6 +116,67 @@ function Test-DistinguishedNameEqual {
     [Convert]::ToBase64String($Left.RawData) -ceq [Convert]::ToBase64String($Right.RawData)
 }
 
+function Resolve-CertificateTemplateName {
+    [OutputType([string])]
+    param (
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $Identifier
+    )
+
+    $rootDse = $null
+    $searchRoot = $null
+    $searcher = $null
+    try {
+        $rootDse = [DirectoryServices.DirectoryEntry]::new('LDAP://RootDSE')
+        $configurationNamingContext = [string] $rootDse.Properties['configurationNamingContext'][0]
+        $searchRoot = [DirectoryServices.DirectoryEntry]::new(
+            "LDAP://CN=Certificate Templates,CN=Public Key Services,CN=Services,$configurationNamingContext"
+        )
+        $searcher = [DirectoryServices.DirectorySearcher]::new($searchRoot)
+
+        $escapedIdentifier = $Identifier `
+            -replace '\\', '\5c' `
+            -replace '\*', '\2a' `
+            -replace '\(', '\28' `
+            -replace '\)', '\29' `
+            -replace "`0", '\00'
+        $searcher.Filter = "(&(objectClass=pKICertificateTemplate)(|(cn=$escapedIdentifier)(displayName=$escapedIdentifier)(msPKI-Cert-Template-OID=$escapedIdentifier)))"
+        $null = $searcher.PropertiesToLoad.Add('name')
+        $result = $searcher.FindOne()
+        if ($null -eq $result -or $result.Properties['name'].Count -eq 0) {
+            throw "Certificate template '$Identifier' was not found in Active Directory by CN, display name, or OID."
+        }
+
+        [string] $result.Properties['name'][0]
+    }
+    finally {
+        if ($null -ne $searcher) { $searcher.Dispose() }
+        if ($null -ne $searchRoot) { $searchRoot.Dispose() }
+        if ($null -ne $rootDse) { $rootDse.Dispose() }
+    }
+}
+
+function Get-CaRequestDiagnostic {
+    [OutputType([string])]
+    param (
+        [Parameter(Mandatory)]
+        [object] $CertificateRequest
+    )
+
+    $requestId = try { $CertificateRequest.GetRequestId() } catch { 'unavailable' }
+    $dispositionMessage = try { $CertificateRequest.GetDispositionMessage() } catch { 'unavailable' }
+    $lastStatus = try { $CertificateRequest.GetLastStatus() } catch { $null }
+    $statusText = if ($null -eq $lastStatus) {
+        'unavailable'
+    }
+    else {
+        '0x{0:X8}' -f ([uint32] ([int64] $lastStatus -band 0xFFFFFFFFL))
+    }
+
+    "Request ID: $requestId; CA message: $dispositionMessage; last status: $statusText"
+}
+
 function Get-OrderedCertificateChain {
     [OutputType([System.Security.Cryptography.X509Certificates.X509Certificate2[]])]
     param (
@@ -320,8 +381,11 @@ if ((Test-Path -LiteralPath $resolvedPfxPath) -and -not $Force) {
     throw "Output PFX '$resolvedPfxPath' already exists. Use -Force to replace it."
 }
 
+$resolvedCertificateTemplate = Resolve-CertificateTemplateName -Identifier $CertificateTemplate
+Write-Verbose "Resolved certificate template '$CertificateTemplate' to AD template name '$resolvedCertificateTemplate'."
+
 $tags = @{
-    CertificateTemplateName = $CertificateTemplate
+    CertificateTemplateName = $resolvedCertificateTemplate
     PfxProtectTo            = $PfxProtectTo -join ';'
     ChainTestUtility        = 'true'
 }
@@ -349,18 +413,19 @@ else {
 $certificateRequest = $null
 $pkcs7Response = $null
 try {
-    Write-Verbose "Submitting the CSR to '$CA' with template '$CertificateTemplate'."
+    Write-Verbose "Submitting the CSR to '$CA' with template '$resolvedCertificateTemplate'."
     $certificateRequest = New-Object -ComObject CertificateAuthority.Request
-    $disposition = $certificateRequest.Submit(0x1, $csr, "CertificateTemplate:$CertificateTemplate", $CA)
+    $disposition = $certificateRequest.Submit(0x1, $csr, "CertificateTemplate:$resolvedCertificateTemplate", $CA)
+    $caDiagnostic = Get-CaRequestDiagnostic -CertificateRequest $certificateRequest
 
     switch ($disposition) {
-        2 { throw "The CA '$CA' denied the certificate request." }
+        2 { throw "The CA '$CA' denied the certificate request. $caDiagnostic" }
         3 {
             # CR_OUT_BASE64HEADER | CR_OUT_CHAIN. The chain response is PKCS#7.
             $pkcs7Response = $certificateRequest.GetCertificate(0x100)
         }
-        5 { throw "The CA '$CA' left the request pending; this utility requires immediate issuance." }
-        default { throw "The CA '$CA' returned unexpected disposition $disposition." }
+        5 { throw "The CA '$CA' left the request pending; this utility requires immediate issuance. $caDiagnostic" }
+        default { throw "The CA '$CA' returned disposition $disposition instead of issuing the certificate. $caDiagnostic" }
     }
 }
 finally {
