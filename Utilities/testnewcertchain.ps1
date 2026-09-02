@@ -219,7 +219,7 @@ function ConvertFrom-Base64Pkcs7 {
         [Array]::Clear($bytes, 0, $bytes.Length)
     }
 
-    $collection
+    Write-Output -NoEnumerate $collection
 }
 
 function Get-OrderedCaResponseChain {
