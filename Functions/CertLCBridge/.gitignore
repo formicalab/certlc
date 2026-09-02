@@ -5,6 +5,10 @@ obj
 appsettings.json
 local.settings.json
 
+# PowerShell modules are restored with Save-Module before publishing
+Modules/*
+!Modules/.gitkeep
+
 # Azurite artifacts
 __blobstorage__
 __queuestorage__

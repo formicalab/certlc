@@ -161,7 +161,7 @@ resource automationAccountDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01'
 /*****************/
 
 // Storage Account
-resource storageAccount 'Microsoft.Storage/storageAccounts@2025-01-01' = {
+resource storageAccount 'Microsoft.Storage/storageAccounts@2026-04-01' = {
   name: storageAccountName
   location: location
   sku: {
@@ -220,7 +220,7 @@ var storagePeDefs = [
   { peName: 'pe-queue-${storageAccountName}', plsConnName: 'pls-${storageAccountName}', groupId: 'queue', nicName: 'nic-pe-queue-${storageAccountName}', dnsKey: 'queue' }
 ]
 
-resource storagePrivateEndpoints 'Microsoft.Network/privateEndpoints@2024-10-01' = [for d in storagePeDefs: {
+resource storagePrivateEndpoints 'Microsoft.Network/privateEndpoints@2025-07-01' = [for d in storagePeDefs: {
   name: d.peName
   location: location
   properties: {
@@ -239,7 +239,7 @@ resource storagePrivateEndpoints 'Microsoft.Network/privateEndpoints@2024-10-01'
   tags: commonTags
 }]
 
-resource storagePrivateEndpointDnsGroups 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2024-10-01' = [for (d, i) in storagePeDefs: {
+resource storagePrivateEndpointDnsGroups 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2025-07-01' = [for (d, i) in storagePeDefs: {
   parent: storagePrivateEndpoints[i]
   name: 'default'
   properties: {
@@ -295,7 +295,7 @@ var certlcDataColumns = [
 ]
 
 // Custom Table for Certificate Statistics
-resource customTable 'Microsoft.OperationalInsights/workspaces/tables@2025-02-01' = {
+resource customTable 'Microsoft.OperationalInsights/workspaces/tables@2025-07-01' = {
   name: 'certlc_CL'
   parent: logAnalyticsWorkspace
   properties: {
@@ -369,7 +369,7 @@ resource applicationInsights 'Microsoft.Insights/components@2020-02-02' = {
 }
 
 // Flexible Consumption Plan for the function app
-resource flexServicePlan 'Microsoft.Web/serverfarms@2024-11-01' = {
+resource flexServicePlan 'Microsoft.Web/serverfarms@2025-03-01' = {
   name: 'asp-${functionAppName}'
   location: location
   kind: 'functionapp'
@@ -384,7 +384,7 @@ resource flexServicePlan 'Microsoft.Web/serverfarms@2024-11-01' = {
 }
 
 // Function App
-resource functionApp 'Microsoft.Web/sites@2024-11-01' = {
+resource functionApp 'Microsoft.Web/sites@2025-03-01' = {
   name: functionAppName
   location: location
   kind: 'functionapp,linux'
@@ -478,9 +478,9 @@ resource automationAccount 'Microsoft.Automation/automationAccounts@2024-10-23' 
     tags: commonTags
   }
 
-  // Runbook: certlc
+  // Primary certificate lifecycle runbook
   resource runbookCertLC 'runbooks@2024-10-23' = {
-    name: 'certlc'
+    name: runbookName
     location: location
     properties: {
       runbookType: 'PowerShell'
@@ -609,7 +609,7 @@ resource automationAccountDiagnostics 'Microsoft.Insights/diagnosticSettings@202
 }
 
 // KeyVault
-resource keyVault 'Microsoft.KeyVault/vaults@2025-05-01' = {
+resource keyVault 'Microsoft.KeyVault/vaults@2026-02-01' = {
   name: keyVaultName
   location: location
   properties: {
@@ -648,7 +648,7 @@ var appPeDnsZoneIds = {
   kv: keyVaultDnsZone.id
 }
 
-resource appPrivateEndpoints 'Microsoft.Network/privateEndpoints@2024-10-01' = [for d in appPeDefs: {
+resource appPrivateEndpoints 'Microsoft.Network/privateEndpoints@2025-07-01' = [for d in appPeDefs: {
   name: d.peName
   location: location
   properties: {
@@ -667,7 +667,7 @@ resource appPrivateEndpoints 'Microsoft.Network/privateEndpoints@2024-10-01' = [
   tags: commonTags
 }]
 
-resource appPrivateEndpointDnsGroups 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2024-10-01' = [for (d, i) in appPeDefs: {
+resource appPrivateEndpointDnsGroups 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2025-07-01' = [for (d, i) in appPeDefs: {
   parent: appPrivateEndpoints[i]
   name: 'default'
   properties: {
