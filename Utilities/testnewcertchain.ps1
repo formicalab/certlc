@@ -180,17 +180,17 @@ function Get-OrderedCertificateChain {
         [switch] $ExcludeRoot
     )
 
-    $leafCandidates = if ($Source -eq 'KeyVaultSecret') {
-        @($Certificates | Where-Object HasPrivateKey)
+    $leafCandidates = @(if ($Source -eq 'KeyVaultSecret') {
+        $Certificates | Where-Object HasPrivateKey
     }
     else {
-        @($Certificates | Where-Object {
+        $Certificates | Where-Object {
             $basicConstraints = $_.Extensions |
                 Where-Object { $_ -is [Security.Cryptography.X509Certificates.X509BasicConstraintsExtension] } |
                 Select-Object -First 1
             $null -eq $basicConstraints -or -not $basicConstraints.CertificateAuthority
-        })
-    }
+        }
+    })
     if ($leafCandidates.Count -ne 1) {
         throw "Expected exactly one leaf certificate in $Source; found $($leafCandidates.Count)."
     }
