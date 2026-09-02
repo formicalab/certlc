@@ -222,6 +222,91 @@ function ConvertFrom-Base64Pkcs7 {
     $collection
 }
 
+function Get-OrderedCaResponseChain {
+    [OutputType([System.Security.Cryptography.X509Certificates.X509Certificate2[]])]
+    param (
+        [Parameter(Mandatory)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2Collection] $Certificates
+    )
+
+    $leafCandidates = @($Certificates | Where-Object {
+        $basicConstraints = $_.Extensions |
+            Where-Object { $_ -is [Security.Cryptography.X509Certificates.X509BasicConstraintsExtension] } |
+            Select-Object -First 1
+        $null -eq $basicConstraints -or -not $basicConstraints.CertificateAuthority
+    })
+    if ($leafCandidates.Count -ne 1) {
+        throw "Expected exactly one end-entity certificate in the AD CS PKCS#7 response; found $($leafCandidates.Count)."
+    }
+
+    $remaining = [Collections.Generic.List[Security.Cryptography.X509Certificates.X509Certificate2]]::new()
+    foreach ($certificate in $Certificates) {
+        if ($certificate.Thumbprint -cne $leafCandidates[0].Thumbprint) {
+            $remaining.Add($certificate)
+        }
+    }
+
+    $ordered = [Collections.Generic.List[Security.Cryptography.X509Certificates.X509Certificate2]]::new()
+    $current = $leafCandidates[0]
+    while ($null -ne $current) {
+        $ordered.Add($current)
+        if (Test-DistinguishedNameEqual -Left $current.SubjectName -Right $current.IssuerName) {
+            break
+        }
+
+        $issuers = @($remaining | Where-Object {
+            Test-DistinguishedNameEqual -Left $_.SubjectName -Right $current.IssuerName
+        })
+        if ($issuers.Count -ne 1) {
+            throw "Expected one issuer for '$($current.Subject)' in the AD CS PKCS#7 response; found $($issuers.Count)."
+        }
+
+        $current = $issuers[0]
+        $null = $remaining.Remove($current)
+    }
+
+    if ($remaining.Count -gt 0) {
+        throw "The AD CS PKCS#7 response contains $($remaining.Count) certificate(s) outside the leaf's issuer chain."
+    }
+    if (-not (Test-DistinguishedNameEqual -Left $ordered[$ordered.Count - 1].SubjectName -Right $ordered[$ordered.Count - 1].IssuerName)) {
+        throw 'The AD CS PKCS#7 response does not terminate in a self-issued root certificate.'
+    }
+
+    $ordered.ToArray()
+}
+
+function Merge-KeyVaultCertificateChain {
+    param (
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $VaultName,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string] $CertificateName,
+
+        [Parameter(Mandatory)]
+        [Security.Cryptography.X509Certificates.X509Certificate2[]] $Certificates
+    )
+
+    $x5c = @($Certificates | ForEach-Object {
+        [Convert]::ToBase64String($_.Export([Security.Cryptography.X509Certificates.X509ContentType]::Cert))
+    })
+    $body = @{ x5c = $x5c } | ConvertTo-Json -Depth 3 -Compress
+    $escapedCertificateName = [Uri]::EscapeDataString($CertificateName)
+    $uri = "https://$VaultName.vault.azure.net/certificates/$escapedCertificateName/pending/merge?api-version=2025-07-01"
+    $token = (Get-AzAccessToken -ResourceTypeName KeyVault -AsSecureString).Token
+
+    Write-Verbose "Submitting $($x5c.Count) explicitly encoded certificates to the Key Vault pending merge API."
+    Invoke-RestMethod `
+        -Uri $uri `
+        -Method Post `
+        -Authentication Bearer `
+        -Token $token `
+        -ContentType 'application/json' `
+        -Body $body
+}
+
 function Get-OrderedCertificateChain {
     [OutputType([System.Security.Cryptography.X509Certificates.X509Certificate2[]])]
     param (
@@ -479,59 +564,56 @@ finally {
     }
 }
 
-$caCertificates = ConvertFrom-Base64Pkcs7 -Content $pkcs7Response
-if ($caCertificates.Count -lt 2) {
-    throw "AD CS returned PKCS#7 containing only $($caCertificates.Count) certificate(s); CR_OUT_CHAIN did not provide an issuer chain."
+$caResponseCertificates = ConvertFrom-Base64Pkcs7 -Content $pkcs7Response
+if ($caResponseCertificates.Count -lt 2) {
+    throw "AD CS returned PKCS#7 containing only $($caResponseCertificates.Count) certificate(s); CR_OUT_CHAIN did not provide an issuer chain."
 }
-Write-Verbose "AD CS PKCS#7 physically contains $($caCertificates.Count) certificates."
-foreach ($certificate in $caCertificates) {
+$caChain = Get-OrderedCaResponseChain -Certificates $caResponseCertificates
+Write-Verbose "AD CS PKCS#7 physically contains $($caChain.Count) certificates in a complete leaf-to-root chain."
+foreach ($certificate in $caChain) {
     Write-Verbose "CA response member: $($certificate.Subject) (issuer: $($certificate.Issuer))"
 }
 
-$temporaryPkcs7Path = Join-Path ([IO.Path]::GetTempPath()) "$([guid]::NewGuid().ToString('N')).p7b"
-try {
-    Set-Content -LiteralPath $temporaryPkcs7Path -Value $pkcs7Response -Encoding ascii
-    Write-Verbose "Merging the PKCS#7 certificate chain into Key Vault certificate '$CertName'."
-    $mergedCertificate = Import-AzKeyVaultCertificate -VaultName $VaultName -Name $CertName -FilePath $temporaryPkcs7Path
-    if ($null -eq $mergedCertificate) {
-        throw 'Import-AzKeyVaultCertificate returned no certificate after the PKCS#7 merge.'
-    }
-}
-finally {
-    Remove-Item -LiteralPath $temporaryPkcs7Path -Force -ErrorAction SilentlyContinue
-}
-
-Write-Verbose "Retrieving the merged PKCS#12 secret for '$CertName'."
-$secretBase64 = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertName -AsPlainText
-if ([string]::IsNullOrWhiteSpace($secretBase64)) {
-    throw "Key Vault returned an empty certificate secret for '$CertName'."
-}
-
-$certificateBytes = [Convert]::FromBase64String($secretBase64)
-$secretBase64 = $null
-$keyVaultCertificates = [Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
-$combinedCertificates = [Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
+$certificateBytes = $null
+$keyVaultCertificates = $null
 $exportedSubjects = @()
 try {
+    Write-Verbose "Merging the explicit certificate chain into pending Key Vault certificate '$CertName'."
+    $mergedCertificate = Merge-KeyVaultCertificateChain `
+        -VaultName $VaultName `
+        -CertificateName $CertName `
+        -Certificates $caChain
+    if ($null -eq $mergedCertificate -or [string]::IsNullOrWhiteSpace($mergedCertificate.id)) {
+        throw 'The Key Vault pending merge API returned no certificate bundle.'
+    }
+
+    Write-Verbose "Retrieving the merged PKCS#12 secret for '$CertName'."
+    $secretBase64 = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertName -AsPlainText
+    if ([string]::IsNullOrWhiteSpace($secretBase64)) {
+        throw "Key Vault returned an empty certificate secret for '$CertName'."
+    }
+
+    $certificateBytes = [Convert]::FromBase64String($secretBase64)
+    $secretBase64 = $null
+    $keyVaultCertificates = [Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
+
     $keyVaultCertificates.Import(
         $certificateBytes,
         [string]::Empty,
         [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
     )
 
-    foreach ($certificate in $keyVaultCertificates) {
-        $null = $combinedCertificates.Add($certificate)
+    $submittedThumbprints = @($caChain.Thumbprint | Sort-Object -Unique)
+    $keyVaultThumbprints = @($keyVaultCertificates.Thumbprint | Sort-Object -Unique)
+    $missingFromKeyVault = @($submittedThumbprints | Where-Object { $_ -notin $keyVaultThumbprints })
+    if ($keyVaultThumbprints.Count -ne $submittedThumbprints.Count -or $missingFromKeyVault.Count -gt 0) {
+        throw "Key Vault chain persistence validation failed: submitted $($submittedThumbprints.Count) certificates but its downloaded PKCS#12 secret contains $($keyVaultThumbprints.Count). Missing thumbprints: $($missingFromKeyVault -join ', ')."
     }
-    foreach ($certificate in $caCertificates) {
-        if ($certificate.Thumbprint -notin $combinedCertificates.Thumbprint) {
-            $null = $combinedCertificates.Add($certificate)
-        }
-    }
+    Write-Verbose "Verified the Key Vault PKCS#12 secret physically contains all $($keyVaultThumbprints.Count) submitted chain certificates."
 
-    $exportChain = Get-OrderedCertificateChain -Certificates $combinedCertificates
+    $exportChain = Get-OrderedCertificateChain -Certificates $keyVaultCertificates
     $exportedSubjects = @($exportChain | ForEach-Object { $_.Subject })
-    Write-Verbose "The Key Vault secret contains $($keyVaultCertificates.Count) certificate(s)."
-    Write-Verbose "Exporting $($exportChain.Count) certificates from the combined Key Vault leaf and CA chain after excluding the root."
+    Write-Verbose "Exporting $($exportChain.Count) certificates solely from the Key Vault PKCS#12 secret after excluding the root."
     foreach ($certificate in $exportChain) {
         Write-Verbose "PFX member: $($certificate.Subject) (issuer: $($certificate.Issuer), private key: $($certificate.HasPrivateKey))"
     }
@@ -561,11 +643,15 @@ try {
     }
 }
 finally {
-    [Array]::Clear($certificateBytes, 0, $certificateBytes.Length)
-    foreach ($certificate in $keyVaultCertificates) {
-        $certificate.Dispose()
+    if ($null -ne $certificateBytes) {
+        [Array]::Clear($certificateBytes, 0, $certificateBytes.Length)
     }
-    foreach ($certificate in $caCertificates) {
+    if ($null -ne $keyVaultCertificates) {
+        foreach ($certificate in $keyVaultCertificates) {
+            $certificate.Dispose()
+        }
+    }
+    foreach ($certificate in $caResponseCertificates) {
         $certificate.Dispose()
     }
 }
