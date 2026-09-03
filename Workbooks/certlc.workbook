@@ -25,7 +25,7 @@
             },
             "queryType": 1,
             "resourceType": "microsoft.resourcegraph/resources",
-            "value": "/subscriptions/4a570962-701a-475e-bf5b-8dc76ec748ff/resourceGroups/rg-sentinel-itn-001/providers/Microsoft.OperationalInsights/workspaces/log-sentinel-itn-001"
+            "value": "/subscriptions/9068a229-f092-400e-8093-87e8e7d26ae1/resourceGroups/rg-certlc-itn-001/providers/Microsoft.OperationalInsights/workspaces/log-certlc-itn-001"
           },
           {
             "id": "c4ac2502-0074-4ee6-ac9c-58d49516cfff",
@@ -47,7 +47,7 @@
             },
             "queryType": 1,
             "resourceType": "microsoft.resourcegraph/resources",
-            "value": "/subscriptions/4a570962-701a-475e-bf5b-8dc76ec748ff/resourceGroups/rg-shared-neu-001/providers/Microsoft.Automation/automationAccounts/aa-shared-neu-001"
+            "value": "/subscriptions/9068a229-f092-400e-8093-87e8e7d26ae1/resourceGroups/rg-certlc-itn-001/providers/Microsoft.Automation/automationAccounts/aa-certlc-itn-001"
           },
           {
             "id": "e75fbcd5-8b96-4b46-a2b1-87d92b2036ec",
@@ -65,7 +65,7 @@
             },
             "queryType": 1,
             "resourceType": "microsoft.resourcegraph/resources",
-            "value": "/subscriptions/4a570962-701a-475e-bf5b-8dc76ec748ff/resourceGroups/rg-shared-neu-001/providers/Microsoft.Automation/automationAccounts/aa-shared-neu-001/runbooks/certlc",
+            "value": "/subscriptions/9068a229-f092-400e-8093-87e8e7d26ae1/resourceGroups/rg-certlc-itn-001/providers/Microsoft.Automation/automationAccounts/aa-certlc-itn-001/runbooks/certlc",
             "label": "Main Runbook"
           },
           {
@@ -84,7 +84,25 @@
             },
             "queryType": 1,
             "resourceType": "microsoft.resourcegraph/resources",
-            "value": "/subscriptions/4a570962-701a-475e-bf5b-8dc76ec748ff/resourceGroups/rg-shared-neu-001/providers/Microsoft.Automation/automationAccounts/aa-shared-neu-001/runbooks/certlcstats"
+            "value": "/subscriptions/9068a229-f092-400e-8093-87e8e7d26ae1/resourceGroups/rg-certlc-itn-001/providers/Microsoft.Automation/automationAccounts/aa-certlc-itn-001/runbooks/certlcstats"
+          },
+          {
+            "id": "b360539c-8d3a-48bc-90cf-5c67acf768f6",
+            "version": "KqlParameterItem/1.0",
+            "name": "FunctionApp",
+            "label": "Function App",
+            "type": 5,
+            "isRequired": true,
+            "query": "where type =~ 'microsoft.web/sites'\r\n| where kind contains 'functionapp'\r\n| project id, name\r\n| order by name desc",
+            "crossComponentResources": [
+              "value::all"
+            ],
+            "typeSettings": {
+              "additionalResourceOptions": []
+            },
+            "queryType": 1,
+            "resourceType": "microsoft.resourcegraph/resources",
+            "value": "/subscriptions/9068a229-f092-400e-8093-87e8e7d26ae1/resourceGroups/rg-certlc-itn-001/providers/Microsoft.Web/sites/flazfn-certlc-itn-001"
           },
           {
             "id": "a46ac1ec-5965-4af4-8750-49ace0d90f8d",
@@ -177,6 +195,15 @@
             "subTarget": "2",
             "preText": "Tab 2",
             "style": "link"
+          },
+          {
+            "id": "efc77831-cde8-47e2-b931-a0fa10a295df",
+            "cellValue": "selectedTab",
+            "linkTarget": "parameter",
+            "linkLabel": "Function bridge",
+            "subTarget": "3",
+            "preText": "Tab 3",
+            "style": "link"
           }
         ]
       },
@@ -218,9 +245,8 @@
                   ],
                   "isHiddenWhenLocked": true,
                   "timeContext": {
-                    "durationMs": 0
+                    "durationMs": 2592000000
                   },
-                  "timeContextFromParameter": "TimeRange",
                   "queryType": 0,
                   "resourceType": "microsoft.operationalinsights/workspaces"
                 }
@@ -235,11 +261,13 @@
             "type": 3,
             "content": {
               "version": "KqlItem/1.0",
-              "query": "// Purpose: Show certificate status summary for ONLY certificates that currently exist in the Key Vault\r\n// Problem: The runbook writes hourly snapshots, but deleted certificates remain in Log Analytics\r\n// Solution: Filter out certificates that weren't reported in the most recent successful runbook execution\r\n//\r\n// Logic:\r\n// 1. Get the completion time of the last SUCCESSFUL certlcstats runbook execution from job logs\r\n//    - This is safer than using certificate timestamps because:\r\n//      * It relies on actual job execution records, not certificate data\r\n//      * It handles cases where no certificates exist or all are deleted\r\n//      * It ensures we only consider data from completed (not failed) runs\r\n// 2. For each certificate Name, get its most recent entry (arg_max)\r\n// 3. Filter to only certificates updated within 5 minutes before the last successful job completion\r\n//    - If a certificate exists in Key Vault, it was written during the last successful cycle\r\n//    - If a certificate was deleted from Key Vault, it won't have been updated recently\r\n//    - 5 minutes allows for the runbook execution time to process all certificates\r\n// 4. Calculate status based on expiration time\r\n// 5. Summarize counts and percentages by status\r\n\r\nlet LastSuccessfulRunbookExecution = toscalar(\r\n    AzureDiagnostics\r\n    | where Category == \"JobLogs\"\r\n    | where Resource =~ \"{AutomationAccount:name}\"\r\n    | where RunbookName_s =~ \"certlcstats\"  // The stats collection runbook\r\n    | where ResultType =~ \"Completed\"       // Only successful completions\r\n    | summarize arg_max(TimeGenerated, *)   // Get the most recent completed job\r\n    | project TimeGenerated\r\n);\r\n\r\nlet latestCerts = certlc_CL\r\n| summarize arg_max(LastUpdate = TimeGenerated, Name, Subject, Template, Created, Expires) by Name\r\n| where LastUpdate >= (LastSuccessfulRunbookExecution - 5m)  // Only show certs from the last successful cycle\r\n| extend RawTimeToExpire = Expires - now()  // timespan\r\n| extend Status = case(\r\n    RawTimeToExpire < 0d, \"❌ Expired\",\r\n    RawTimeToExpire < 30d, \"⚠️ Expiring Soon\",\r\n    \"✅ OK\");\r\n\r\nlet totalCount = toscalar(latestCerts | summarize count());\r\n\r\nlatestCerts\r\n| summarize Count = count() by Status\r\n| extend Total = totalCount\r\n| extend Percentage = round(100.0 * Count / Total, 2)\r\n| project Status, Count, Percentage\r\n| order by Status asc\r\n",
+              "query": "// Purpose: Show certificate status summary for ONLY certificates that currently exist in the Key Vault\r\n// Problem: The runbook writes hourly snapshots, but deleted certificates remain in Log Analytics\r\n// Solution: Select the snapshot emitted by the most recent successful runbook execution\r\n//\r\n// Logic:\r\n// 1. Get the JobId of the latest successful certlcstats execution\r\n// 2. Extract its Snapshot ID marker from the matching output stream\r\n// 3. Select only rows carrying that SnapshotId (an empty scan returns no rows)\r\n// 4. Calculate and summarize certificate status\r\n\r\nlet LatestSuccessfulJobId = toscalar(\r\n    AzureDiagnostics\r\n    | where Category == \"JobLogs\"\r\n    | where Resource =~ \"{AutomationAccount:name}\"\r\n    | where RunbookName_s =~ tostring(split(\"{StatsRunbook}\", \"/\")[-1])\r\n    | where ResultType =~ \"Completed\"\r\n    | summarize arg_max(TimeGenerated, JobId_g)\r\n    | project JobId = tostring(JobId_g)\r\n);\r\n\r\nlet LatestSnapshotId = toscalar(\r\n    AzureDiagnostics\r\n    | where Category == \"JobStreams\"\r\n    | where Resource =~ \"{AutomationAccount:name}\"\r\n    | where RunbookName_s =~ tostring(split(\"{StatsRunbook}\", \"/\")[-1])\r\n    | where tostring(JobId_g) == LatestSuccessfulJobId\r\n    | where StreamType_s =~ \"Output\"\r\n    | extend SnapshotId = extract(@\"Snapshot ID:\\s*([0-9A-Fa-f-]{36})\", 1, ResultDescription)\r\n    | where isnotempty(SnapshotId)\r\n    | summarize arg_max(TimeGenerated, SnapshotId)\r\n    | project SnapshotId\r\n);\r\n\r\nlet latestCerts = certlcstats_CL\r\n| where SnapshotId == LatestSnapshotId\r\n| extend LastUpdate = TimeGenerated\r\n| extend RawTimeToExpire = Expires - now()  // timespan\r\n| extend Status = case(\r\n    RawTimeToExpire < 0d, \"❌ Expired\",\r\n    RawTimeToExpire < 30d, \"⚠️ Expiring Soon\",\r\n    \"✅ OK\");\r\n\r\nlet totalCount = toscalar(latestCerts | summarize count());\r\n\r\nlatestCerts\r\n| summarize Count = count() by Status\r\n| extend Total = totalCount\r\n| extend Percentage = round(100.0 * Count / Total, 2)\r\n| project Status, Count, Percentage\r\n| order by Status asc\r\n",
               "size": 3,
               "title": "Status of certificates in the key vault - Last refreshed (UTC): {LastUpdateFormatted}",
               "noDataMessageStyle": 4,
-              "timeContextFromParameter": "TimeRange",
+              "timeContext": {
+                "durationMs": 2592000000
+              },
               "showRefreshButton": true,
               "queryType": 0,
               "resourceType": "microsoft.operationalinsights/workspaces",
@@ -304,7 +332,7 @@
               }
             },
             "customWidth": "50",
-            "name": "query - 4",
+            "name": "Certificate status summary",
             "styleSettings": {
               "maxWidth": "50%"
             }
@@ -347,17 +375,19 @@
               }
             },
             "customWidth": "50",
-            "name": "query - 4"
+            "name": "Job status summary"
           },
           {
             "type": 3,
             "content": {
               "version": "KqlItem/1.0",
-              "query": "// Purpose: Show detailed certificate information for ONLY certificates that currently exist in the Key Vault\r\n// Problem: The runbook writes hourly snapshots, but deleted certificates remain in Log Analytics\r\n// Solution: Filter out certificates that weren't reported in the most recent successful runbook execution\r\n//\r\n// Logic:\r\n// 1. Get the completion time of the last SUCCESSFUL certlcstats runbook execution from job logs\r\n//    - This is safer than using certificate timestamps because:\r\n//      * It relies on actual job execution records, not certificate data\r\n//      * It handles cases where no certificates exist or all are deleted\r\n//      * It ensures we only consider data from completed (not failed) runs\r\n// 2. For each certificate Name, get its most recent entry (arg_max)\r\n// 3. Filter to only certificates updated within 5 minutes before the last successful job completion\r\n//    - If a certificate exists in Key Vault, it was written during the last successful cycle\r\n//    - If a certificate was deleted from Key Vault, it won't have been updated recently\r\n//    - 5 minutes allows for the runbook execution time to process all certificates\r\n// 4. Calculate status based on expiration time and format time-to-expire\r\n// 5. Display certificate details sorted by expiration urgency\r\n\r\nlet LastSuccessfulRunbookExecution = toscalar(\r\n    AzureDiagnostics\r\n    | where Category == \"JobLogs\"\r\n    | where Resource =~ \"{AutomationAccount:name}\"\r\n    | where RunbookName_s =~ \"certlcstats\"  // The stats collection runbook\r\n    | where ResultType =~ \"Completed\"       // Only successful completions\r\n    | summarize arg_max(TimeGenerated, *)   // Get the most recent completed job\r\n    | project TimeGenerated\r\n);\r\n\r\ncertlc_CL\r\n| summarize arg_max(LastUpdate = TimeGenerated, Name, Subject, Template, Created, Expires) by Name\r\n| where LastUpdate >= (LastSuccessfulRunbookExecution - 5m)  // Only show certs from the last successful cycle\r\n| extend RawTimeToExpire = Expires - now()  // timespan\r\n| extend TimeToExpire = format_timespan(RawTimeToExpire, 'd.hh:mm:ss')  // e.g., \"3.12:45:00\"\r\n| extend Status = case(\r\n    RawTimeToExpire < 0d, \"❌ Expired\",\r\n    RawTimeToExpire < 30d, \"⚠️ Expiring Soon\",\r\n    \"✅ OK\"\r\n)\r\n| order by RawTimeToExpire asc  // Most urgent (expired/expiring soon) first\r\n| project Status, LastUpdate, Name, Subject, Template, Created, Expires, TimeToExpire",
+              "query": "// Purpose: Show detailed certificate information for ONLY certificates that currently exist in the Key Vault\r\n// Problem: The runbook writes hourly snapshots, but deleted certificates remain in Log Analytics\r\n// Solution: Select the snapshot emitted by the most recent successful runbook execution\r\n//\r\n// Logic:\r\n// 1. Get the JobId of the latest successful certlcstats execution\r\n// 2. Extract its Snapshot ID marker from the matching output stream\r\n// 3. Select only rows carrying that SnapshotId (an empty scan returns no rows)\r\n// 4. Calculate status and display certificate details\r\n\r\nlet LatestSuccessfulJobId = toscalar(\r\n    AzureDiagnostics\r\n    | where Category == \"JobLogs\"\r\n    | where Resource =~ \"{AutomationAccount:name}\"\r\n    | where RunbookName_s =~ tostring(split(\"{StatsRunbook}\", \"/\")[-1])\r\n    | where ResultType =~ \"Completed\"\r\n    | summarize arg_max(TimeGenerated, JobId_g)\r\n    | project JobId = tostring(JobId_g)\r\n);\r\n\r\nlet LatestSnapshotId = toscalar(\r\n    AzureDiagnostics\r\n    | where Category == \"JobStreams\"\r\n    | where Resource =~ \"{AutomationAccount:name}\"\r\n    | where RunbookName_s =~ tostring(split(\"{StatsRunbook}\", \"/\")[-1])\r\n    | where tostring(JobId_g) == LatestSuccessfulJobId\r\n    | where StreamType_s =~ \"Output\"\r\n    | extend SnapshotId = extract(@\"Snapshot ID:\\s*([0-9A-Fa-f-]{36})\", 1, ResultDescription)\r\n    | where isnotempty(SnapshotId)\r\n    | summarize arg_max(TimeGenerated, SnapshotId)\r\n    | project SnapshotId\r\n);\r\n\r\ncertlcstats_CL\r\n| where SnapshotId == LatestSnapshotId\r\n| extend LastUpdate = TimeGenerated\r\n| extend RawTimeToExpire = Expires - now()  // timespan\r\n| extend TimeToExpire = format_timespan(RawTimeToExpire, 'd.hh:mm:ss')  // e.g., \"3.12:45:00\"\r\n| extend Status = case(\r\n    RawTimeToExpire < 0d, \"❌ Expired\",\r\n    RawTimeToExpire < 30d, \"⚠️ Expiring Soon\",\r\n    \"✅ OK\"\r\n)\r\n| order by RawTimeToExpire asc  // Most urgent (expired/expiring soon) first\r\n| project Status, LastUpdate, Name, Subject, Template, Created, Expires, TimeToExpire",
               "size": 3,
               "title": "Details - last refreshed (UTC): {LastUpdateFormatted}",
               "noDataMessageStyle": 4,
-              "timeContextFromParameter": "TimeRange",
+              "timeContext": {
+                "durationMs": 2592000000
+              },
               "showRefreshButton": true,
               "showExportToExcel": true,
               "queryType": 0,
@@ -419,7 +449,7 @@
                 }
               }
             },
-            "name": "query - 1"
+            "name": "Certificate details"
           }
         ]
       },
@@ -451,7 +481,7 @@
             "type": 3,
             "content": {
               "version": "KqlItem/1.0",
-              "query": "// -------------------------------\n// Step 1: Get all output events for the job (children)\n// -------------------------------\nlet JobStreamOutputs = AzureDiagnostics\n| where Category == \"JobStreams\"\n| where Resource =~ \"{AutomationAccount:name}\"\n| where RunbookName_s =~ tostring(split(\"{Runbook:name}\", \"/\")[-1])\n| where StreamType_s == \"Output\"\n| extend JobIdStr = tostring(JobId_g)\n| extend ParsedMessage = parse_json(ResultDescription)\n| extend ChildMessage = tostring(ParsedMessage.message),\n         ChildSection = tostring(ParsedMessage.section)\n| project \n    JobIdStr,\n    Time = TimeGenerated,\n    ChildMessage,\n    ChildSection,\n    Id = strcat(JobIdStr, \"-\", format_datetime(TimeGenerated, 'yyyyMMddHHmmssfff')),\n    ParentId = JobIdStr,\n    Name = strcat(\"📝 Output at \", format_datetime(TimeGenerated, 'HH:mm:ss')),\n    Kind = \"Output\",\n    FinalResult = \"📝\";\n\n// -------------------------------\n// Step 1b: Compute last output per job (for parent)\n// -------------------------------\nlet LastOutputPerJob = JobStreamOutputs\n| summarize arg_max(Time, ChildMessage, ChildSection) by JobIdStr\n| project \n    JobIdStr,\n    LastTime = Time,\n    LastChildMessage = ChildMessage,\n    LastChildSection = ChildSection;\n\n// -------------------------------\n// Step 2: Summarize final job status per JobId (parents)\n// -------------------------------\nlet JobLogSummary = AzureDiagnostics\n| where Category == \"JobLogs\"\n| where Resource =~ \"{AutomationAccount:name}\"\n| where RunbookName_s =~ tostring(split(\"{Runbook:name}\", \"/\")[-1])\n| summarize arg_max(TimeGenerated, ResultType) by JobId_g\n| extend JobIdStr = tostring(JobId_g)\n| join kind=leftouter LastOutputPerJob on JobIdStr\n| project \n    Id = JobIdStr,\n    ParentId = \"\",\n    Name = strcat(\"📦 Job \", JobIdStr),\n    Kind = \"Job\",\n    FinalResult = case(\n        tolower(ResultType) == \"completed\", \"success\",\n        tolower(ResultType) == \"failed\", \"failed\",\n        ResultType\n    ),\n    Time = LastTime,                 // last child output time\n    Message = LastChildMessage,      // bubble up last message\n    Section = LastChildSection;      // bubble up last section\n\n// -------------------------------\n// Step 3: Union parents + children and sort\n// -------------------------------\nunion \n(\n    JobLogSummary\n    | project Id, ParentId, Name, Kind, FinalResult, Time, Section, Message\n),\n(\n    JobStreamOutputs\n    | project Id, ParentId, Name, Kind, FinalResult, Time, Section = ChildSection, Message = ChildMessage\n)\n| order by Time desc, ParentId asc, Time asc\n",
+              "query": "let JobStreamEvents = AzureDiagnostics\n| where Category == \"JobStreams\"\n| where Resource =~ \"{AutomationAccount:name}\"\n| where RunbookName_s =~ tostring(split(\"{Runbook:name}\", \"/\")[-1])\n| where StreamType_s in (\"Output\", \"Error\", \"Warning\")\n| extend JobIdStr = tostring(JobId_g), RawMessage = replace_regex(tostring(ResultDescription), @\"\\x1B\\[[0-9;]*[A-Za-z]\", \"\")\n| extend ParsedMessage = parse_json(extract(@\"(\\{.*\\})\", 1, RawMessage))\n| extend StructuredMessage = tostring(ParsedMessage.message),\n         StructuredSection = tostring(ParsedMessage.section),\n         StructuredLevel = tostring(ParsedMessage.level)\n| extend ChildMessage = iff(isnotempty(StructuredMessage), StructuredMessage, RawMessage),\n         ChildSection = iff(isnotempty(StructuredSection), StructuredSection, StreamType_s),\n         EffectiveLevel = tolower(iff(isnotempty(StructuredLevel), StructuredLevel, StreamType_s))\n| project\n    JobIdStr,\n    Time = TimeGenerated,\n    ChildMessage,\n    ChildSection,\n    Id = strcat(JobIdStr, \"-\", format_datetime(TimeGenerated, 'yyyyMMddHHmmssfff')),\n    ParentId = JobIdStr,\n    Name = strcat(case(\n        EffectiveLevel == \"error\", \"Error at \",\n        EffectiveLevel == \"warning\", \"Warning at \",\n        \"Output at \"), format_datetime(TimeGenerated, 'HH:mm:ss')),\n    Kind = StreamType_s,\n    FinalResult = case(\n        EffectiveLevel == \"error\", \"failed\",\n        EffectiveLevel == \"warning\", \"warning\",\n        \"info\");\n\nlet LastEventPerJob = JobStreamEvents\n| summarize arg_max(Time, ChildMessage, ChildSection) by JobIdStr\n| project JobIdStr, LastMessage = ChildMessage, LastSection = ChildSection;\n\nlet JobLogSummary = AzureDiagnostics\n| where Category == \"JobLogs\"\n| where Resource =~ \"{AutomationAccount:name}\"\n| where RunbookName_s =~ tostring(split(\"{Runbook:name}\", \"/\")[-1])\n| summarize arg_max(TimeGenerated, ResultType) by JobId_g\n| extend JobIdStr = tostring(JobId_g), CompletionTime = TimeGenerated\n| join kind=leftouter LastEventPerJob on JobIdStr\n| project\n    Id = JobIdStr,\n    ParentId = \"\",\n    Name = strcat(\"Job \", JobIdStr),\n    Kind = \"Job\",\n    FinalResult = case(\n        tolower(ResultType) == \"completed\", \"success\",\n        tolower(ResultType) == \"failed\", \"failed\",\n        ResultType),\n    Time = CompletionTime,\n    Message = LastMessage,\n    Section = LastSection;\n\nunion\n(\n    JobLogSummary\n    | project Id, ParentId, Name, Kind, FinalResult, Time, Section, Message\n),\n(\n    JobStreamEvents\n    | project Id, ParentId, Name, Kind, FinalResult, Time, Section = ChildSection, Message = ChildMessage\n)\n| order by Time desc, ParentId asc",
               "size": 3,
               "showAnalytics": true,
               "title": "Job History",
@@ -492,30 +522,14 @@
                     }
                   },
                   {
-                    "columnMatch": "Message_datetime",
+                    "columnMatch": "Section",
                     "formatter": 5
                   },
                   {
-                    "columnMatch": "Section_datetime",
-                    "formatter": 5
-                  },
-                  {
-                    "columnMatch": "OutputTime",
-                    "formatter": 6,
-                    "dateFormat": {
-                      "showUtcTime": null,
-                      "formatName": "shortDateTimeNoMsPattern"
-                    }
-                  },
-                  {
-                    "columnMatch": "FinalTime",
-                    "formatter": 6,
+                    "columnMatch": "Message",
+                    "formatter": 1,
                     "formatOptions": {
-                      "aggregation": "Max"
-                    },
-                    "dateFormat": {
-                      "showUtcTime": null,
-                      "formatName": "shortDateTimeNoMsPattern"
+                      "customColumnWidthSetting": "50%"
                     }
                   }
                 ],
@@ -539,6 +553,213 @@
         "value": "2"
       },
       "name": "grpLogs"
+    },
+    {
+      "type": 12,
+      "content": {
+        "version": "NotebookGroup/1.0",
+        "groupType": "editable",
+        "items": [
+          {
+            "type": 3,
+            "content": {
+              "version": "KqlItem/1.0",
+              "query": "let TraceSummary = AppTraces\n| where AppRoleName =~ \"{FunctionApp:name}\"\n| where Message has_any (\"CERTLC:\", \"Runbook started with job id:\", \"Runbook job id:\")\n| summarize\n    Started = minif(TimeGenerated, Message has \"CERTLC: full message received\"),\n    Completed = countif(Message has \"status: Completed\") > 0,\n    LastTrace = max(TimeGenerated)\n  by OperationId\n| where isnotnull(Started);\nlet ExceptionSummary = AppExceptions\n| where AppRoleName =~ \"{FunctionApp:name}\"\n| summarize ExceptionCount = count() by OperationId;\nlet Operations = TraceSummary\n| join kind=leftouter ExceptionSummary on OperationId\n| extend Status = case(ExceptionCount > 0, \"Failed\", Completed, \"Completed\", \"In progress or unknown\"),\n         DurationSeconds = (LastTrace - Started) / 1s;\nlet Summary = materialize(Operations\n| summarize\n    Total = count(),\n    Completed = countif(Status == \"Completed\"),\n    Failed = countif(Status == \"Failed\"),\n    FailureRatePct = round(100.0 * countif(Status == \"Failed\") / count(), 1),\n    P95DurationSeconds = round(percentile(DurationSeconds, 95), 1));\nunion\n(Summary | project Metric = \"Invocations\", Value = tostring(Total)),\n(Summary | project Metric = \"Completed\", Value = tostring(Completed)),\n(Summary | project Metric = \"Failed\", Value = tostring(Failed)),\n(Summary | project Metric = \"Failure rate\", Value = strcat(FailureRatePct, \"%\")),\n(Summary | project Metric = \"P95 duration\", Value = strcat(P95DurationSeconds, \" s\"))",
+              "size": 3,
+              "title": "Function bridge summary",
+              "noDataMessageStyle": 4,
+              "timeContextFromParameter": "TimeRange",
+              "showRefreshButton": true,
+              "queryType": 0,
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ],
+              "visualization": "tiles",
+              "tileSettings": {
+                "showBorder": true,
+                "titleContent": {
+                  "columnMatch": "Metric",
+                  "formatter": 1
+                },
+                "leftContent": {
+                  "columnMatch": "Value",
+                  "formatter": 1
+                }
+              }
+            },
+            "name": "Function bridge summary"
+          },
+          {
+            "type": 3,
+            "content": {
+              "version": "KqlItem/1.0",
+              "query": "let TraceSummary = AppTraces\n| where AppRoleName =~ \"{FunctionApp:name}\"\n| where Message has_any (\"CERTLC:\", \"Runbook started with job id:\", \"Runbook job id:\")\n| summarize\n    Started = minif(TimeGenerated, Message has \"CERTLC: full message received\"),\n    Completed = countif(Message has \"status: Completed\") > 0\n  by OperationId\n| where isnotnull(Started);\nlet ExceptionSummary = AppExceptions\n| where AppRoleName =~ \"{FunctionApp:name}\"\n| summarize ExceptionCount = count() by OperationId;\nTraceSummary\n| join kind=leftouter ExceptionSummary on OperationId\n| extend Status = case(ExceptionCount > 0, \"Failed\", Completed, \"Completed\", \"In progress or unknown\")\n| summarize Invocations = count(), Failed = countif(Status == \"Failed\") by Time = bin(Started, 1h)\n| order by Time asc",
+              "size": 3,
+              "title": "Function bridge volume and failures",
+              "noDataMessageStyle": 4,
+              "timeContextFromParameter": "TimeRange",
+              "showRefreshButton": true,
+              "queryType": 0,
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ],
+              "visualization": "timechart",
+              "chartSettings": {
+                "xAxis": "Time",
+                "yAxis": [
+                  "Invocations",
+                  "Failed"
+                ]
+              }
+            },
+            "customWidth": "50",
+            "name": "Function bridge trend"
+          },
+          {
+            "type": 3,
+            "content": {
+              "version": "KqlItem/1.0",
+              "query": "let TraceSummary = AppTraces\n| where AppRoleName =~ \"{FunctionApp:name}\"\n| where Message has_any (\"CERTLC:\", \"Runbook started with job id:\", \"Runbook job id:\")\n| summarize\n    Started = minif(TimeGenerated, Message has \"CERTLC: full message received\"),\n    EventType = take_anyif(extract(@\"CERTLC: event type:\\s*(.+)$\", 1, Message), Message has \"CERTLC: event type:\"),\n    RunbookJobId = take_anyif(extract(@\"job id:\\s*([0-9a-fA-F-]{36})\", 1, Message), Message has \"job id:\"),\n    Completed = countif(Message has \"status: Completed\") > 0,\n    LastTrace = max(TimeGenerated)\n  by OperationId\n| where isnotnull(Started);\nlet ExceptionSummary = AppExceptions\n| where AppRoleName =~ \"{FunctionApp:name}\"\n| summarize ExceptionCount = count() by OperationId;\nTraceSummary\n| join kind=leftouter ExceptionSummary on OperationId\n| extend Status = case(ExceptionCount > 0, \"Failed\", Completed, \"Completed\", \"In progress or unknown\"),\n         Duration = LastTrace - Started\n| top 10 by Duration desc\n| project Started, Status, EventType, RunbookJobId, Duration",
+              "size": 3,
+              "title": "Slowest Function bridge operations",
+              "noDataMessageStyle": 4,
+              "timeContextFromParameter": "TimeRange",
+              "showRefreshButton": true,
+              "showExportToExcel": true,
+              "queryType": 0,
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ],
+              "visualization": "table",
+              "gridSettings": {
+                "formatters": [
+                  {
+                    "columnMatch": "Started",
+                    "formatter": 6,
+                    "formatOptions": {
+                      "customColumnWidthSetting": "20ch"
+                    },
+                    "dateFormat": {
+                      "showUtcTime": null,
+                      "formatName": "shortDateTimeNoMsPattern"
+                    }
+                  },
+                  {
+                    "columnMatch": "Status",
+                    "formatter": 1
+                  }
+                ],
+                "rowLimit": 10,
+                "filter": true
+              }
+            },
+            "customWidth": "50",
+            "name": "Slowest Function bridge operations"
+          },
+          {
+            "type": 3,
+            "content": {
+              "version": "KqlItem/1.0",
+              "query": "let BridgeOperations = AppTraces\n| where AppRoleName =~ \"{FunctionApp:name}\"\n| where Message has_any (\"CERTLC:\", \"Runbook started with job id:\", \"Runbook job id:\")\n| summarize by OperationId;\nlet FunctionFailures = BridgeOperations\n| join kind=inner (\n    AppExceptions\n    | where AppRoleName =~ \"{FunctionApp:name}\"\n    | summarize arg_max(TimeGenerated, OuterMessage) by OperationId\n  ) on OperationId\n| project Time = TimeGenerated, Source = \"Function bridge\", Id = OperationId, Details = tostring(OuterMessage);\nlet FailedJobs = AzureDiagnostics\n| where Category == \"JobLogs\"\n| where Resource =~ \"{AutomationAccount:name}\"\n| where RunbookName_s =~ tostring(split(\"{Runbook:name}\", \"/\")[-1])\n| summarize arg_max(TimeGenerated, ResultType) by JobId_g\n| where ResultType =~ \"Failed\"\n| extend JobId = tostring(JobId_g);\nlet JobErrors = AzureDiagnostics\n| where Category == \"JobStreams\"\n| where Resource =~ \"{AutomationAccount:name}\"\n| where RunbookName_s =~ tostring(split(\"{Runbook:name}\", \"/\")[-1])\n| where StreamType_s == \"Error\"\n| summarize arg_max(TimeGenerated, ResultDescription) by JobId = tostring(JobId_g)\n| project JobId, ErrorMessage = replace_regex(tostring(ResultDescription), @\"\\x1B\\[[0-9;]*[A-Za-z]\", \"\");\nunion\nFunctionFailures,\n(FailedJobs\n| join kind=leftouter JobErrors on JobId\n| project Time = TimeGenerated, Source = \"Automation job\", Id = JobId, Details = ErrorMessage)\n| top 20 by Time desc",
+              "size": 3,
+              "title": "Recent failures",
+              "noDataMessageStyle": 4,
+              "timeContextFromParameter": "TimeRange",
+              "showRefreshButton": true,
+              "showExportToExcel": true,
+              "queryType": 0,
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ],
+              "visualization": "table",
+              "gridSettings": {
+                "formatters": [
+                  {
+                    "columnMatch": "Time",
+                    "formatter": 6,
+                    "formatOptions": {
+                      "customColumnWidthSetting": "20ch"
+                    },
+                    "dateFormat": {
+                      "showUtcTime": null,
+                      "formatName": "shortDateTimeNoMsPattern"
+                    }
+                  },
+                  {
+                    "columnMatch": "Details",
+                    "formatter": 1,
+                    "formatOptions": {
+                      "customColumnWidthSetting": "50%"
+                    }
+                  }
+                ],
+                "rowLimit": 20,
+                "filter": true
+              }
+            },
+            "name": "Recent failures"
+          },
+          {
+            "type": 3,
+            "content": {
+              "version": "KqlItem/1.0",
+              "query": "let TraceSummary = AppTraces\n| where AppRoleName =~ \"{FunctionApp:name}\"\n| where Message has_any (\"CERTLC:\", \"Runbook started with job id:\", \"Runbook job id:\")\n| summarize\n    Started = minif(TimeGenerated, Message has \"CERTLC: full message received\"),\n    EventType = take_anyif(extract(@\"CERTLC: event type:\\s*(.+)$\", 1, Message), Message has \"CERTLC: event type:\"),\n    RunbookJobId = take_anyif(extract(@\"job id:\\s*([0-9a-fA-F-]{36})\", 1, Message), Message has \"job id:\"),\n    Completed = countif(Message has \"status: Completed\") > 0,\n    arg_max(TimeGenerated, Message)\n  by OperationId\n| where isnotnull(Started)\n| project OperationId, Started, LastTrace = TimeGenerated, EventType, RunbookJobId, Completed, LastMessage = Message;\nlet ExceptionSummary = AppExceptions\n| where AppRoleName =~ \"{FunctionApp:name}\"\n| summarize ExceptionCount = count(), arg_max(TimeGenerated, OuterMessage) by OperationId\n| project OperationId, ExceptionCount, LastException = OuterMessage;\nTraceSummary\n| join kind=leftouter ExceptionSummary on OperationId\n| extend Status = case(ExceptionCount > 0, \"Failed\", Completed, \"Completed\", \"In progress or unknown\"),\n         Duration = LastTrace - Started\n| project Started, Status, EventType, RunbookJobId, Duration, LastMessage, LastException, OperationId\n| order by Started desc",
+              "size": 3,
+              "title": "Function bridge invocations",
+              "noDataMessageStyle": 4,
+              "timeContextFromParameter": "TimeRange",
+              "showRefreshButton": true,
+              "showExportToExcel": true,
+              "queryType": 0,
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ],
+              "visualization": "table",
+              "gridSettings": {
+                "formatters": [
+                  {
+                    "columnMatch": "Started",
+                    "formatter": 6,
+                    "formatOptions": {
+                      "customColumnWidthSetting": "20ch"
+                    },
+                    "dateFormat": {
+                      "showUtcTime": null,
+                      "formatName": "shortDateTimeNoMsPattern"
+                    }
+                  },
+                  {
+                    "columnMatch": "Status",
+                    "formatter": 1
+                  },
+                  {
+                    "columnMatch": "RunbookJobId",
+                    "formatter": 5
+                  },
+                  {
+                    "columnMatch": "OperationId",
+                    "formatter": 5
+                  }
+                ],
+                "rowLimit": 5000,
+                "filter": true
+              }
+            },
+            "name": "Function bridge invocations"
+          }
+        ]
+      },
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "3"
+      },
+      "name": "grpFunctionBridge"
     }
   ],
   "fallbackResourceIds": [

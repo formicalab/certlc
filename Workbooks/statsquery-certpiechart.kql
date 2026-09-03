@@ -1,34 +1,39 @@
 // Purpose: Show certificate status summary for ONLY certificates that currently exist in the Key Vault
 // Problem: The runbook writes hourly snapshots, but deleted certificates remain in Log Analytics
-// Solution: Filter out certificates that weren't reported in the most recent successful runbook execution
+// Solution: Select the snapshot emitted by the most recent successful runbook execution
 //
 // Logic:
-// 1. Get the completion time of the last SUCCESSFUL certlcstats runbook execution from job logs
-//    - This is safer than using certificate timestamps because:
-//      * It relies on actual job execution records, not certificate data
-//      * It handles cases where no certificates exist or all are deleted
-//      * It ensures we only consider data from completed (not failed) runs
-// 2. For each certificate Name, get its most recent entry (arg_max)
-// 3. Filter to only certificates updated within 5 minutes before the last successful job completion
-//    - If a certificate exists in Key Vault, it was written during the last successful cycle
-//    - If a certificate was deleted from Key Vault, it won't have been updated recently
-//    - 5 minutes allows for the runbook execution time to process all certificates
-// 4. Calculate status based on expiration time
-// 5. Summarize counts and percentages by status
+// 1. Get the JobId of the latest successful certlcstats execution
+// 2. Extract its Snapshot ID marker from the matching output stream
+// 3. Select only rows carrying that SnapshotId (an empty scan returns no rows)
+// 4. Calculate and summarize certificate status
 
-let LastSuccessfulRunbookExecution = toscalar(
+let LatestSuccessfulJobId = toscalar(
     AzureDiagnostics
     | where Category == "JobLogs"
     | where Resource =~ "{AutomationAccount:name}"
-    | where RunbookName_s =~ "certlcstats"  // The stats collection runbook
-    | where ResultType =~ "Completed"       // Only successful completions
-    | summarize arg_max(TimeGenerated, *)   // Get the most recent completed job
-    | project TimeGenerated
+    | where RunbookName_s =~ tostring(split("{StatsRunbook}", "/")[-1])
+    | where ResultType =~ "Completed"
+    | summarize arg_max(TimeGenerated, JobId_g)
+    | project JobId = tostring(JobId_g)
 );
 
-let latestCerts = certlc_CL
-| summarize arg_max(LastUpdate = TimeGenerated, Name, Subject, Template, Created, Expires) by Name
-| where LastUpdate >= (LastSuccessfulRunbookExecution - 5m)  // Only show certs from the last successful cycle
+let LatestSnapshotId = toscalar(
+    AzureDiagnostics
+    | where Category == "JobStreams"
+    | where Resource =~ "{AutomationAccount:name}"
+    | where RunbookName_s =~ tostring(split("{StatsRunbook}", "/")[-1])
+    | where tostring(JobId_g) == LatestSuccessfulJobId
+    | where StreamType_s =~ "Output"
+    | extend SnapshotId = extract(@"Snapshot ID:\s*([0-9A-Fa-f-]{36})", 1, ResultDescription)
+    | where isnotempty(SnapshotId)
+    | summarize arg_max(TimeGenerated, SnapshotId)
+    | project SnapshotId
+);
+
+let latestCerts = certlcstats_CL
+| where SnapshotId == LatestSnapshotId
+| extend LastUpdate = TimeGenerated
 | extend RawTimeToExpire = Expires - now()  // timespan
 | extend Status = case(
     RawTimeToExpire < 0d, "❌ Expired",

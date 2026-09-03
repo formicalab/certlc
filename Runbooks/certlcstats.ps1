@@ -56,18 +56,16 @@ catch {
 # set context
 Set-AzContext -SubscriptionName $AzureConnection.Subscription -DefaultProfile $AzureConnection | Out-Null
 
-# Check if the script is running on Azure or on hybrid worker; assign jobId accordingly.
-# https://rakhesh.com/azure/azure-automation-powershell-variables/
+# Require a Hybrid Runbook Worker and generate one identifier shared by every row in this scan.
 if ($env:AZUREPS_HOST_ENVIRONMENT -eq 'AzureAutomation/') {
-    # We are in a Hybrid Runbook Worker
-    $jobId = $env:PSPrivateMetadata
-    Write-Output "Runbook running with job id $jobId on hybrid worker $($env:COMPUTERNAME)."
+    $snapshotId = [Guid]::NewGuid().Guid
+    Write-Output "Snapshot ID: $snapshotId. Runbook running on hybrid worker $($env:COMPUTERNAME)."
 }
 elseif ($env:AZUREPS_HOST_ENVIRONMENT -eq 'AzureAutomation') {
-    # We are in Azure Automation. This is not acceptable because we need a hybrid worker to access the Key Vault with a Private Endpoint
-    $jobId = $PSPrivateMetadata.JobId
-    Write-Output "Runbook running with job id $jobId in Azure Automation. This is not supported, please use a Hybrid Runbook Worker to access the Key Vault with a Private Endpoint."
-    throw
+    throw 'Runbook running in Azure Automation. This is not supported; use a Hybrid Runbook Worker to access the Key Vault private endpoint.'
+}
+else {
+    throw 'This runbook must be executed by an Azure Automation Hybrid Runbook Worker.'
 }
 
 # Get the runbook variables from the Automation Account
@@ -127,6 +125,7 @@ $results = foreach ($certMeta in $certificates) {
     }
 
     [PSCustomObject]@{
+        SnapshotId = $snapshotId
         Thumbprint = $certDetails.Certificate.Thumbprint
         Name       = $certMeta.Name
         Created    = $certDetails.Created.ToString('o')     # ISO 8601 format required by Azure Monitor
@@ -180,8 +179,11 @@ if ($bytes -gt 900000) {
 $maxAttempts = 3
 for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
     try {
-        $statusCode = 0
-        Invoke-RestMethod -Uri $uri -Method Post -Body $body -Headers $headers -TimeoutSec 60 -StatusCodeVariable statusCode
+        $response = Invoke-WebRequest -Uri $uri -Method Post -Body $body -Headers $headers -TimeoutSec 60 -SkipHttpErrorCheck
+        $statusCode = [int]$response.StatusCode
+        if ($statusCode -lt 200 -or $statusCode -ge 300) {
+            throw "Logs Ingestion returned HTTP $statusCode`: $($response.Content)"
+        }
         Write-Output "All items ingested (attempt $attempt), status code $statusCode."
         break
     }
