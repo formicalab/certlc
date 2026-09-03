@@ -78,8 +78,9 @@ The exported, SID-protected PFX contains the private-key leaf and every intermed
 1. An external system or utility script sends a certificate request message to the Storage Queue
 2. The Function App receives the message, authenticates with its managed identity, and starts the `certlc` runbook directly on the configured Hybrid Worker group
 3. The runbook executes on the Hybrid Worker with access to the Enterprise CA
-4. A certificate signing request (CSR) is submitted with the AD CS `ICertRequest` COM interface over RPC/DCOM
-5. The runbook applies the [certificate chain contract](#certificate-chain-contract): validate the CA response, merge and verify the complete chain in Key Vault, then export the root-excluded PFX
+4. Before creating a CSR, the runbook verifies that it is running as Local System or a local administrator, resolves every `PfxProtectTo` principal to a SID, prepares the host-specific export folder and ACL, and proves write/delete access with a temporary probe
+5. A certificate signing request (CSR) is submitted with the AD CS `ICertRequest` COM interface over RPC/DCOM
+6. The runbook applies the [certificate chain contract](#certificate-chain-contract): validate the CA response, merge and verify the complete chain in Key Vault, then revalidate the export prerequisites and export the root-excluded PFX
 
 ### Certificate Renewal Flow
 

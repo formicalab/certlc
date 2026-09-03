@@ -784,6 +784,180 @@ function Convert-PfxProtectToFromTag {
 
 #endregion
 
+#region ### Initialize-PfxExportTarget ###
+
+############################################
+# FUNCTIONS - Initialize-PfxExportTarget   #
+############################################
+
+<#
+.SYNOPSIS
+    Prepare and validate the filesystem and principals required for PFX export.
+
+.DESCRIPTION
+    Resolves every protection principal to a SID, creates the host-specific target directory,
+    applies its final ACL, and verifies write/delete access with a temporary probe file.
+    Call this before certificate issuance so invalid export prerequisites fail without creating
+    irreversible CA or Key Vault state.
+
+.PARAMETER PfxRootFolder
+    Root directory below which host-specific PFX directories are created.
+
+.PARAMETER Hostname
+    Single safe path segment used as the host-specific directory name.
+
+.PARAMETER ProtectTo
+    Domain users or groups that receive ReadAndExecute access and can decrypt the PFX.
+
+.OUTPUTS
+    PSCustomObject containing TargetFolder and the resolved ProtectionSids.
+#>
+function Initialize-PfxExportTarget {
+    [OutputType([pscustomobject])]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$PfxRootFolder,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Hostname,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string[]]$ProtectTo
+    )
+
+    # SID-protected PKCS#12 export and NTFS ACLs depend on Windows cryptography and security APIs.
+    if (-not $IsWindows) {
+        throw [System.PlatformNotSupportedException]::new('Initialize-PfxExportTarget: SID-protected PFX export requires a Windows Hybrid Worker.')
+    }
+
+    # The final ACL grants write access only to Local System and local Administrators. Verify
+    # the worker token belongs to one of those identities before changing any directory ACL.
+    $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    try {
+        $workerIdentityName = $currentIdentity.Name
+        $currentPrincipal = [System.Security.Principal.WindowsPrincipal]::new($currentIdentity)
+        $workerCanApplyAcl = $currentIdentity.IsSystem -or
+            $currentPrincipal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+    finally {
+        # WindowsIdentity owns a native token handle; release it before filesystem work begins.
+        $currentIdentity.Dispose()
+    }
+    if (-not $workerCanApplyAcl) {
+        throw [System.Security.SecurityException]::new("Initialize-PfxExportTarget: Worker identity '$workerIdentityName' must run as Local System or a local administrator to apply the PFX directory ACL.")
+    }
+
+    # Keep the direct function-call contract as strict as the dispatcher so Hostname cannot
+    # introduce rooted paths, traversal segments, wildcard expansion, or alternate separators.
+    if ($Hostname -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9\-\.]{0,253})$') {
+        throw [System.ArgumentException]::new("Initialize-PfxExportTarget: Hostname '$Hostname' is not a safe directory name.", 'Hostname')
+    }
+
+    try {
+        # Canonicalize both paths and require the target to remain an immediate child of the
+        # configured root before creating either directory.
+        $rootPath = [System.IO.Path]::GetFullPath($PfxRootFolder)
+        $targetPath = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($rootPath, $Hostname))
+        $rootPrefix = $rootPath.TrimEnd(
+            [System.IO.Path]::DirectorySeparatorChar,
+            [System.IO.Path]::AltDirectorySeparatorChar
+        ) + [System.IO.Path]::DirectorySeparatorChar
+        if (-not $targetPath.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw [System.ArgumentException]::new("Target path '$targetPath' is outside PFX root '$rootPath'.")
+        }
+
+        # Directory.CreateDirectory is idempotent and treats wildcard characters literally,
+        # which is safer here than provider wildcard expansion through New-Item.
+        $null = [System.IO.Directory]::CreateDirectory($rootPath)
+        $null = [System.IO.Directory]::CreateDirectory($targetPath)
+    }
+    catch {
+        throw [System.Exception]::new("Initialize-PfxExportTarget: Cannot prepare PFX directory for host '$Hostname' below '$PfxRootFolder'.", $_.Exception)
+    }
+
+    # Resolve every requested identity before any certificate request is created. The returned
+    # SID objects are reused by ACL construction and native PFX protection to avoid late lookup.
+    $protectionSids = [System.Collections.Generic.List[System.Security.Principal.SecurityIdentifier]]::new()
+    foreach ($principal in $ProtectTo) {
+        try {
+            $sid = ([System.Security.Principal.NTAccount]$principal).Translate(
+                [System.Security.Principal.SecurityIdentifier]
+            )
+            $protectionSids.Add($sid)
+        }
+        catch {
+            throw [System.Exception]::new("Initialize-PfxExportTarget: Cannot resolve PfxProtectTo principal '$principal' to a Windows SID.", $_.Exception)
+        }
+    }
+
+    try {
+        # Build the complete ACL in memory and apply it once so the target never observes a
+        # partially assembled permission set.
+        $acl = Get-Acl -LiteralPath $targetPath
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($rule in @($acl.Access)) {
+            $null = $acl.RemoveAccessRule($rule)
+        }
+
+        $inheritFlags = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+        $propagationFlags = [System.Security.AccessControl.PropagationFlags]::None
+        $fullControlSids = @(
+            [System.Security.Principal.SecurityIdentifier]::new([System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null),
+            [System.Security.Principal.SecurityIdentifier]::new([System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+        )
+        foreach ($sid in $fullControlSids) {
+            $accessRule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+                $sid, 'FullControl', $inheritFlags, $propagationFlags, 'Allow'
+            )
+            $acl.AddAccessRule($accessRule)
+        }
+        foreach ($sid in $protectionSids) {
+            $accessRule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+                $sid, 'ReadAndExecute', $inheritFlags, $propagationFlags, 'Allow'
+            )
+            $acl.AddAccessRule($accessRule)
+        }
+        Set-Acl -LiteralPath $targetPath -AclObject $acl
+
+        # DeleteOnClose validates create, write, flush, close, and delete rights without leaving
+        # reusable probe data in the certificate export directory.
+        $probePath = [System.IO.Path]::Combine($targetPath, ".certlc-preflight-$([Guid]::NewGuid().ToString('N')).tmp")
+        $probeStream = [System.IO.FileStream]::new(
+            $probePath,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None,
+            4096,
+            [System.IO.FileOptions]::DeleteOnClose
+        )
+        try {
+            $probeStream.WriteByte(0)
+            $probeStream.Flush($true)
+        }
+        finally {
+            $probeStream.Dispose()
+        }
+        if ([System.IO.File]::Exists($probePath)) {
+            throw [System.IO.IOException]::new("Preflight probe file '$probePath' was not deleted on close.")
+        }
+    }
+    catch {
+        throw [System.Exception]::new("Initialize-PfxExportTarget: PFX directory '$targetPath' cannot accept the required ACL and file operations.", $_.Exception)
+    }
+
+    Write-CertLCLog -Section 'Initialize-PfxExportTarget' -Message "PFX: Export prerequisites validated for target folder $targetPath and $($protectionSids.Count) protection principal(s)."
+    return [pscustomobject]@{
+        TargetFolder   = $targetPath
+        ProtectionSids = $protectionSids.ToArray()
+    }
+}
+
+#endregion
+
 #region ### Certificate chain helpers ###
 
 #########################################
@@ -1284,8 +1458,8 @@ function Get-KeyVaultCertificateSecretValue {
     One or more X509Certificate2 objects to include in the exported PFX. The leaf certificate
     carries the private key; issuer certificates contribute their public certificate material.
 
-.PARAMETER ProtectTo
-    An array of strings representing the users or groups (in domain\user or UPN format) to protect the PFX file to.
+.PARAMETER ProtectionSids
+    SIDs resolved and validated by Initialize-PfxExportTarget before certificate issuance.
 
 .PARAMETER PfxFile
     The path to the output PFX file.
@@ -1293,7 +1467,8 @@ function Get-KeyVaultCertificateSecretValue {
 .EXAMPLE
     $protectTo = @("DOMAIN\User1", "DOMAIN\Group1")
     $pfxFile = "C:\path\to\output.pfx"
-    Export-PfxWithGroupProtection -Certificates @($cert) -ProtectTo $protectTo -PfxFile $pfxFile
+    $preflight = Initialize-PfxExportTarget -PfxRootFolder 'C:\path\to' -Hostname 'output' -ProtectTo $protectTo
+    Export-PfxWithGroupProtection -Certificates @($cert) -ProtectionSids $preflight.ProtectionSids -PfxFile $pfxFile
 #>
 function Export-PfxWithGroupProtection {
     [CmdletBinding()]
@@ -1302,7 +1477,7 @@ function Export-PfxWithGroupProtection {
         [System.Security.Cryptography.X509Certificates.X509Certificate2[]]$Certificates,
 
         [Parameter(Mandatory = $true)]
-        [string[]]$ProtectTo,
+        [System.Security.Principal.SecurityIdentifier[]]$ProtectionSids,
 
         [Parameter(Mandatory = $true)]
         [string]$PfxFile
@@ -1350,10 +1525,8 @@ function Export-PfxWithGroupProtection {
 '@
     }
 
-    # resolve SIDs and build the rulestring: "SID=... OR SID=..."
-    $rule = ($ProtectTo | ForEach-Object {
-            ([System.Security.Principal.NTAccount]$_).Translate([System.Security.Principal.SecurityIdentifier]).Value
-        } | ForEach-Object { "SID=$_" } ) -join ' OR '
+    # Build the protection descriptor only from SIDs that passed the early export preflight.
+    $rule = ($ProtectionSids | ForEach-Object { "SID=$($_.Value)" }) -join ' OR '
 
     # create protection descriptor
     $hDesc = [IntPtr]::Zero
@@ -1617,6 +1790,15 @@ function New-CertificateCreationRequest {
         # for audit symmetry with RevokedJobId.
         [Parameter()][string]$RenewedJobId
     )
+
+    # Validate every local export dependency before creating a Key Vault CSR or contacting the
+    # CA. This prevents bad paths, ACL rights, or domain principals from causing late failure.
+    $pfxPreparation = Initialize-PfxExportTarget `
+        -PfxRootFolder $PfxRootFolder `
+        -Hostname $Hostname `
+        -ProtectTo $PfxProtectTo
+    $PfxTargetFolder = $pfxPreparation.TargetFolder
+    $ProtectionSids = $pfxPreparation.ProtectionSids
 
     # prepare tags for the certificate
     $tagPfxValue = Convert-PfxProtectToForTag -Value $PfxProtectTo
@@ -1941,51 +2123,14 @@ function New-CertificateCreationRequest {
         # All remaining PFX work consumes the verified Key Vault collection. Keeping it inside
         # this try/finally guarantees that ephemeral private-key handles are always released.
 
-        # Create root folder if needed
-        if (-not (Test-Path -Path $PfxRootFolder)) {
-            Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Creating the PFX root folder: $PfxRootFolder"
-            New-Item -Path $PfxRootFolder -ItemType Directory -Force | Out-Null
-        }
-        Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Root folder verified: $PfxRootFolder"
-
-        $PfxTargetFolder = Join-Path -Path $PfxRootFolder -ChildPath $Hostname
-
-        if (-not (Test-Path -Path $PfxTargetFolder)) {
-            Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Creating the target folder for PFX: $PfxTargetFolder"
-            New-Item -Path $PfxTargetFolder -ItemType Directory -Force | Out-Null
-        }
-
-        # Set ACLs on the target folder. This operation is repeated, for security, even if the folder already exists.
-        try {
-            # Start with current ACL, then fully protect (no inheritance, do not preserve inherited ACEs)
-            $acl = Get-Acl -Path $PfxTargetFolder
-            $acl.SetAccessRuleProtection($true, $false)  # protect; remove inherited
-
-            # Remove any existing explicit ACEs so only our defined set remains
-            foreach ($rule in @($acl.Access)) { $null = $acl.RemoveAccessRule($rule) }
-
-            $inheritFlags = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
-            $propFlags = [System.Security.AccessControl.PropagationFlags]::None
-
-            # Required full-control principals
-            foreach ($adm in @('BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM')) {
-                $ace = New-Object System.Security.AccessControl.FileSystemAccessRule($adm, 'FullControl', $inheritFlags, $propFlags, 'Allow')
-                $acl.AddAccessRule($ace)
-            }
-
-            # Limited principals (Read & Execute)
-            foreach ($principal in $PfxProtectTo) {
-                if ([string]::IsNullOrWhiteSpace($principal)) { continue }
-                $ace = New-Object System.Security.AccessControl.FileSystemAccessRule($principal, 'ReadAndExecute', $inheritFlags, $propFlags, 'Allow')
-                $acl.AddAccessRule($ace)
-            }
-
-            Set-Acl -Path $PfxTargetFolder -AclObject $acl
-            Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: ACL set on target folder (inheritance disabled, custom ACEs only): $PfxTargetFolder"
-        }
-        catch {
-            throw [System.Exception]::new("New-CertificateCreationRequest: PFX: Error setting permissions on $PfxTargetFolder", $_.Exception)
-        }
+        # Reapply and revalidate the prerequisites because CA and Key Vault operations may take
+        # long enough for directory permissions or domain membership to change after preflight.
+        $pfxPreparation = Initialize-PfxExportTarget `
+            -PfxRootFolder $PfxRootFolder `
+            -Hostname $Hostname `
+            -ProtectTo $PfxProtectTo
+        $PfxTargetFolder = $pfxPreparation.TargetFolder
+        $ProtectionSids = $pfxPreparation.ProtectionSids
 
         $pfxFile = Join-Path -Path $PfxTargetFolder -ChildPath "$($CertificateName).pfx"
         $temporaryPfxFile = Join-Path -Path $PfxTargetFolder -ChildPath ".$($CertificateName).$([Guid]::NewGuid().ToString('N')).tmp"
@@ -2011,7 +2156,7 @@ function New-CertificateCreationRequest {
             # The ordered set contains the private-key leaf and intermediates, but not the root.
             Export-PfxWithGroupProtection `
                 -Certificates $exportChain `
-                -ProtectTo $PfxProtectTo `
+                -ProtectionSids $ProtectionSids `
                 -PfxFile $temporaryPfxFile
 
             # A Hybrid Worker may create a PFX protected to other domain SIDs without being
@@ -2373,6 +2518,9 @@ function New-CertificateRevocationRequest {
 
     Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "CA: Sending revocation request for certificate $CertificateName version $CertificateVersion (serial $serialNumber) to the CA $CA using reason $($RevocationReason)..."
 
+    # Initialize before COM activation so the finally block remains safe under StrictMode
+    # when New-Object fails before assigning the CertificateAuthority.Admin instance.
+    $CertAdmin = $null
     try {
         $CertAdmin = New-Object -ComObject CertificateAuthority.Admin
         $CertAdmin.RevokeCertificate($CA, $serialNumber, $RevocationReason, 0)
