@@ -1683,6 +1683,8 @@ function New-CertificateCreationRequest {
         }
     }
 
+    $keyVaultCertificates = $null
+    $exportChain = $null
     $caResponseCertificates = ConvertFrom-Base64Pkcs7 -Content $pkcs7Response
     try {
         # Validate the physical CA response before sending any certificate material to Key Vault.
@@ -1699,7 +1701,7 @@ function New-CertificateCreationRequest {
         }
 
         # Reuse the Automation Account's managed-identity Az context and keep the Key Vault
-        # bearer token as a SecureString for the complete REST operation.
+        # bearer token as a SecureString through merge and exact-version secret retrieval.
         $keyVaultToken = $null
         try {
             $tokenResult = Get-AzAccessToken -ResourceTypeName KeyVault -AsSecureString
@@ -1809,10 +1811,63 @@ function New-CertificateCreationRequest {
             }
 
             Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "KeyVault: Complete certificate chain merged and request tags verified for certificate $CertificateName version $certificateVersion in vault $VaultName."
+
+            # Use the sid returned by this merge instead of a latest-version lookup. This binds
+            # PFX creation to the exact certificate version completed by the current operation.
+            Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "KeyVault: Retrieving exact PKCS#12 secret version for certificate $CertificateName version $certificateVersion..."
+            $secretBase64 = Get-KeyVaultCertificateSecretValue `
+                -VaultName $VaultName `
+                -SecretId ([string]$mergedCertificate.sid) `
+                -Token $keyVaultToken
+
+            $certificateBytes = $null
+            try {
+                $certificateBytes = [Convert]::FromBase64String($secretBase64)
+                $secretBase64 = $null
+                $keyVaultCertificates = [System.Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
+                $importFlags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable -bor
+                    [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
+
+                # EphemeralKeySet keeps the Key Vault private key out of the Hybrid Worker's
+                # persistent user and machine key stores while it is prepared for PFX export.
+                $keyVaultCertificates.Import($certificateBytes, [string]::Empty, $importFlags)
+
+                # The final PFX must be built only from material physically returned by Key Vault.
+                # Comparing against the CA response proves that the merge persisted every member.
+                Assert-CertificateSet -Expected $caChain -Actual $keyVaultCertificates -Context 'Key Vault persistence'
+                $exportChain = Get-OrderedCertificateChain `
+                    -Certificates $keyVaultCertificates `
+                    -Source KeyVaultSecret `
+                    -ExcludeRoot
+
+                Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "KeyVault: Verified $($keyVaultCertificates.Count) persisted chain certificate(s); $($exportChain.Count) leaf/intermediate certificate(s) selected for PFX export after root exclusion."
+                foreach ($certificate in $exportChain) {
+                    Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX chain member: subject '$($certificate.Subject)', issuer '$($certificate.Issuer)', private key '$($certificate.HasPrivateKey)'."
+                }
+            }
+            catch {
+                # Import can partially populate a collection. Dispose it here on failure because
+                # the later PFX cleanup block is reached only after this preparation succeeds.
+                if ($null -ne $keyVaultCertificates) {
+                    foreach ($certificate in $keyVaultCertificates) {
+                        $certificate.Dispose()
+                    }
+                    $keyVaultCertificates = $null
+                }
+                throw
+            }
+            finally {
+                # The decoded PKCS#12 contains private-key material and must not remain in memory
+                # beyond collection import. The Base64 reference is also released promptly.
+                $secretBase64 = $null
+                if ($null -ne $certificateBytes) {
+                    [Array]::Clear($certificateBytes, 0, $certificateBytes.Length)
+                }
+            }
         }
         finally {
             # SecureString implements IDisposable. Release the token as soon as all Key Vault
-            # REST work for this step is complete.
+            # merge and exact-version retrieval work is complete.
             if ($null -ne $keyVaultToken) {
                 $keyVaultToken.Dispose()
             }
@@ -1826,106 +1881,120 @@ function New-CertificateCreationRequest {
         }
     }
 
-    # Create root folder if needed
-    if (-not (Test-Path -Path $PfxRootFolder)) {
-        Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Creating the PFX root folder: $PfxRootFolder"
-        New-Item -Path $PfxRootFolder -ItemType Directory -Force | Out-Null
-    }
-    Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Root folder verified: $PfxRootFolder"
-
-    $PfxTargetFolder = Join-Path -Path $PfxRootFolder -ChildPath $Hostname
-
-    if (-not (Test-Path -Path $PfxTargetFolder)) {
-        Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Creating the target folder for PFX: $PfxTargetFolder"
-        New-Item -Path $PfxTargetFolder -ItemType Directory -Force | Out-Null
-    }
-
-    # Set ACLs on the target folder. This operation is repeated, for security, even if the folder already exists.
     try {
-        # Start with current ACL, then fully protect (no inheritance, do not preserve inherited ACEs)
-        $acl = Get-Acl -Path $PfxTargetFolder
-        $acl.SetAccessRuleProtection($true, $false)  # protect; remove inherited
+        # All remaining PFX work consumes the verified Key Vault collection. Keeping it inside
+        # this try/finally guarantees that ephemeral private-key handles are always released.
 
-        # Remove any existing explicit ACEs so only our defined set remains
-        foreach ($rule in @($acl.Access)) { $null = $acl.RemoveAccessRule($rule) }
+        # Create root folder if needed
+        if (-not (Test-Path -Path $PfxRootFolder)) {
+            Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Creating the PFX root folder: $PfxRootFolder"
+            New-Item -Path $PfxRootFolder -ItemType Directory -Force | Out-Null
+        }
+        Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Root folder verified: $PfxRootFolder"
 
-        $inheritFlags = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
-        $propFlags = [System.Security.AccessControl.PropagationFlags]::None
+        $PfxTargetFolder = Join-Path -Path $PfxRootFolder -ChildPath $Hostname
 
-        # Required full-control principals
-        foreach ($adm in @('BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM')) {
-            $ace = New-Object System.Security.AccessControl.FileSystemAccessRule($adm, 'FullControl', $inheritFlags, $propFlags, 'Allow')
-            $acl.AddAccessRule($ace)
+        if (-not (Test-Path -Path $PfxTargetFolder)) {
+            Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Creating the target folder for PFX: $PfxTargetFolder"
+            New-Item -Path $PfxTargetFolder -ItemType Directory -Force | Out-Null
         }
 
-        # Limited principals (Read & Execute)
-        foreach ($principal in $PfxProtectTo) {
-            if ([string]::IsNullOrWhiteSpace($principal)) { continue }
-            $ace = New-Object System.Security.AccessControl.FileSystemAccessRule($principal, 'ReadAndExecute', $inheritFlags, $propFlags, 'Allow')
-            $acl.AddAccessRule($ace)
-        }
-
-        Set-Acl -Path $PfxTargetFolder -AclObject $acl
-        Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: ACL set on target folder (inheritance disabled, custom ACEs only): $PfxTargetFolder"
-    }
-    catch {
-        throw [System.Exception]::new("New-CertificateCreationRequest: PFX: Error setting permissions on $PfxTargetFolder", $_.Exception)
-    }
-
-    $pfxFile = Join-Path -Path $PfxTargetFolder -ChildPath "$($CertificateName).pfx"
-    Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Export path: $pfxFile"
-
-    Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Retrieving secret for $CertificateName from vault $VaultName..."
-    try {
-        $certBase64 = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertificateName -AsPlainText
-    }
-    catch {
-        throw [System.Exception]::new("New-CertificateCreationRequest: PFX: Error retrieving secret for $CertificateName", $_.Exception)
-    }
-    if ([string]::IsNullOrEmpty($certBase64)) {
-        throw [System.Exception]::new("New-CertificateCreationRequest: PFX: Retrieved secret is empty for $CertificateName")
-    }
-
-    $certBytes = [Convert]::FromBase64String($certBase64); $certBase64 = $null
-    $x509Cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($certBytes, [string]::Empty, 'Exportable')
-    $certBytes = $null
-    if (-not $x509Cert.HasPrivateKey) {
-        $x509Cert = $null; throw [System.Exception]::new("New-CertificateCreationRequest: PFX: Private key missing for $CertificateName")
-    }
-    try {
-        $null = $x509Cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Pfx)
-    }
-    catch {
-        $x509Cert = $null; throw [System.Exception]::new('New-CertificateCreationRequest: PFX: Private key not exportable', $_.Exception)
-    }
-
-    if (Test-Path -Path $pfxFile) {
-        Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Removing existing file $pfxFile"
+        # Set ACLs on the target folder. This operation is repeated, for security, even if the folder already exists.
         try {
-            Remove-Item -Path $pfxFile -Force
+            # Start with current ACL, then fully protect (no inheritance, do not preserve inherited ACEs)
+            $acl = Get-Acl -Path $PfxTargetFolder
+            $acl.SetAccessRuleProtection($true, $false)  # protect; remove inherited
+
+            # Remove any existing explicit ACEs so only our defined set remains
+            foreach ($rule in @($acl.Access)) { $null = $acl.RemoveAccessRule($rule) }
+
+            $inheritFlags = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+            $propFlags = [System.Security.AccessControl.PropagationFlags]::None
+
+            # Required full-control principals
+            foreach ($adm in @('BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM')) {
+                $ace = New-Object System.Security.AccessControl.FileSystemAccessRule($adm, 'FullControl', $inheritFlags, $propFlags, 'Allow')
+                $acl.AddAccessRule($ace)
+            }
+
+            # Limited principals (Read & Execute)
+            foreach ($principal in $PfxProtectTo) {
+                if ([string]::IsNullOrWhiteSpace($principal)) { continue }
+                $ace = New-Object System.Security.AccessControl.FileSystemAccessRule($principal, 'ReadAndExecute', $inheritFlags, $propFlags, 'Allow')
+                $acl.AddAccessRule($ace)
+            }
+
+            Set-Acl -Path $PfxTargetFolder -AclObject $acl
+            Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: ACL set on target folder (inheritance disabled, custom ACEs only): $PfxTargetFolder"
         }
         catch {
-            $x509Cert = $null; throw [System.Exception]::new("New-CertificateCreationRequest: PFX: Cannot remove existing file $pfxFile", $_.Exception)
+            throw [System.Exception]::new("New-CertificateCreationRequest: PFX: Error setting permissions on $PfxTargetFolder", $_.Exception)
         }
-    }
 
-    try {
-        # Keep the current leaf-only behavior explicit until the creation path supplies
-        # the validated Key Vault chain in a later, separately reviewed change.
-        Export-PfxWithGroupProtection -Certificates @($x509Cert) -ProtectTo $PfxProtectTo -PfxFile $pfxFile
-    }
-    catch {
-        throw [System.Exception]::new("New-CertificateCreationRequest: PFX: Export failure for $CertificateName", $_.Exception)
+        $pfxFile = Join-Path -Path $PfxTargetFolder -ChildPath "$($CertificateName).pfx"
+        $temporaryPfxFile = Join-Path -Path $PfxTargetFolder -ChildPath ".$($CertificateName).$([Guid]::NewGuid().ToString('N')).tmp"
+        Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Export path: $pfxFile"
+
+        # Preserve the previous explicit private-key exportability check. Capture and clear the
+        # probe because a PFX byte array contains sensitive private-key material.
+        $privateKeyProbe = $null
+        try {
+            $privateKeyProbe = $exportChain[0].Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Pfx)
+        }
+        catch {
+            throw [System.Exception]::new("New-CertificateCreationRequest: PFX: Private key is not exportable for certificate $CertificateName.", $_.Exception)
+        }
+        finally {
+            if ($null -ne $privateKeyProbe) {
+                [Array]::Clear($privateKeyProbe, 0, $privateKeyProbe.Length)
+            }
+        }
+
+        try {
+            # Export only certificates physically downloaded from the exact Key Vault secret.
+            # The ordered set contains the private-key leaf and intermediates, but not the root.
+            Export-PfxWithGroupProtection `
+                -Certificates $exportChain `
+                -ProtectTo $PfxProtectTo `
+                -PfxFile $temporaryPfxFile
+
+            # A Hybrid Worker may create a PFX protected to other domain SIDs without being
+            # authorized to decrypt it. Verify successful non-empty output without reopening it.
+            if (-not (Test-Path -LiteralPath $temporaryPfxFile -PathType Leaf)) {
+                throw [System.Exception]::new("PFX export did not create temporary file $temporaryPfxFile.")
+            }
+            $temporaryPfx = Get-Item -LiteralPath $temporaryPfxFile
+            if ($temporaryPfx.Length -le 0) {
+                throw [System.Exception]::new("PFX export created an empty temporary file $temporaryPfxFile.")
+            }
+
+            # The temporary file is created in the target directory so replacement stays on the
+            # same volume. An existing valid PFX remains untouched until export fully succeeds.
+            [System.IO.File]::Move($temporaryPfxFile, $pfxFile, $true)
+        }
+        catch {
+            throw [System.Exception]::new("New-CertificateCreationRequest: PFX: Export failure for $CertificateName.", $_.Exception)
+        }
+        finally {
+            # Move removes the temporary path on success; this handles every failure path.
+            Remove-Item -LiteralPath $temporaryPfxFile -Force -ErrorAction SilentlyContinue
+        }
+
+        if (-not (Test-Path -LiteralPath $pfxFile -PathType Leaf)) {
+            throw [System.Exception]::new("New-CertificateCreationRequest: PFX: Export did not create $pfxFile")
+        }
+
+        Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Certificate $CertificateName exported with $($exportChain.Count) leaf/intermediate chain member(s) to $pfxFile."
     }
     finally {
-        $x509Cert = $null
+        # Dispose every certificate imported from the Key Vault PKCS#12. This also releases the
+        # ephemeral private-key handle associated with the leaf certificate.
+        if ($null -ne $keyVaultCertificates) {
+            foreach ($certificate in $keyVaultCertificates) {
+                $certificate.Dispose()
+            }
+        }
     }
-
-    if (-not (Test-Path -Path $pfxFile)) {
-        throw [System.Exception]::new("New-CertificateCreationRequest: PFX: Export did not create $pfxFile")
-    }
-
-    Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Certificate $CertificateName exported to $pfxFile"
 }
 
 #endregion
