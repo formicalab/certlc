@@ -799,8 +799,9 @@ function Convert-PfxProtectToFromTag {
     It does not use Export-PfxCertificate cmdlet, but instead uses native interop helpers to create a protection descriptor and export the PFX file.
     The exported PFX file can be protected to multiple SIDs (users or groups).
 
-.PARAMETER Cert
-    The X509Certificate2 object representing the certificate to export.
+.PARAMETER Certificates
+    One or more X509Certificate2 objects to include in the exported PFX. The leaf certificate
+    carries the private key; issuer certificates contribute their public certificate material.
 
 .PARAMETER ProtectTo
     An array of strings representing the users or groups (in domain\user or UPN format) to protect the PFX file to.
@@ -811,13 +812,13 @@ function Convert-PfxProtectToFromTag {
 .EXAMPLE
     $protectTo = @("DOMAIN\User1", "DOMAIN\Group1")
     $pfxFile = "C:\path\to\output.pfx"
-    Export-PfxWithGroupProtection -Cert $cert -ProtectTo $protectTo -PfxFile $pfxFile
+    Export-PfxWithGroupProtection -Certificates @($cert) -ProtectTo $protectTo -PfxFile $pfxFile
 #>
 function Export-PfxWithGroupProtection {
     [CmdletBinding()]
     param (
         [Parameter(Mandatory = $true)]
-        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert,
+        [System.Security.Cryptography.X509Certificates.X509Certificate2[]]$Certificates,
 
         [Parameter(Mandatory = $true)]
         [string[]]$ProtectTo,
@@ -892,11 +893,14 @@ function Export-PfxWithGroupProtection {
 
         try {
 
-            # Add the cert to the memory store
-            if (-not [Win32Native]::CertAddCertificateContextToStore($store, $Cert.Handle, 3, [IntPtr]::Zero)) {
-                throw "Export-PfxWithGroupProtection: CertAddCertificateContextToStore failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+            # Add every selected chain member to one memory store. Only the leaf is expected
+            # to carry a private key; issuer certificates add their public material to the PFX.
+            foreach ($certificate in $Certificates) {
+                if (-not [Win32Native]::CertAddCertificateContextToStore($store, $certificate.Handle, 3, [IntPtr]::Zero)) {
+                    throw "Export-PfxWithGroupProtection: CertAddCertificateContextToStore failed for '$($certificate.Subject)': $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+                }
             }
-            Write-CertLCLog -Section 'Export-PfxWithGroupProtection' 'Certificate added to memory store.'
+            Write-CertLCLog -Section 'Export-PfxWithGroupProtection' -Message "$($Certificates.Count) certificate(s) added to memory store."
 
             # Wrap the handle in an IntPtr buffer
             $pvPara = [Runtime.InteropServices.Marshal]::AllocHGlobal([IntPtr]::Size)
@@ -1300,7 +1304,9 @@ function New-CertificateCreationRequest {
     }
 
     try {
-        Export-PfxWithGroupProtection -Cert $x509Cert -ProtectTo $PfxProtectTo -PfxFile $pfxFile
+        # Keep the current leaf-only behavior explicit until the creation path supplies
+        # the validated Key Vault chain in a later, separately reviewed change.
+        Export-PfxWithGroupProtection -Certificates @($x509Cert) -ProtectTo $PfxProtectTo -PfxFile $pfxFile
     }
     catch {
         throw [System.Exception]::new("New-CertificateCreationRequest: PFX: Export failure for $CertificateName", $_.Exception)
