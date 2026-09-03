@@ -855,6 +855,11 @@ function ConvertFrom-Base64Pkcs7 {
         $collection.Import($bytes)
     }
     catch {
+        # Import can partially populate the collection before failing. Dispose any certificate
+        # objects already created because this helper owns the collection until it returns.
+        foreach ($certificate in $collection) {
+            $certificate.Dispose()
+        }
         throw [System.Exception]::new("ConvertFrom-Base64Pkcs7: CA response could not be decoded as PKCS#7: $($_.Exception.Message)", $_.Exception)
     }
     finally {
@@ -1509,8 +1514,8 @@ function Find-TemplateName {
 
 .DESCRIPTION
     This function creates a new certificate request in Azure Key Vault and submits it to the specified Certificate Authority (CA) for issuance.
-    It prepares the necessary tags, handles existing in-progress requests, and uses the Certificate Enrollment API to submit the request.
-    The resulting certificate is then exported to a PFX file protected to the specified users/groups.
+    It prepares the necessary tags, handles existing in-progress requests, and uses the Certificate Enrollment API to retrieve and validate the complete certificate chain.
+    The complete chain is merged into Key Vault, and the resulting certificate is then exported to a PFX file protected to the specified users/groups.
 
 .PARAMETER VaultName
     The name of the Azure Key Vault where the certificate will be stored.
@@ -1635,9 +1640,11 @@ function New-CertificateCreationRequest {
     # CR_OUT_BASE64HEADER = 0x0,
     # CR_OUT_BASE64 = 0x1,
     # CR_OUT_BINARY = 0x2
+    # CR_OUT_CHAIN = 0x100
 
     Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "CA: Sending request to the CA $CA using template $($CertificateTemplateName) for certificate $CertificateName..."
-    $CertEncoded = $null
+    $CertRequest = $null
+    $pkcs7Response = $null
     try {
         $CertRequest = New-Object -ComObject CertificateAuthority.Request
         $CertRequestStatus = $CertRequest.Submit(0x1, $csr, "CertificateTemplate:$CertificateTemplateName", $CA)
@@ -1653,8 +1660,10 @@ function New-CertificateCreationRequest {
             }
             $CR_DISP_ISSUED {
                 Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "CA: Certificate Request for $CertificateName submitted successfully."
-                $CertEncoded = $CertRequest.GetCertificate(0x0)
-                Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "Certificate received from CA $CA"
+                # CR_OUT_BASE64HEADER | CR_OUT_CHAIN returns PKCS#7 containing the issued leaf
+                # and every issuer certificate through the self-issued root.
+                $pkcs7Response = $CertRequest.GetCertificate(0x100)
+                Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "Complete certificate chain received from CA $CA."
             }
             $CR_DISP_UNDER_SUBMISSION {
                 throw [System.Exception]::new("New-CertificateCreationRequest: CA: Request to $CA is pending. This runbook expects immediate issuance. Review template/CA configuration.")
@@ -1674,26 +1683,148 @@ function New-CertificateCreationRequest {
         }
     }
 
-    # we need to save the certificate in a temporary file because the Import-AzKeyVaultCertificate cmdlet does not accept a base64 string as input
-    $CertEncodedFile = New-TemporaryFile
-    Set-Content -Path $CertEncodedFile -Value $CertEncoded
-
-    # import the certificate into the key vault
-    Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "KeyVault: Importing the certificate $CertificateName into the key vault $VaultName..."
+    $caResponseCertificates = ConvertFrom-Base64Pkcs7 -Content $pkcs7Response
     try {
-        $newCert = Import-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -FilePath $CertEncodedFile
-        if ($null -eq $newCert) {
-            throw [System.Exception]::new('New-CertificateCreationRequest: KeyVault: Error importing certificate into the key vault: returned null result.')
+        # Validate the physical CA response before sending any certificate material to Key Vault.
+        # This rejects leaf-only, ambiguous, disconnected, and cryptographically invalid chains.
+        if ($caResponseCertificates.Count -lt 2) {
+            throw [System.Exception]::new("New-CertificateCreationRequest: CA returned PKCS#7 containing only $($caResponseCertificates.Count) certificate(s); the issuer chain is missing.")
+        }
+        $caChain = Get-OrderedCertificateChain -Certificates $caResponseCertificates -Source CaResponse
+        Assert-CertificateChain -Certificates $caChain
+
+        Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "CA: Validated $($caChain.Count) certificate(s) in the complete leaf-to-root chain for $CertificateName."
+        foreach ($certificate in $caChain) {
+            Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "CA chain member: subject '$($certificate.Subject)', issuer '$($certificate.Issuer)'."
+        }
+
+        # Reuse the Automation Account's managed-identity Az context and keep the Key Vault
+        # bearer token as a SecureString for the complete REST operation.
+        $keyVaultToken = $null
+        try {
+            $tokenResult = Get-AzAccessToken -ResourceTypeName KeyVault -AsSecureString
+            if ($null -eq $tokenResult -or $null -eq $tokenResult.Token) {
+                throw [System.Exception]::new('Get-AzAccessToken returned no secure token.')
+            }
+            $keyVaultToken = $tokenResult.Token
+        }
+        catch {
+            throw [System.Exception]::new("New-CertificateCreationRequest: KeyVault: Error acquiring a data-plane token for vault $VaultName.", $_.Exception)
+        }
+
+        try {
+            Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "KeyVault: Merging the complete certificate chain into pending certificate $CertificateName in vault $VaultName..."
+            $mergedCertificate = Merge-KeyVaultCertificateChain `
+                -VaultName $VaultName `
+                -CertificateName $CertificateName `
+                -Certificates $caChain `
+                -Token $keyVaultToken
+
+            # Treat the service-returned certificate ID as untrusted input. The version is used
+            # for an exact tag update, so it must belong to the expected vault and certificate.
+            try {
+                $certificateUri = [Uri][string]$mergedCertificate.id
+            }
+            catch {
+                throw [System.Exception]::new("New-CertificateCreationRequest: KeyVault returned an invalid certificate ID '$($mergedCertificate.id)'.", $_.Exception)
+            }
+            if (-not $certificateUri.IsAbsoluteUri -or
+                $certificateUri.Scheme -ine 'https' -or
+                $certificateUri.Host -ine "$VaultName.vault.azure.net" -or
+                -not $certificateUri.IsDefaultPort -or
+                -not [string]::IsNullOrEmpty($certificateUri.Query) -or
+                -not [string]::IsNullOrEmpty($certificateUri.Fragment)) {
+                throw [System.Exception]::new("New-CertificateCreationRequest: KeyVault returned an unexpected certificate ID '$($mergedCertificate.id)'.")
+            }
+
+            $certificatePath = @($certificateUri.AbsolutePath.Trim('/').Split('/'))
+            if ($certificatePath.Count -ne 3 -or
+                $certificatePath[0] -ine 'certificates' -or
+                [Uri]::UnescapeDataString($certificatePath[1]) -cne $CertificateName -or
+                [string]::IsNullOrWhiteSpace($certificatePath[2])) {
+                throw [System.Exception]::new("New-CertificateCreationRequest: KeyVault returned an unexpected certificate ID '$($mergedCertificate.id)'.")
+            }
+            $certificateVersion = $certificatePath[2]
+
+            # Key Vault replaces tags as one set. Start with tags returned by the merge, retain
+            # unrelated values, and overlay the current request's mandatory and optional tags.
+            $mergedTags = @{}
+            $mergedTagProperty = $mergedCertificate.PSObject.Properties['tags']
+            if ($null -ne $mergedTagProperty -and $null -ne $mergedTagProperty.Value) {
+                if ($mergedTagProperty.Value -is [System.Collections.IDictionary]) {
+                    foreach ($key in $mergedTagProperty.Value.Keys) {
+                        $mergedTags[$key] = [string]$mergedTagProperty.Value[$key]
+                    }
+                }
+                else {
+                    foreach ($property in $mergedTagProperty.Value.PSObject.Properties) {
+                        $mergedTags[$property.Name] = [string]$property.Value
+                    }
+                }
+            }
+
+            $tagUpdateRequired = $false
+            foreach ($tag in $tags.GetEnumerator()) {
+                if (-not $mergedTags.ContainsKey($tag.Key) -or $mergedTags[$tag.Key] -cne [string]$tag.Value) {
+                    $tagUpdateRequired = $true
+                }
+                $mergedTags[$tag.Key] = [string]$tag.Value
+            }
+
+            if ($tagUpdateRequired) {
+                Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "KeyVault: Updating request tags on certificate $CertificateName version $certificateVersion."
+                try {
+                    # Do not retry this state-changing update automatically. The merged tag set
+                    # makes a deliberate, exact-version replacement through the Az cmdlet.
+                    $taggedCertificate = Update-AzKeyVaultCertificate `
+                        -VaultName $VaultName `
+                        -Name $CertificateName `
+                        -Version $certificateVersion `
+                        -Tag $mergedTags `
+                        -PassThru
+                }
+                catch {
+                    throw [System.Exception]::new("New-CertificateCreationRequest: KeyVault: Error updating tags on certificate $CertificateName version $certificateVersion.", $_.Exception)
+                }
+
+                # Normalize the cmdlet response to a hashtable so verification is independent
+                # of the concrete dictionary type returned by the installed Az.KeyVault version.
+                $verifiedTags = @{}
+                if ($null -ne $taggedCertificate -and $null -ne $taggedCertificate.Tags) {
+                    foreach ($key in $taggedCertificate.Tags.Keys) {
+                        $verifiedTags[$key] = [string]$taggedCertificate.Tags[$key]
+                    }
+                }
+            }
+            else {
+                # The merge response represents the exact new version and already contains every
+                # requested tag, so no additional state-changing call is necessary.
+                $verifiedTags = $mergedTags
+            }
+
+            foreach ($tag in $tags.GetEnumerator()) {
+                if (-not $verifiedTags.ContainsKey($tag.Key) -or $verifiedTags[$tag.Key] -cne [string]$tag.Value) {
+                    throw [System.Exception]::new("New-CertificateCreationRequest: KeyVault certificate $CertificateName version $certificateVersion is missing expected tag '$($tag.Key)'.")
+                }
+            }
+
+            Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "KeyVault: Complete certificate chain merged and request tags verified for certificate $CertificateName version $certificateVersion in vault $VaultName."
+        }
+        finally {
+            # SecureString implements IDisposable. Release the token as soon as all Key Vault
+            # REST work for this step is complete.
+            if ($null -ne $keyVaultToken) {
+                $keyVaultToken.Dispose()
+            }
         }
     }
-    catch {
-        throw [System.Exception]::new("New-CertificateCreationRequest: KeyVault: Error importing certificate $CertificateName into key vault $VaultName", $_.Exception)
-    }
     finally {
-        # Always remove temporary file
-        Remove-Item -Path $CertEncodedFile -Force -ErrorAction SilentlyContinue
+        # The PKCS#7 decoder owns these certificate objects until this creation path finishes
+        # validating and merging them; dispose every member on both success and failure.
+        foreach ($certificate in $caResponseCertificates) {
+            $certificate.Dispose()
+        }
     }
-    Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "KeyVault: Certificate $CertificateName imported into the key vault $($VaultName)."
 
     # Create root folder if needed
     if (-not (Test-Path -Path $PfxRootFolder)) {
