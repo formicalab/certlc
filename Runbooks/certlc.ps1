@@ -1272,11 +1272,12 @@ function Get-KeyVaultCertificateSecretValue {
 
 <#
 .SYNOPSIS
-    Export a PFX certificate from Azure Key Vault, protecting it to specified SIDs.
+    Export a certificate collection to a PFX file protected to specified SIDs.
 
 .DESCRIPTION
-    This function exports a PFX certificate from Azure Key Vault, protecting it to specified SIDs.
+    This function exports selected certificates retrieved from Azure Key Vault to one PFX file protected to specified SIDs.
     It does not use Export-PfxCertificate cmdlet, but instead uses native interop helpers to create a protection descriptor and export the PFX file.
+    The collection contains the private-key leaf and its intermediate certificates, with the self-issued root excluded before this function is called.
     The exported PFX file can be protected to multiple SIDs (users or groups).
 
 .PARAMETER Certificates
@@ -1502,6 +1503,56 @@ function Find-TemplateName {
 
 #endregion
 
+#region ### Get-CaRequestDiagnostic ###
+
+###########################################
+# FUNCTIONS - Get-CaRequestDiagnostic     #
+###########################################
+
+<#
+.SYNOPSIS
+    Retrieve diagnostic details for an AD CS certificate request.
+
+.DESCRIPTION
+    Reads the request ID, CA disposition message, and last HRESULT from an
+    ICertRequest COM object. Each property is retrieved independently because
+    AD CS may leave individual diagnostics unavailable for some dispositions.
+
+.PARAMETER CertificateRequest
+    The CertificateAuthority.Request COM object after Submit has returned.
+
+.OUTPUTS
+    System.String containing the available CA request diagnostics.
+#>
+function Get-CaRequestDiagnostic {
+    [OutputType([string])]
+    param (
+        [Parameter(Mandatory = $true)]
+        [object]$CertificateRequest
+    )
+
+    $requestId = try { $CertificateRequest.GetRequestId() } catch { 'unavailable' }
+    $dispositionMessage = try { $CertificateRequest.GetDispositionMessage() } catch { 'unavailable' }
+    $lastStatus = try { $CertificateRequest.GetLastStatus() } catch { $null }
+
+    if ([string]::IsNullOrWhiteSpace([string]$dispositionMessage)) {
+        $dispositionMessage = 'unavailable'
+    }
+
+    # COM exposes HRESULT values as signed integers; normalize to eight-digit hexadecimal
+    # so the value can be looked up directly in AD CS and Windows error documentation.
+    $statusText = if ($null -eq $lastStatus) {
+        'unavailable'
+    }
+    else {
+        '0x{0:X8}' -f ([uint32]([int64]$lastStatus -band 0xFFFFFFFFL))
+    }
+
+    "Request ID: $requestId; CA message: $dispositionMessage; last status: $statusText"
+}
+
+#endregion
+
 #region ### New-CertificateCreationRequest ###
 
 ##############################################
@@ -1510,12 +1561,12 @@ function Find-TemplateName {
 
 <#
 .SYNOPSIS
-    Create a new certificate request in Azure Key Vault, submit it to the specified CA, export the issued certificate to a PFX file protected to specified users/groups.
+    Create a Key Vault certificate request, merge the complete CA chain, and export a root-excluded PFX protected to specified users/groups.
 
 .DESCRIPTION
     This function creates a new certificate request in Azure Key Vault and submits it to the specified Certificate Authority (CA) for issuance.
     It prepares the necessary tags, handles existing in-progress requests, and uses the Certificate Enrollment API to retrieve and validate the complete certificate chain.
-    The complete chain is merged into Key Vault, and the resulting certificate is then exported to a PFX file protected to the specified users/groups.
+    The complete leaf-to-root chain is merged into Key Vault. The exact merged secret version is verified and exported as a PFX containing the private-key leaf and all intermediates, while excluding the self-issued root.
 
 .PARAMETER VaultName
     The name of the Azure Key Vault where the certificate will be stored.
@@ -1656,7 +1707,8 @@ function New-CertificateCreationRequest {
 
         switch ($CertRequestStatus) {
             $CR_DISP_DENIED {
-                throw [System.Exception]::new("New-CertificateCreationRequest: CA: Request was denied. Check the CA $CA for details.")
+                $caDiagnostic = Get-CaRequestDiagnostic -CertificateRequest $CertRequest
+                throw [System.Exception]::new("New-CertificateCreationRequest: CA: Request was denied by $CA. $caDiagnostic")
             }
             $CR_DISP_ISSUED {
                 Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "CA: Certificate Request for $CertificateName submitted successfully."
@@ -1666,15 +1718,19 @@ function New-CertificateCreationRequest {
                 Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "Complete certificate chain received from CA $CA."
             }
             $CR_DISP_UNDER_SUBMISSION {
-                throw [System.Exception]::new("New-CertificateCreationRequest: CA: Request to $CA is pending. This runbook expects immediate issuance. Review template/CA configuration.")
+                $caDiagnostic = Get-CaRequestDiagnostic -CertificateRequest $CertRequest
+                throw [System.Exception]::new("New-CertificateCreationRequest: CA: Request to $CA is pending. This runbook expects immediate issuance. $caDiagnostic")
             }
             default {
-                throw [System.Exception]::new("New-CertificateCreationRequest: CA: Request to $CA failed with status $CertRequestStatus")
+                $caDiagnostic = Get-CaRequestDiagnostic -CertificateRequest $CertRequest
+                throw [System.Exception]::new("New-CertificateCreationRequest: CA: Request to $CA returned disposition $CertRequestStatus instead of issuing the certificate. $caDiagnostic")
             }
         }
     }
     catch {
-        throw [System.Exception]::new("New-CertificateCreationRequest: CA: Error submitting request to $CA", $_.Exception)
+        # Keep the CA diagnostic in the outer message because Automation logging may display
+        # Exception.Message without rendering the complete inner-exception chain.
+        throw [System.Exception]::new("New-CertificateCreationRequest: CA: Error submitting request to $CA. $($_.Exception.Message)", $_.Exception)
     }
     finally {
         if ($CertRequest) {
