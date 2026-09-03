@@ -1,17 +1,14 @@
 # Certificate Lifecycle Management (CertLC)
 
-An automated certificate lifecycle management solution for Azure environments that integrates Azure Key Vault with an on-premises Enterprise Certificate Authority (CA) to handle certificate creation, renewal, revocation, and monitoring.
+CertLC is an event-driven certificate lifecycle management solution that integrates Azure Key Vault with an on-premises Windows Enterprise Certificate Authority (CA) for certificate creation, renewal, revocation, and inventory collection.
 
-## Overview
-
-CertLC provides end-to-end automation for managing certificates stored in Azure Key Vault when the issuing authority is an on-premises Windows Enterprise CA. The solution uses an event-driven architecture to respond to certificate lifecycle events and execute the appropriate operations.
-
-### Key Features
+## Key Features
 
 - **Certificate Creation**: Automatically request and issue new certificates from the Enterprise CA based on queue messages
 - **Certificate Renewal**: Proactively renew certificates approaching expiration using Event Grid notifications
+- **Certificate Chain Preservation**: Store the complete CA chain in Key Vault and export the private-key leaf with its intermediate certificates in the protected PFX
 - **Certificate Revocation**: Revoke certificates on demand using the certificate thumbprint
-- **Statistics Collection**: Gather and store certificate metadata in Log Analytics for monitoring and reporting 
+- **Statistics Collection**: Gather and store certificate metadata in Log Analytics for monitoring and reporting
 
 ## Architecture
 
@@ -21,7 +18,7 @@ CertLC provides end-to-end automation for managing certificates stored in Azure 
 │  ┌────────────┐    ┌─────────────┐    ┌──────────────┐    ┌──────────────────┐  │
 │  │ Event Grid │───►│   Storage   │───►│ Function App │───►│ Automation       │  │
 │  │ (KeyVault  │    │   Queue     │    │ (PowerShell) │    │ Account          │  │
-│  │  events)   │    │             │    │              │    │ (Hybrid Worker)  │  │
+│  │  events)   │    │             │    │              │    │                  │  │
 │  └────────────┘    └─────────────┘    └──────────────┘    └────────┬─────────┘  │
 │                                                                     │           │
 │  ┌────────────┐                       ┌──────────────┐              │           │
@@ -35,35 +32,55 @@ CertLC provides end-to-end automation for managing certificates stored in Azure 
 │  └────────────┘    └─────────────┘                                              │
 └─────────────────────────────────────────────────────────────────────────────────┘
                                             │
-                                            │ Hybrid Worker
+                                            │ registered Hybrid Worker
                                             ▼
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │                              On-Premises                                        │
 │  ┌───────────────────────────────────┐                                          │
 │  │    Enterprise Certificate         │    Certificate enrollment, renewal,     │
-│  │    Authority (Windows CA)         │    and revocation via CEP/CES           │
+│  │    Authority (Windows CA)         │    and revocation via AD CS RPC         │
 │  └───────────────────────────────────┘                                          │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Architecture Highlights
+### Components and Responsibilities
 
-- **Event-Driven Processing**: Event Grid captures Key Vault certificate events (e.g., near-expiry) and routes them to a Storage Queue
-- **Serverless Compute**: Azure Function App (Flex Consumption) processes queue messages and triggers Automation runbooks
-- **Hybrid Execution**: Automation Account with Hybrid Worker enables secure communication with on-premises Enterprise CA
-- **Private Networking**: All Azure PaaS resources are secured with private endpoints
-- **Managed Identities**: No stored credentials - all Azure-to-Azure authentication uses system-assigned managed identities
-- **Observability**: Application Insights for function monitoring, Log Analytics for certificate statistics and audit logs
+| Component | Responsibility |
+|-----------|----------------|
+| Event Grid and Storage Queue | Event Grid sends Key Vault near-expiry events to the queue; external callers place custom creation and revocation requests on the same queue |
+| Function App (`CertLCBridge`) | Serialize each queue message and start the configured Automation runbook directly with `Start-AzAutomationRunbook`; includes `OutboundTester` for connectivity checks |
+| Automation Account | Host `certlc.ps1` for creation, renewal, and revocation, `certlcstats.ps1` for inventory collection, and an hourly statistics schedule that is created but not linked by default |
+| Hybrid Worker | Run the PowerShell 7.6 runbooks with network access to Azure private endpoints, Active Directory, the Enterprise CA, and the PFX file location |
+| Enterprise CA | Issue complete certificate chains and process enrollment and revocation requests through AD CS RPC/DCOM interfaces |
+| Key Vault | Hold versioned certificates, private keys, complete certificate chains, and lifecycle tags |
+| Log Analytics and Application Insights | Store latest-version certificate inventory and operational telemetry; the workbook shows expiration status/details, runbook job status, and per-job logs |
+
+Azure-to-Azure calls use managed identities. Storage, Function App, Automation Account, and Key Vault data-plane access is private; the Hybrid Worker provides the boundary between Azure automation and the on-premises CA. Azure Monitor ingestion endpoints remain public and require controlled outbound access.
+
+The Bicep deployment creates a custom PowerShell 7.6 Automation runtime named `certlc-PowerShell-7-6`, with the `Az` and `Azure CLI` modules loaded as default packages for both runbooks.
 
 ## How It Works
+
+### Certificate Chain Contract
+
+For creation and renewal, CertLC requests the complete PKCS#7 response from AD CS and requires one unambiguous, cryptographically valid chain with at least one intermediate CA:
+
+```text
+leaf certificate -> intermediate CA certificate(s) -> self-issued root CA certificate
+```
+
+The runbook merges that complete leaf-to-root sequence into the pending Key Vault certificate operation. It then downloads the exact secret version returned by the merge, verifies that Key Vault persisted the same certificates, and uses that verified copy for export. A latest-version race or a merge that loses part of the chain therefore causes the operation to fail instead of being reported as successful.
+
+The exported, SID-protected PFX contains the private-key leaf and every intermediate CA certificate, but excludes the self-issued root. CertLC's chain selection follows the TLS certificate-list convention in [RFC 8446, Section 4.4.2](https://www.rfc-editor.org/rfc/rfc8446.html#section-4.4.2): the sender's certificate is first, each following certificate should certify the preceding certificate, and a trust anchor may be omitted because peers receive trust anchors independently. [RFC 5280, Sections 6 and 6.1](https://www.rfc-editor.org/rfc/rfc5280.html#section-6) defines certification-path validation and states that a self-signed certificate supplied as the trust anchor is not part of the prospective certification path. Therefore, CertLC preserves the root in Key Vault as part of the CA response but does not distribute it as part of the deployable PFX; target systems must trust the root through their normal trust-store administration.
 
 ### Certificate Creation Flow
 
 1. An external system or utility script sends a certificate request message to the Storage Queue
-2. The Function App receives the message and triggers the `certlc` runbook via webhook
+2. The Function App receives the message, authenticates with its managed identity, and starts the `certlc` runbook directly on the configured Hybrid Worker group
 3. The runbook executes on the Hybrid Worker with access to the Enterprise CA
-4. A certificate signing request (CSR) is submitted to the CA using CEP/CES protocols
-5. The issued certificate is imported into Azure Key Vault
+4. Before creating a CSR, the runbook verifies that it is running as Local System or a local administrator, resolves every `PfxProtectTo` principal to a SID, prepares the host-specific export folder and ACL, and proves write/delete access with a temporary probe
+5. A certificate signing request (CSR) is submitted with the AD CS `ICertRequest` COM interface over RPC/DCOM
+6. The runbook applies the [certificate chain contract](#certificate-chain-contract): validate the CA response, merge and verify the complete chain in Key Vault, then revalidate the export prerequisites and export the root-excluded PFX
 
 ### Certificate Renewal Flow
 
@@ -71,28 +88,48 @@ CertLC provides end-to-end automation for managing certificates stored in Azure 
 2. Event Grid captures the event and delivers it to the Storage Queue
 3. The Function App triggers the renewal process through the Automation runbook
 4. The Hybrid Worker requests a renewed certificate from the Enterprise CA. The new version is tagged with `RenewedJobId=<automation-job-id>` for traceability back to the renewal job
-5. The renewed certificate replaces the expiring one in Key Vault
+5. The runbook applies the [certificate chain contract](#certificate-chain-contract) and stores the renewal as a new Key Vault version without deleting the expiring version
 6. **Revoked-latest short-circuit**: if the latest version of the certificate carries `Revoked=true`, the renewal branch logs a warning and exits without contacting the CA. Auto-renewal resumes only after an operator either issues a new version explicitly or clears the `Revoked` tag
 
 ### Certificate Revocation Flow
 
 1. A revocation request with a certificate thumbprint (any version, current or older) is sent to the Storage Queue
 2. The Function App triggers the `certlc` runbook
-3. The runbook locates the matching Key Vault version by thumbprint (LDAP-safe lookup, then a direct REST GET of the version metadata to read its `x5t`)
-4. **Idempotency guard**: if the version already carries `Revoked=true`, the runbook fails fast with an `ALREADY REVOKED` log line that includes the previous `RevokedAt`, `RevocationReason`, and `RevokedJobId`. The CA is not called again and existing tags are preserved
+3. The runbook locates the matching Key Vault version by thumbprint using paginated Key Vault REST requests: it checks each certificate name's latest-version `x5t` first, then enumerates older versions when needed
+4. **Idempotency guard**: if the version already carries `Revoked=true`, the runbook logs `ALREADY REVOKED` with the previous `RevokedAt`, `RevocationReason`, and `RevokedJobId`, then completes successfully so the duplicate queue message is acknowledged. The CA is not called again, no duplicate notification is sent, and existing tags are preserved
 5. Otherwise, the runbook extracts the version's serial number and submits a revocation request to the CA for that serial
 6. The matching Key Vault version is set to `enabled = false` and tagged with audit metadata (`Revoked=true`, `RevokedAt`, `RevocationReason`, `RevokedJobId`). Existing tags on the version (e.g. `NotifyTo`, `Hostname`, `PfxProtectTo`) are preserved. **No Key Vault objects are deleted by the runbook**; other versions of the same certificate are left untouched, and the certificate object remains in the vault for audit
+
+### Key Vault Certificate Tags
+
+CertLC stores the following tags on individual Key Vault certificate versions. Creation and renewal write a new version's operational tags; revocation starts with the selected version's existing tags and overlays its audit tags so unrelated metadata is preserved.
+
+| Tag | Written by | Required and format | Purpose and consumers |
+|-----|------------|---------------------|-----------------------|
+| `CertificateTemplateName` | Creation and renewal | Required. Internal AD CS certificate template name, not its display name or OID | Records the issuing template and supplies the `Template` field collected by `certlcstats` |
+| `Hostname` | Creation and renewal | Required. Lowercase hostname validated by the creation dispatcher | Selects the host-specific folder below the configured PFX root during renewal and export |
+| `PfxProtectTo` | Creation and renewal | Required. Normalized, deduplicated domain principals or UPNs serialized as one semicolon-delimited string | Reconstructs the principal list used for SID-protected PFX export and target-folder ACLs during renewal |
+| `NotifyTo` | Creation and renewal | Optional. Email addresses serialized as one semicolon-delimited string | Supplies recipients to lifecycle notification paths when SMTP is configured; revocation reads the tag from the specifically matched version |
+| `RenewedJobId` | Renewal only | Present when the Automation job ID is available | Correlates a renewed certificate version with the Automation job that created it |
+| `Revoked` | Revocation only | Required on a revoked version; literal string `true` | Prevents duplicate revocation and stops automatic renewal while the revoked version remains latest |
+| `RevokedAt` | Revocation only | Required on a revoked version; UTC timestamp in `yyyy-MM-ddTHH:mm:ssZ` format | Records when CertLC completed the revocation |
+| `RevocationReason` | Revocation only | Required on a revoked version; decimal string from `0` through `6` | Records the AD CS revocation reason code and is included in duplicate-revocation diagnostics |
+| `RevokedJobId` | Revocation only | Present when the Automation job ID is available | Correlates the revocation with the Automation job and is included in duplicate-revocation diagnostics |
 
 ### Statistics Collection
 
 1. The `certlcstats` runbook runs on a schedule (hourly by default, disabled until manually linked)
-2. It enumerates all certificates in Key Vault and collects metadata
+2. It enumerates certificate names in Key Vault and collects metadata from the latest version of each name
 3. Certificate data is published to a custom Log Analytics table via Data Collection Rule
-4. Azure Monitor Workbooks can visualize certificate inventory and expiration timelines
+4. The Azure Monitor workbook shows certificate expiration status and details, runbook job status, and logs for selected jobs
 
 ### Resilience
 
-Idempotent Key Vault and LDAP reads (certificate-version listing, version metadata GET, AD template discovery) are wrapped in an exponential-backoff retry helper that recovers from transient HTTP 408/429/5xx, `Retry-After` throttling, and common network exceptions. Mutating calls (CA enrollment / revocation, tag writes) are **not** retried automatically — they are surfaced to the operator to avoid duplicate side-effects.
+The runbook's Key Vault REST reads for thumbprint discovery and exact secret retrieval, plus its LDAP template lookup, use a retry helper with up to four total attempts. It retries HTTP 408, 429, 500, 502, 503, and 504 responses and selected network, timeout, I/O, web, and COM exceptions. `Retry-After` takes precedence over exponential backoff with jitter, and delays are capped at 30 seconds. State-changing certificate creation/merge/update calls and CA enrollment/revocation calls are not passed through this retry helper, avoiding automatic duplicate side effects.
+
+The Function bridge acknowledges a queue message only when the Automation job reaches `Completed`. `Failed`, `Stopped`, `Suspended`, and `Blocked` fail the Function invocation so queue retry and poison-message handling remain active. Transitional states are polled for up to `RunbookPollingTimeoutMinutes` (25 minutes in the Bicep deployment); an unknown state or elapsed deadline fails closed. Automation output retrieval is best-effort and cannot turn an otherwise completed lifecycle operation into a duplicate queue retry.
+
+Queue-trigger retries are bounded by [host.json](Functions/CertLCBridge/host.json): CertLC currently uses `maxDequeueCount: 5` and `visibilityTimeout: 00:00:30`, so a failed message is processed at most five times with a 30-second delay between unsuccessful attempts. Every attempt starts a separate Automation job. After the fifth failure, the Functions host moves the message from `certlc` to `certlc-poison`; it is not retried again unless an operator resubmits it. These settings can be changed in `host.json` and redeployed, or overridden per environment with the Function App settings `AzureFunctionsJobHost__extensions__queues__maxDequeueCount` and `AzureFunctionsJobHost__extensions__queues__visibilityTimeout`.
 
 ## Repository Structure
 
@@ -118,32 +155,26 @@ CertLC/
 │   ├── certlc.workbook         # Certificate statistics dashboard
 │   └── *.kql                   # KQL queries for visualizations
 ├── Utilities/                  # Helper scripts
+│   ├── Export-PfxWithGroupProtection.ps1 # Export a Key Vault certificate as a SID-protected PFX
+│   ├── Extract-KeyCer.ps1      # Extract a certificate and private key from a PFX
+│   ├── Extract-KeyCerChain.ps1 # Extract every certificate, a full-chain bundle, and the leaf private key
 │   ├── testnewcert.ps1         # Test certificate creation
+│   ├── testnewcertchain.ps1    # Validate full-chain creation and PFX export
 │   ├── testrenewcert.ps1       # Test certificate renewal
 │   └── testrevocationcert.ps1  # Test certificate revocation
 └── Tests/                      # Development and testing scripts
 ```
 
-## Components
-
-### Azure Function App (CertLCBridge)
-
-PowerShell-based Azure Function that bridges the Storage Queue with the Automation Account:
-- **QueueHandler**: Triggered by queue messages, parses the request payload, and invokes the appropriate Automation runbook
-- **OutboundTester**: HTTP-triggered function for testing network connectivity from the Function App
-
-### Automation Runbooks
-
-- **certlc.ps1**: Main runbook handling certificate creation, renewal, and revocation operations. Executes on Hybrid Workers with CA access.
-- **certlcstats.ps1**: Scheduled runbook that collects certificate metadata from Key Vault and publishes to Log Analytics.
-
-Both runbooks run on a custom **PowerShell 7.6** runtime environment (default name `certlc-PowerShell-7-6`) created on the Automation Account by the Bicep template, with the `Az` and `Azure CLI` modules preloaded as default packages.
-
-### Certificate Request Schema
+## Certificate Request Schema
 
 Requests are sent as JSON messages to the Storage Queue using CloudEventSchema. The schema varies by operation type:
 
+The runbook validates `specversion` (`1.0`) and `type`, and logs `id` when supplied. It consumes the operation-specific fields identified below. Other envelope and `data` fields shown in the examples are retained for CloudEvent/Event Grid compatibility but are not read by the current dispatcher.
+
 **Creation Request:**
+
+Consumed `data` fields: `VaultName`, `ObjectName`, `CertificateTemplate`, `CertificateSubject`, `CertificateDnsNames` (optional array), `Hostname`, `PfxProtectTo`, and `NotifyTo` (optional array). `CertificateTemplate` may be the template's internal name, display name, or OID; the runbook resolves and stores the internal name.
+
 ```json
 {
   "id": "<event identifier, free field>",
@@ -157,7 +188,7 @@ Requests are sent as JSON messages to the Storage Queue using CloudEventSchema. 
     "VaultName": "<key vault name>",
     "ObjectType": "Certificate",
     "ObjectName": "<name of the new certificate>",
-    "CertificateTemplate": "<certificate template name>",
+    "CertificateTemplate": "<certificate template internal name, display name, or OID>",
     "CertificateSubject": "<certificate subject>",
     "CertificateDnsNames": [ "<dns name 1>", "<dns name 2>" ],
     "Hostname": "<hostname - used as folder name for exported PFX>",
@@ -168,6 +199,9 @@ Requests are sent as JSON messages to the Storage Queue using CloudEventSchema. 
 ```
 
 **Renewal Request** (from Event Grid CertificateNearExpiry event):
+
+Consumed `data` fields: `VaultName` and `ObjectName`. The dispatcher deliberately reads the latest Key Vault version for that name and reconstructs the subject, SANs, template, export hostname, protection principals, and notification recipients from the certificate and its tags; the event's `Version`, `NBF`, and `EXP` values are not used.
+
 ```json
 {
   "id": "<event identifier>",
@@ -189,6 +223,9 @@ Requests are sent as JSON messages to the Storage Queue using CloudEventSchema. 
 ```
 
 **Revocation Request:**
+
+Consumed `data` fields: `VaultName`, `CertificateThumbprint`, and `RevocationReason`. The reason must parse as an integer from `0` through `6`.
+
 ```json
 {
   "id": "<event identifier, free field>",
@@ -207,14 +244,14 @@ Requests are sent as JSON messages to the Storage Queue using CloudEventSchema. 
 }
 ```
 
-> **Note:** For revocation reasons, see [ICertAdmin::RevokeCertificate](https://learn.microsoft.com/en-us/windows/win32/api/certadm/nf-certadm-icertadmin-revokecertificate) for possible values.
+> **Note:** For the meaning of the accepted `0` through `6` revocation reasons, see [ICertAdmin::RevokeCertificate](https://learn.microsoft.com/en-us/windows/win32/api/certadm/nf-certadm-icertadmin-revokecertificate).
 
 ## Security Considerations
 
-- **No Stored Secrets**: All Azure service authentication uses managed identities
-- **Private Endpoints**: All PaaS resources are isolated from public internet
+- **Managed Identities**: Azure service authentication does not use stored service credentials
+- **Private Endpoints**: Storage, Function App, Automation Account, and Key Vault data-plane access uses private endpoints; Azure Monitor ingestion remains public
 - **RBAC Authorization**: Key Vault uses Azure RBAC (not access policies) with least-privilege assignments
-- **Encrypted Variables**: Sensitive automation variables (SMTP credentials) are stored encrypted
+- **Encrypted Variables**: Non-Azure secrets required by the runbooks, such as SMTP credentials, are stored as encrypted Automation variables
 - **Audit Logging**: Diagnostic settings enabled on Key Vault and Automation Account
 
 ## Getting Started

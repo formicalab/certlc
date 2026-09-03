@@ -430,6 +430,8 @@ resource functionApp 'Microsoft.Web/sites@2025-03-01' = {
       HybridWorkerGroupName: hybridWorkerGroupName
       RunbookName: runbookName
       ResourceGroupName: resourceGroup().name
+      // End polling before the Function host's normal execution window while allowing typical certificate operations to finish.
+      RunbookPollingTimeoutMinutes: '25'
       AzureWebJobsStorage__credential: 'managedidentity'
       AzureWebJobsStorage__blobServiceUri: storageAccount.properties.primaryEndpoints.blob
       AzureWebJobsStorage__queueServiceUri: storageAccount.properties.primaryEndpoints.queue

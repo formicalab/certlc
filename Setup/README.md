@@ -295,6 +295,19 @@ The Bicep template creates and configures the following Azure resources:
   - Retry policy: 30 attempts over 1 day (1440 minutes)
   - **Dead-letter destination**: failed deliveries are written to the `eventgrid-deadletter` blob container on the Storage Account (using the system topic's managed identity)
 
+#### Function Queue Retry and Poison Handling
+
+Event Grid delivery retries end once an event reaches the `certlc` queue. From that point, the Function queue trigger owns retry behavior. The deployed [host.json](../Functions/CertLCBridge/host.json) allows five processing attempts (`maxDequeueCount: 5`) with a 30-second delay between unsuccessful Function invocations (`visibilityTimeout: 00:00:30`). Each attempt starts a separate Automation job. After the fifth failure, the Functions host moves the message to the automatically named `certlc-poison` queue and stops retrying it.
+
+Change these defaults in `host.json` before publishing the Function, or override them per environment with Function App settings:
+
+| App setting | Purpose | Current default |
+|---|---|---|
+| `AzureFunctionsJobHost__extensions__queues__maxDequeueCount` | Maximum total processing attempts before poison-queue transfer | `5` |
+| `AzureFunctionsJobHost__extensions__queues__visibilityTimeout` | Delay after a failed invocation before the next attempt | `00:00:30` |
+
+Changing a Function App setting restarts the app. The `certlc-poison` queue is distinct from the `eventgrid-deadletter` blob container: the queue contains events that reached the Function but repeatedly failed processing, while the blob container contains events that Event Grid could not deliver to Storage Queue.
+
 ### Networking
 
 #### 14. **Private Endpoints** (6 total)
@@ -436,7 +449,7 @@ The solution follows a secure-by-default architecture:
 - Role-based access control (RBAC) follows the principle of least privilege
 - Automation Account variables for sensitive data are encrypted
 - Key Vault uses RBAC authorization and soft delete protection
-- The runbook never deletes certificates from Key Vault: revocations are recorded by disabling the specific version and tagging it (`Revoked=true`, `RevokedAt`, `RevocationReason`, `RevokedJobId`). Renewed versions are likewise tagged with `RenewedJobId` for traceability. A duplicate revocation against an already-revoked version is rejected up-front with an `ALREADY REVOKED` error and the previous audit tags are preserved. Vault soft-delete / purge-protection settings still apply to operator actions performed outside the runbook
+- The runbook never deletes certificates from Key Vault: revocations are recorded by disabling the specific version and tagging it (`Revoked=true`, `RevokedAt`, `RevocationReason`, `RevokedJobId`). Renewed versions are likewise tagged with `RenewedJobId` for traceability. A duplicate revocation against an already-revoked version logs `ALREADY REVOKED`, preserves the previous audit tags, and completes successfully without calling the CA or sending another notification. Genuine revocation failures use the configured SMTP transport when the matched certificate version has `NotifyTo` recipients. Vault soft-delete / purge-protection settings still apply to operator actions performed outside the runbook
 - Diagnostic settings enabled on critical resources (Automation Account, Key Vault) for audit logging
 
 ## Files

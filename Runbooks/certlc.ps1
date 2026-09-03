@@ -664,7 +664,10 @@ function Format-PfxProtectTo {
         [Parameter()] [object] $InputValue
     )
 
-    if (-not $InputValue) { return @() }
+    if (-not $InputValue) {
+        Write-Output -NoEnumerate @()
+        return
+    }
 
     # Wrap single string
     if ($InputValue -isnot [System.Array]) {
@@ -688,8 +691,9 @@ function Format-PfxProtectTo {
     $out = foreach ($n in $normalized) {
         if ($seen.Add($n)) { $n }
     }
-    # Force array output even when single element to keep downstream .Count usage safe under StrictMode
-    return @($out)
+    # PowerShell enumerates arrays written by return, collapsing zero items to $null and one item
+    # to a scalar. Suppress enumeration so callers always receive the documented array type.
+    Write-Output -NoEnumerate @($out)
 }
 
 #endregion
@@ -775,11 +779,673 @@ function Convert-PfxProtectToFromTag {
         [string] $TagValue
     )
 
-    if ([string]::IsNullOrWhiteSpace($TagValue)) { return @() }
+    if ([string]::IsNullOrWhiteSpace($TagValue)) {
+        Write-Output -NoEnumerate @()
+        return
+    }
 
     # Parse then normalize to keep parity with input handling
-    $raw = $TagValue.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
-    return Format-PfxProtectTo -InputValue $raw
+    $raw = @($TagValue.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+    $normalized = Format-PfxProtectTo -InputValue $raw
+    Write-Output -NoEnumerate @($normalized)
+}
+
+#endregion
+
+#region ### Initialize-PfxExportTarget ###
+
+############################################
+# FUNCTIONS - Initialize-PfxExportTarget   #
+############################################
+
+<#
+.SYNOPSIS
+    Prepare and validate the filesystem and principals required for PFX export.
+
+.DESCRIPTION
+    Resolves every protection principal to a SID, creates the host-specific target directory,
+    applies its final ACL, and verifies write/delete access with a temporary probe file.
+    Call this before certificate issuance so invalid export prerequisites fail without creating
+    irreversible CA or Key Vault state.
+
+.PARAMETER PfxRootFolder
+    Root directory below which host-specific PFX directories are created.
+
+.PARAMETER Hostname
+    Single safe path segment used as the host-specific directory name.
+
+.PARAMETER ProtectTo
+    Domain users or groups that receive ReadAndExecute access and can decrypt the PFX.
+
+.OUTPUTS
+    PSCustomObject containing TargetFolder and the resolved ProtectionSids.
+#>
+function Initialize-PfxExportTarget {
+    [OutputType([pscustomobject])]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$PfxRootFolder,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Hostname,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string[]]$ProtectTo
+    )
+
+    # SID-protected PKCS#12 export and NTFS ACLs depend on Windows cryptography and security APIs.
+    if (-not $IsWindows) {
+        throw [System.PlatformNotSupportedException]::new('Initialize-PfxExportTarget: SID-protected PFX export requires a Windows Hybrid Worker.')
+    }
+
+    # The final ACL grants write access only to Local System and local Administrators. Verify
+    # the worker token belongs to one of those identities before changing any directory ACL.
+    $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    try {
+        $workerIdentityName = $currentIdentity.Name
+        $currentPrincipal = [System.Security.Principal.WindowsPrincipal]::new($currentIdentity)
+        $workerCanApplyAcl = $currentIdentity.IsSystem -or
+            $currentPrincipal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+    finally {
+        # WindowsIdentity owns a native token handle; release it before filesystem work begins.
+        $currentIdentity.Dispose()
+    }
+    if (-not $workerCanApplyAcl) {
+        throw [System.Security.SecurityException]::new("Initialize-PfxExportTarget: Worker identity '$workerIdentityName' must run as Local System or a local administrator to apply the PFX directory ACL.")
+    }
+
+    # Keep the direct function-call contract as strict as the dispatcher so Hostname cannot
+    # introduce rooted paths, traversal segments, wildcard expansion, or alternate separators.
+    if ($Hostname -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9\-\.]{0,253})$') {
+        throw [System.ArgumentException]::new("Initialize-PfxExportTarget: Hostname '$Hostname' is not a safe directory name.", 'Hostname')
+    }
+
+    try {
+        # Canonicalize both paths and require the target to remain an immediate child of the
+        # configured root before creating either directory.
+        $rootPath = [System.IO.Path]::GetFullPath($PfxRootFolder)
+        $targetPath = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($rootPath, $Hostname))
+        $rootPrefix = $rootPath.TrimEnd(
+            [System.IO.Path]::DirectorySeparatorChar,
+            [System.IO.Path]::AltDirectorySeparatorChar
+        ) + [System.IO.Path]::DirectorySeparatorChar
+        if (-not $targetPath.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw [System.ArgumentException]::new("Target path '$targetPath' is outside PFX root '$rootPath'.")
+        }
+
+        # Directory.CreateDirectory is idempotent and treats wildcard characters literally,
+        # which is safer here than provider wildcard expansion through New-Item.
+        $null = [System.IO.Directory]::CreateDirectory($rootPath)
+        $null = [System.IO.Directory]::CreateDirectory($targetPath)
+    }
+    catch {
+        throw [System.Exception]::new("Initialize-PfxExportTarget: Cannot prepare PFX directory for host '$Hostname' below '$PfxRootFolder'.", $_.Exception)
+    }
+
+    # Resolve every requested identity before any certificate request is created. The returned
+    # SID objects are reused by ACL construction and native PFX protection to avoid late lookup.
+    $protectionSids = [System.Collections.Generic.List[System.Security.Principal.SecurityIdentifier]]::new()
+    foreach ($principal in $ProtectTo) {
+        try {
+            $sid = ([System.Security.Principal.NTAccount]$principal).Translate(
+                [System.Security.Principal.SecurityIdentifier]
+            )
+            $protectionSids.Add($sid)
+        }
+        catch {
+            throw [System.Exception]::new("Initialize-PfxExportTarget: Cannot resolve PfxProtectTo principal '$principal' to a Windows SID.", $_.Exception)
+        }
+    }
+
+    try {
+        # Build the complete ACL in memory and apply it once so the target never observes a
+        # partially assembled permission set.
+        $acl = Get-Acl -LiteralPath $targetPath
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($rule in @($acl.Access)) {
+            $null = $acl.RemoveAccessRule($rule)
+        }
+
+        $inheritFlags = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+        $propagationFlags = [System.Security.AccessControl.PropagationFlags]::None
+        $fullControlSids = @(
+            [System.Security.Principal.SecurityIdentifier]::new([System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null),
+            [System.Security.Principal.SecurityIdentifier]::new([System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+        )
+        foreach ($sid in $fullControlSids) {
+            $accessRule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+                $sid, 'FullControl', $inheritFlags, $propagationFlags, 'Allow'
+            )
+            $acl.AddAccessRule($accessRule)
+        }
+        foreach ($sid in $protectionSids) {
+            $accessRule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+                $sid, 'ReadAndExecute', $inheritFlags, $propagationFlags, 'Allow'
+            )
+            $acl.AddAccessRule($accessRule)
+        }
+        Set-Acl -LiteralPath $targetPath -AclObject $acl
+
+        # DeleteOnClose validates create, write, flush, close, and delete rights without leaving
+        # reusable probe data in the certificate export directory.
+        $probePath = [System.IO.Path]::Combine($targetPath, ".certlc-preflight-$([Guid]::NewGuid().ToString('N')).tmp")
+        $probeStream = [System.IO.FileStream]::new(
+            $probePath,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None,
+            4096,
+            [System.IO.FileOptions]::DeleteOnClose
+        )
+        try {
+            $probeStream.WriteByte(0)
+            $probeStream.Flush($true)
+        }
+        finally {
+            $probeStream.Dispose()
+        }
+        if ([System.IO.File]::Exists($probePath)) {
+            throw [System.IO.IOException]::new("Preflight probe file '$probePath' was not deleted on close.")
+        }
+    }
+    catch {
+        throw [System.Exception]::new("Initialize-PfxExportTarget: PFX directory '$targetPath' cannot accept the required ACL and file operations.", $_.Exception)
+    }
+
+    # This function returns a data object to its caller. Route its log away from the success
+    # stream so assignment captures only the object below, not a mixed log-and-result array.
+    Write-CertLCLog -Section 'Initialize-PfxExportTarget' -Message "PFX: Export prerequisites validated for target folder $targetPath and $($protectionSids.Count) protection principal(s)." | Write-Information -InformationAction Continue
+    return [pscustomobject]@{
+        TargetFolder   = $targetPath
+        ProtectionSids = $protectionSids.ToArray()
+    }
+}
+
+#endregion
+
+#region ### Certificate chain helpers ###
+
+#########################################
+# FUNCTIONS - Certificate chain helpers #
+#########################################
+
+<#
+.SYNOPSIS
+    Compare two X.500 distinguished names by their encoded values.
+
+.DESCRIPTION
+    Certificate subject and issuer strings can use different formatting while representing
+    the same distinguished name. Comparing RawData avoids formatting-dependent mismatches.
+
+.PARAMETER Left
+    The first distinguished name to compare.
+
+.PARAMETER Right
+    The second distinguished name to compare.
+#>
+function Test-DistinguishedNameEqual {
+    [OutputType([bool])]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Security.Cryptography.X509Certificates.X500DistinguishedName]$Left,
+
+        [Parameter(Mandatory = $true)]
+        [System.Security.Cryptography.X509Certificates.X500DistinguishedName]$Right
+    )
+
+    return [Convert]::ToBase64String($Left.RawData) -ceq [Convert]::ToBase64String($Right.RawData)
+}
+
+<#
+.SYNOPSIS
+    Decode a Base64 PKCS#7 certificate response.
+
+.DESCRIPTION
+    Removes optional PEM headers and whitespace, decodes the PKCS#7 payload, and imports all
+    certificates into one X509Certificate2Collection. Temporary decoded bytes are cleared.
+
+.PARAMETER Content
+    Base64 or PEM-formatted PKCS#7 certificate content returned by AD CS.
+
+.OUTPUTS
+    System.Security.Cryptography.X509Certificates.X509Certificate2Collection
+#>
+function ConvertFrom-Base64Pkcs7 {
+    [OutputType([System.Security.Cryptography.X509Certificates.X509Certificate2Collection])]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Content
+    )
+
+    # AD CS can return either plain Base64 or Base64 with PEM boundary lines.
+    $base64 = $Content -replace '(?m)^-----[^\r\n]+-----\s*$', '' -replace '\s', ''
+    try {
+        $bytes = [Convert]::FromBase64String($base64)
+    }
+    catch {
+        throw [System.Exception]::new("ConvertFrom-Base64Pkcs7: CA response is not valid Base64 PKCS#7: $($_.Exception.Message)", $_.Exception)
+    }
+
+    $collection = [System.Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
+    try {
+        $collection.Import($bytes)
+    }
+    catch {
+        # Import can partially populate the collection before failing. Dispose any certificate
+        # objects already created because this helper owns the collection until it returns.
+        foreach ($certificate in $collection) {
+            $certificate.Dispose()
+        }
+        throw [System.Exception]::new("ConvertFrom-Base64Pkcs7: CA response could not be decoded as PKCS#7: $($_.Exception.Message)", $_.Exception)
+    }
+    finally {
+        # Certificate bytes are public material, but clearing transient buffers keeps cleanup
+        # consistent with the later PKCS#12 path, which also carries private-key material.
+        [Array]::Clear($bytes, 0, $bytes.Length)
+    }
+
+    # PowerShell normally enumerates collections on output. Preserve the collection object so
+    # strict-mode callers can reliably use .Count even when a response contains one certificate.
+    Write-Output -NoEnumerate $collection
+}
+
+<#
+.SYNOPSIS
+    Order a certificate collection from leaf to self-issued root.
+
+.DESCRIPTION
+    Selects exactly one leaf, follows encoded issuer-to-subject relationships, and rejects
+    ambiguous issuers, unrelated certificates, or a chain without a self-issued root.
+
+.PARAMETER Certificates
+    The certificate collection to order.
+
+.PARAMETER Source
+    Identifies whether the collection came from AD CS or a Key Vault PKCS#12 secret. AD CS
+    leaf selection uses Basic Constraints; Key Vault leaf selection uses the private key.
+
+.PARAMETER ExcludeRoot
+    Remove the self-issued root after ordering. At least one intermediate must remain.
+
+.OUTPUTS
+    System.Security.Cryptography.X509Certificates.X509Certificate2[]
+#>
+function Get-OrderedCertificateChain {
+    [OutputType([System.Security.Cryptography.X509Certificates.X509Certificate2[]])]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2Collection]$Certificates,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('CaResponse', 'KeyVaultSecret')]
+        [string]$Source,
+
+        [Parameter()]
+        [switch]$ExcludeRoot
+    )
+
+    # Wrap the complete conditional expression. Wrapping only each branch still permits
+    # PowerShell to unwrap a one-item result before assignment under strict mode.
+    $leafCandidates = @(if ($Source -eq 'KeyVaultSecret') {
+        $Certificates | Where-Object HasPrivateKey
+    }
+    else {
+        $Certificates | Where-Object {
+            $basicConstraints = $_.Extensions |
+                Where-Object { $_ -is [System.Security.Cryptography.X509Certificates.X509BasicConstraintsExtension] } |
+                Select-Object -First 1
+            $null -eq $basicConstraints -or -not $basicConstraints.CertificateAuthority
+        }
+    })
+    if ($leafCandidates.Count -ne 1) {
+        throw [System.Exception]::new("Get-OrderedCertificateChain: Expected exactly one leaf certificate in $Source; found $($leafCandidates.Count).")
+    }
+
+    # Keep unconsumed certificates in a mutable list so each issuer can be used exactly once.
+    $remaining = [System.Collections.Generic.List[System.Security.Cryptography.X509Certificates.X509Certificate2]]::new()
+    foreach ($certificate in $Certificates) {
+        if ($certificate.Thumbprint -cne $leafCandidates[0].Thumbprint) {
+            $remaining.Add($certificate)
+        }
+    }
+
+    $ordered = [System.Collections.Generic.List[System.Security.Cryptography.X509Certificates.X509Certificate2]]::new()
+    $current = $leafCandidates[0]
+    while ($null -ne $current) {
+        $ordered.Add($current)
+        if (Test-DistinguishedNameEqual -Left $current.SubjectName -Right $current.IssuerName) {
+            break
+        }
+
+        # Encoded distinguished-name comparison avoids locale and formatting differences in
+        # the display strings exposed by Subject and Issuer.
+        $issuers = @($remaining | Where-Object {
+            Test-DistinguishedNameEqual -Left $_.SubjectName -Right $current.IssuerName
+        })
+        if ($issuers.Count -ne 1) {
+            throw [System.Exception]::new("Get-OrderedCertificateChain: Expected one issuer for '$($current.Subject)' in $Source; found $($issuers.Count).")
+        }
+
+        $current = $issuers[0]
+        $null = $remaining.Remove($current)
+    }
+
+    if ($remaining.Count -gt 0) {
+        throw [System.Exception]::new("Get-OrderedCertificateChain: $Source contains $($remaining.Count) certificate(s) outside the leaf's issuer chain.")
+    }
+    if (-not (Test-DistinguishedNameEqual -Left $ordered[$ordered.Count - 1].SubjectName -Right $ordered[$ordered.Count - 1].IssuerName)) {
+        throw [System.Exception]::new("Get-OrderedCertificateChain: $Source does not terminate in a self-issued root certificate.")
+    }
+
+    if ($ExcludeRoot) {
+        $ordered.RemoveAt($ordered.Count - 1)
+        if ($ordered.Count -lt 2) {
+            throw [System.Exception]::new("Get-OrderedCertificateChain: $Source contains no intermediate CA certificate after the root is excluded.")
+        }
+    }
+
+    # Prevent output-pipeline enumeration so a one-item result remains an array for strict mode.
+    Write-Output -NoEnumerate $ordered.ToArray()
+}
+
+<#
+.SYNOPSIS
+    Assert that two certificate collections contain exactly the same certificates.
+
+.DESCRIPTION
+    Compares certificate counts and unique thumbprints. This detects missing, unexpected,
+    and duplicate certificates without relying on collection order.
+
+.PARAMETER Expected
+    The expected certificates.
+
+.PARAMETER Actual
+    The certificate collection being verified.
+
+.PARAMETER Context
+    Description included in a mismatch error.
+#>
+function Assert-CertificateSet {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2[]]$Expected,
+
+        [Parameter(Mandatory = $true)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2Collection]$Actual,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Context
+    )
+
+    # Count comparison detects duplicate certificate bags that unique thumbprints alone hide.
+    $expectedThumbprints = @($Expected.Thumbprint | Sort-Object -Unique)
+    $actualThumbprints = @($Actual.Thumbprint | Sort-Object -Unique)
+    $missing = @($expectedThumbprints | Where-Object { $_ -notin $actualThumbprints })
+    $unexpected = @($actualThumbprints | Where-Object { $_ -notin $expectedThumbprints })
+    if ($Expected.Count -ne $Actual.Count -or $missing.Count -gt 0 -or $unexpected.Count -gt 0) {
+        throw [System.Exception]::new("Assert-CertificateSet: $Context certificate mismatch. Expected $($Expected.Count), found $($Actual.Count). Missing: $($missing -join ', '); unexpected: $($unexpected -join ', ').")
+    }
+}
+
+<#
+.SYNOPSIS
+    Cryptographically validate an ordered certificate chain without network retrieval.
+
+.DESCRIPTION
+    Builds the supplied leaf-to-root chain using only its final certificate as a custom trust
+    root and its intermediate certificates as the extra store. Revocation and certificate
+    downloads are disabled so validation cannot silently supplement the supplied collection.
+
+.PARAMETER Certificates
+    Certificates ordered from leaf to self-issued root.
+#>
+function Assert-CertificateChain {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2[]]$Certificates
+    )
+
+    $chain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
+    try {
+        # Validate only the physical CA response. Downloads could conceal a missing intermediate.
+        $chain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+        $chain.ChainPolicy.DisableCertificateDownloads = $true
+        $chain.ChainPolicy.TrustMode = [System.Security.Cryptography.X509Certificates.X509ChainTrustMode]::CustomRootTrust
+        $null = $chain.ChainPolicy.CustomTrustStore.Add($Certificates[-1])
+
+        # The first item is the leaf and the last is the custom root; only middle items belong
+        # in ExtraStore. Avoid constructing a descending range when there are no intermediates.
+        if ($Certificates.Count -gt 2) {
+            foreach ($certificate in $Certificates[1..($Certificates.Count - 2)]) {
+                $null = $chain.ChainPolicy.ExtraStore.Add($certificate)
+            }
+        }
+
+        if (-not $chain.Build($Certificates[0])) {
+            $status = ($chain.ChainStatus.StatusInformation | ForEach-Object { $_.Trim() }) -join '; '
+            throw [System.Exception]::new("Assert-CertificateChain: AD CS returned an invalid certificate chain: $status")
+        }
+    }
+    finally {
+        $chain.Dispose()
+    }
+}
+
+#endregion
+
+#region ### Key Vault certificate chain REST helpers ###
+
+##################################################
+# FUNCTIONS - Key Vault chain REST API helpers   #
+##################################################
+
+<#
+.SYNOPSIS
+    Merge an ordered certificate chain into a pending Key Vault certificate request.
+
+.DESCRIPTION
+    Exports every supplied certificate as DER, encodes the certificates into the Key Vault
+    x5c JSON array, and completes an existing pending certificate operation through the
+    Key Vault REST API. Certificates must be supplied in leaf-to-root order.
+
+.PARAMETER VaultName
+    Name of the Key Vault containing the pending certificate request.
+
+.PARAMETER CertificateName
+    Name of the pending Key Vault certificate.
+
+.PARAMETER Certificates
+    The complete certificate chain in leaf-to-root order.
+
+.PARAMETER Token
+    SecureString bearer token for the Key Vault data-plane resource.
+
+.OUTPUTS
+    PSCustomObject containing the completed Key Vault certificate bundle.
+
+.NOTES
+    The pending merge POST is intentionally not retried because it changes service state.
+    An automatic retry could obscure whether Key Vault completed the first request.
+#>
+function Merge-KeyVaultCertificateChain {
+    [OutputType([pscustomobject])]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidatePattern('^[A-Za-z0-9-]{3,24}$')]
+        [string]$VaultName,
+
+        [Parameter(Mandatory = $true)]
+        [ValidatePattern('^[A-Za-z0-9-]+$')]
+        [string]$CertificateName,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateCount(2, 2147483647)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2[]]$Certificates,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNull()]
+        [System.Security.SecureString]$Token
+    )
+
+    # Key Vault requires each x5c member to contain the Base64-encoded DER certificate.
+    # Preserve the supplied leaf-to-root order because the pending merge API consumes the
+    # array as the certificate chain associated with the Key Vault-generated private key.
+    $x5c = @($Certificates | ForEach-Object {
+        [Convert]::ToBase64String($_.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
+    })
+    $body = @{ x5c = $x5c } | ConvertTo-Json -Depth 3 -Compress
+    $escapedCertificateName = [Uri]::EscapeDataString($CertificateName)
+    $uri = "https://$VaultName.vault.azure.net/certificates/$escapedCertificateName/pending/merge?api-version=2025-07-01"
+
+    # This function returns the Key Vault response object. Keep its informational log off the
+    # success stream so callers do not receive a mixed log-and-response array under StrictMode.
+    Write-CertLCLog -Section 'Merge-KeyVaultCertificateChain' -Message "KeyVault: Submitting $($x5c.Count) explicitly encoded certificate(s) for pending certificate $CertificateName in vault $VaultName." | Write-Information -InformationAction Continue
+
+    # Do not wrap this state-changing POST in Invoke-WithRetry. A transport failure can occur
+    # after Key Vault commits the merge, making an automatic retry operationally ambiguous.
+    try {
+        $response = Invoke-RestMethod `
+            -Uri $uri `
+            -Method POST `
+            -Authentication Bearer `
+            -Token $Token `
+            -ContentType 'application/json' `
+            -Body $body
+    }
+    catch {
+        throw [System.Exception]::new("Merge-KeyVaultCertificateChain: Key Vault pending merge failed for certificate $CertificateName in vault $VaultName.", $_.Exception)
+    }
+
+    # The exact certificate and secret version identifiers are required by later steps. Read
+    # properties defensively because strict mode rejects access to omitted REST properties.
+    $idProperty = if ($null -eq $response) { $null } else { $response.PSObject.Properties['id'] }
+    $sidProperty = if ($null -eq $response) { $null } else { $response.PSObject.Properties['sid'] }
+    if ($null -eq $idProperty -or [string]::IsNullOrWhiteSpace([string]$idProperty.Value) -or
+        $null -eq $sidProperty -or [string]::IsNullOrWhiteSpace([string]$sidProperty.Value)) {
+        throw [System.Exception]::new('Merge-KeyVaultCertificateChain: Key Vault pending merge returned no certificate or secret version identifier.')
+    }
+
+    return $response
+}
+
+<#
+.SYNOPSIS
+    Retrieve the PKCS#12 value for an exact Key Vault certificate secret version.
+
+.DESCRIPTION
+    Validates the versioned secret identifier returned by Key Vault, retrieves that exact
+    secret through the Key Vault REST API, and verifies that it contains a non-empty PKCS#12
+    value. The request uses the runbook retry helper because a version-specific GET is idempotent.
+
+.PARAMETER VaultName
+    Name of the Key Vault that must own the secret identifier.
+
+.PARAMETER SecretId
+    Versioned Key Vault secret identifier returned in the certificate merge response.
+
+.PARAMETER Token
+    SecureString bearer token for the Key Vault data-plane resource.
+
+.OUTPUTS
+    System.String containing the Base64-encoded PKCS#12 secret value.
+#>
+function Get-KeyVaultCertificateSecretValue {
+    [OutputType([string])]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidatePattern('^[A-Za-z0-9-]{3,24}$')]
+        [string]$VaultName,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$SecretId,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNull()]
+        [System.Security.SecureString]$Token
+    )
+
+    # Treat the service-returned identifier as untrusted input. Restrict it to the expected
+    # HTTPS data-plane host before allowing Invoke-RestMethod to make a request.
+    try {
+        $secretUri = [Uri]$SecretId
+    }
+    catch {
+        throw [System.ArgumentException]::new("Get-KeyVaultCertificateSecretValue: Key Vault returned an invalid secret ID '$SecretId'.", 'SecretId', $_.Exception)
+    }
+    $expectedHost = "$VaultName.vault.azure.net"
+    if (-not $secretUri.IsAbsoluteUri -or
+        $secretUri.Scheme -ine 'https' -or
+        $secretUri.Host -ine $expectedHost -or
+        -not $secretUri.IsDefaultPort -or
+        -not [string]::IsNullOrEmpty($secretUri.Query) -or
+        -not [string]::IsNullOrEmpty($secretUri.Fragment)) {
+        throw [System.ArgumentException]::new("Get-KeyVaultCertificateSecretValue: Expected an HTTPS secret ID on '$expectedHost'; received '$SecretId'.", 'SecretId')
+    }
+
+    # A certificate-backed secret ID must identify one concrete version. Reject collection,
+    # latest-version, or unrelated Key Vault resource paths before issuing the GET.
+    $pathSegments = @($secretUri.AbsolutePath.Trim('/').Split('/'))
+    if ($pathSegments.Count -ne 3 -or
+        $pathSegments[0] -ine 'secrets' -or
+        [string]::IsNullOrWhiteSpace([Uri]::UnescapeDataString($pathSegments[1])) -or
+        [string]::IsNullOrWhiteSpace($pathSegments[2])) {
+        throw [System.ArgumentException]::new("Get-KeyVaultCertificateSecretValue: Expected a versioned certificate secret ID; received '$SecretId'.", 'SecretId')
+    }
+
+    $uri = "$($secretUri.AbsoluteUri.TrimEnd('/'))?api-version=2025-07-01"
+
+    # Copy function-scope values into locals before creating the closure. This ensures
+    # GetNewClosure captures both values when Invoke-WithRetry executes the script block.
+    $requestUri = $uri
+    $requestToken = $Token
+    $operation = {
+        Invoke-RestMethod `
+            -Uri $requestUri `
+            -Method GET `
+            -Authentication Bearer `
+            -Token $requestToken `
+            -ContentType 'application/json'
+    }.GetNewClosure()
+
+    try {
+        # Version-specific secret retrieval is idempotent and safe for transient retries.
+        $secret = Invoke-WithRetry `
+            -ScriptBlock $operation `
+            -OperationName "KV GET certificate secret $($pathSegments[1])/$($pathSegments[2])" `
+            -Section 'Get-KeyVaultCertificateSecretValue'
+    }
+    catch {
+        throw [System.Exception]::new("Get-KeyVaultCertificateSecretValue: Failed to retrieve versioned secret '$SecretId'.", $_.Exception)
+    }
+
+    # Read REST properties defensively for strict mode and require Key Vault's PKCS#12 marker.
+    $contentTypeProperty = if ($null -eq $secret) { $null } else { $secret.PSObject.Properties['contentType'] }
+    if ($null -eq $contentTypeProperty -or [string]$contentTypeProperty.Value -ine 'application/x-pkcs12') {
+        $actualContentType = if ($null -eq $contentTypeProperty) { '<missing>' } else { [string]$contentTypeProperty.Value }
+        throw [System.Exception]::new("Get-KeyVaultCertificateSecretValue: Secret '$SecretId' has content type '$actualContentType'; expected 'application/x-pkcs12'.")
+    }
+
+    $valueProperty = if ($null -eq $secret) { $null } else { $secret.PSObject.Properties['value'] }
+    if ($null -eq $valueProperty -or [string]::IsNullOrWhiteSpace([string]$valueProperty.Value)) {
+        throw [System.Exception]::new("Get-KeyVaultCertificateSecretValue: Key Vault returned an empty value for versioned secret '$SecretId'.")
+    }
+
+    return [string]$valueProperty.Value
 }
 
 #endregion
@@ -792,18 +1458,20 @@ function Convert-PfxProtectToFromTag {
 
 <#
 .SYNOPSIS
-    Export a PFX certificate from Azure Key Vault, protecting it to specified SIDs.
+    Export a certificate collection to a PFX file protected to specified SIDs.
 
 .DESCRIPTION
-    This function exports a PFX certificate from Azure Key Vault, protecting it to specified SIDs.
+    This function exports selected certificates retrieved from Azure Key Vault to one PFX file protected to specified SIDs.
     It does not use Export-PfxCertificate cmdlet, but instead uses native interop helpers to create a protection descriptor and export the PFX file.
+    The collection contains the private-key leaf and its intermediate certificates, with the self-issued root excluded before this function is called.
     The exported PFX file can be protected to multiple SIDs (users or groups).
 
-.PARAMETER Cert
-    The X509Certificate2 object representing the certificate to export.
+.PARAMETER Certificates
+    One or more X509Certificate2 objects to include in the exported PFX. The leaf certificate
+    carries the private key; issuer certificates contribute their public certificate material.
 
-.PARAMETER ProtectTo
-    An array of strings representing the users or groups (in domain\user or UPN format) to protect the PFX file to.
+.PARAMETER ProtectionSids
+    SIDs resolved and validated by Initialize-PfxExportTarget before certificate issuance.
 
 .PARAMETER PfxFile
     The path to the output PFX file.
@@ -811,28 +1479,29 @@ function Convert-PfxProtectToFromTag {
 .EXAMPLE
     $protectTo = @("DOMAIN\User1", "DOMAIN\Group1")
     $pfxFile = "C:\path\to\output.pfx"
-    Export-PfxWithGroupProtection -Cert $cert -ProtectTo $protectTo -PfxFile $pfxFile
+    $preflight = Initialize-PfxExportTarget -PfxRootFolder 'C:\path\to' -Hostname 'output' -ProtectTo $protectTo
+    Export-PfxWithGroupProtection -Certificates @($cert) -ProtectionSids $preflight.ProtectionSids -PfxFile $pfxFile
 #>
 function Export-PfxWithGroupProtection {
     [CmdletBinding()]
     param (
         [Parameter(Mandatory = $true)]
-        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert,
+        [System.Security.Cryptography.X509Certificates.X509Certificate2[]]$Certificates,
 
         [Parameter(Mandatory = $true)]
-        [string[]]$ProtectTo,
+        [System.Security.Principal.SecurityIdentifier[]]$ProtectionSids,
 
         [Parameter(Mandatory = $true)]
         [string]$PfxFile
     )
 
     # Add native interop helpers
-    if (-not ('Win32Native' -as [type])) {
+    if (-not ('CertLCPfxNative' -as [type])) {
         Add-Type -TypeDefinition @'
         using System;
         using System.Runtime.InteropServices;
 
-        public static class Win32Native
+        public static class CertLCPfxNative
         {
             [StructLayout(LayoutKind.Sequential)]
             public struct BLOB
@@ -848,14 +1517,9 @@ function Export-PfxWithGroupProtection {
             [DllImport("ncrypt.dll")]
             public static extern int NCryptCloseProtectionDescriptor(IntPtr hDesc);
 
-            [DllImport("crypt32.dll", CharSet = CharSet.Ansi, SetLastError = true)]
-            public static extern IntPtr CertOpenStore(
-                string storeProvider, uint encoding, IntPtr hCryptProv,
-                uint flags, IntPtr pvPara);
-
-            [DllImport("crypt32.dll", SetLastError = true)]
-            public static extern bool CertAddCertificateContextToStore(
-                IntPtr hStore, IntPtr pCert, uint disp, IntPtr ppOut);
+            [DllImport("crypt32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+            public static extern IntPtr PFXImportCertStore(
+                ref BLOB pfx, string password, uint flags);
 
             [DllImport("crypt32.dll", SetLastError = true)]
             public static extern bool CertCloseStore(IntPtr hStore, uint flags);
@@ -868,35 +1532,44 @@ function Export-PfxWithGroupProtection {
 '@
     }
 
-    # resolve SIDs and build the rulestring: "SID=... OR SID=..."
-    $rule = ($ProtectTo | ForEach-Object {
-            ([System.Security.Principal.NTAccount]$_).Translate([System.Security.Principal.SecurityIdentifier]).Value
-        } | ForEach-Object { "SID=$_" } ) -join ' OR '
+    # Build the protection descriptor only from SIDs that passed the early export preflight.
+    $rule = ($ProtectionSids | ForEach-Object { "SID=$($_.Value)" }) -join ' OR '
 
     # create protection descriptor
     $hDesc = [IntPtr]::Zero
-    $hr = [Win32Native]::NCryptCreateProtectionDescriptor($rule, 0, [ref]$hDesc)
+    $hr = [CertLCPfxNative]::NCryptCreateProtectionDescriptor($rule, 0, [ref]$hDesc)
     if ($hr) {
         throw 'Export-PfxWithGroupProtection: NCryptCreateProtectionDescriptor failed: 0x{0:X}' -f $hr
     }
     Write-CertLCLog -Section 'Export-PfxWithGroupProtection' -Message "Protection descriptor handle: $hDesc"
 
-    try {
+    $sourcePfxBytes = $null
+    $sourcePfxBuffer = [IntPtr]::Zero
+    $store = [IntPtr]::Zero
+    $passwordBytes = [System.Security.Cryptography.RandomNumberGenerator]::GetBytes(40)
+    $password = [System.Convert]::ToBase64String($passwordBytes)
+    [Array]::Clear($passwordBytes, 0, $passwordBytes.Length)
 
-        # Create memory store
-        $store = [Win32Native]::CertOpenStore('Memory', 0, [IntPtr]::Zero, 0x2000, [IntPtr]::Zero)
+    try {
+        # Import an intermediate in-memory PKCS#12 into a non-persistent native store. This
+        # preserves the private-key association that is lost when only certificate contexts
+        # are copied into a new memory store.
+        $sourcePfxBytes = ([System.Security.Cryptography.X509Certificates.X509Certificate2Collection]$Certificates).Export(
+            [System.Security.Cryptography.X509Certificates.X509ContentType]::Pfx,
+            $password)
+        $sourcePfxBuffer = [Runtime.InteropServices.Marshal]::AllocHGlobal($sourcePfxBytes.Length)
+        [Runtime.InteropServices.Marshal]::Copy($sourcePfxBytes, 0, $sourcePfxBuffer, $sourcePfxBytes.Length)
+        $sourcePfx = New-Object CertLCPfxNative+BLOB
+        $sourcePfx.cbData = $sourcePfxBytes.Length
+        $sourcePfx.pbData = $sourcePfxBuffer
+        $store = [CertLCPfxNative]::PFXImportCertStore([ref]$sourcePfx, $password, 0x0001 -bor 0x8000)
         if ($store -eq [IntPtr]::Zero) {
-            throw 'Export-PfxWithGroupProtection: CertOpenStore failed: 0x{0:X}' -f [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            throw 'Export-PfxWithGroupProtection: PFXImportCertStore failed: 0x{0:X}' -f [Runtime.InteropServices.Marshal]::GetLastWin32Error()
         }
-        Write-CertLCLog -Section 'Export-PfxWithGroupProtection' -Message "Memory store handle: $store"
+        Write-CertLCLog -Section 'Export-PfxWithGroupProtection' -Message "Private-key PFX imported into native memory store: $store"
 
         try {
-
-            # Add the cert to the memory store
-            if (-not [Win32Native]::CertAddCertificateContextToStore($store, $Cert.Handle, 3, [IntPtr]::Zero)) {
-                throw "Export-PfxWithGroupProtection: CertAddCertificateContextToStore failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
-            }
-            Write-CertLCLog -Section 'Export-PfxWithGroupProtection' 'Certificate added to memory store.'
+            Write-CertLCLog -Section 'Export-PfxWithGroupProtection' -Message "$($Certificates.Count) certificate(s) imported into native memory store."
 
             # Wrap the handle in an IntPtr buffer
             $pvPara = [Runtime.InteropServices.Marshal]::AllocHGlobal([IntPtr]::Size)
@@ -904,14 +1577,11 @@ function Export-PfxWithGroupProtection {
 
             try {
 
-                # generate a random password for the PFX (as per documentation, if not used the API should generate one, but it seems it does not and uses empty or "0" as passwords)
-                $password = [System.Convert]::ToBase64String([System.Security.Cryptography.RandomNumberGenerator]::GetBytes(40))
-
                 # Query size of PFX so that we know how much buffer to allocate (pass 1)
-                $blob = New-Object Win32Native+BLOB
-                $flags = 0x0004 -bor 0x0010 -bor 0x0020  # EXPORT_PRIVATE_KEYS | INCLUDE_EXTENDED_PROPERTIES | PROTECT_TO_DOMAIN_SIDS
+                $blob = New-Object CertLCPfxNative+BLOB
+                $flags = 0x0002 -bor 0x0004 -bor 0x0010 -bor 0x0020  # REPORT_NOT_ABLE_TO_EXPORT_PRIVATE_KEY | EXPORT_PRIVATE_KEYS | INCLUDE_EXTENDED_PROPERTIES | PROTECT_TO_DOMAIN_SIDS
 
-                if (-not [Win32Native]::PFXExportCertStoreEx($store, [ref]$blob, $password, $pvPara, $flags)) {
+                if (-not [CertLCPfxNative]::PFXExportCertStoreEx($store, [ref]$blob, $password, $pvPara, $flags)) {
                     throw ('Export-PfxWithGroupProtection:: size query failed: 0x{0:X}' -f [Runtime.InteropServices.Marshal]::GetLastWin32Error())
                 }
                 Write-CertLCLog -Section 'Export-PfxWithGroupProtection' -Message "PFX size will be: $($blob.cbData) bytes"
@@ -921,7 +1591,7 @@ function Export-PfxWithGroupProtection {
 
                 # do export to the memory store
                 try {
-                    if (-not [Win32Native]::PFXExportCertStoreEx($store, [ref]$blob, $password, $pvPara, $flags)) {
+                    if (-not [CertLCPfxNative]::PFXExportCertStoreEx($store, [ref]$blob, $password, $pvPara, $flags)) {
                         throw ('Export-PfxWithGroupProtection: export to memory store failed: 0x{0:X}' -f [Runtime.InteropServices.Marshal]::GetLastWin32Error())
                     }
                     Write-CertLCLog -Section 'Export-PfxWithGroupProtection' 'Export to memory store successful.'
@@ -946,12 +1616,19 @@ function Export-PfxWithGroupProtection {
         }
         finally {
             # close the memory store
-            [Win32Native]::CertCloseStore($store, 0) | Out-Null
+            [CertLCPfxNative]::CertCloseStore($store, 0) | Out-Null
         }
     }
     finally {
+        $password = $null
+        if ($sourcePfxBuffer -ne [IntPtr]::Zero) {
+            [Runtime.InteropServices.Marshal]::FreeHGlobal($sourcePfxBuffer)
+        }
+        if ($null -ne $sourcePfxBytes) {
+            [Array]::Clear($sourcePfxBytes, 0, $sourcePfxBytes.Length)
+        }
         # free the protection descriptor handle
-        [Win32Native]::NCryptCloseProtectionDescriptor($hDesc) | Out-Null
+        [CertLCPfxNative]::NCryptCloseProtectionDescriptor($hDesc) | Out-Null
     }
 }
 
@@ -1018,6 +1695,56 @@ function Find-TemplateName {
 
 #endregion
 
+#region ### Get-CaRequestDiagnostic ###
+
+###########################################
+# FUNCTIONS - Get-CaRequestDiagnostic     #
+###########################################
+
+<#
+.SYNOPSIS
+    Retrieve diagnostic details for an AD CS certificate request.
+
+.DESCRIPTION
+    Reads the request ID, CA disposition message, and last HRESULT from an
+    ICertRequest COM object. Each property is retrieved independently because
+    AD CS may leave individual diagnostics unavailable for some dispositions.
+
+.PARAMETER CertificateRequest
+    The CertificateAuthority.Request COM object after Submit has returned.
+
+.OUTPUTS
+    System.String containing the available CA request diagnostics.
+#>
+function Get-CaRequestDiagnostic {
+    [OutputType([string])]
+    param (
+        [Parameter(Mandatory = $true)]
+        [object]$CertificateRequest
+    )
+
+    $requestId = try { $CertificateRequest.GetRequestId() } catch { 'unavailable' }
+    $dispositionMessage = try { $CertificateRequest.GetDispositionMessage() } catch { 'unavailable' }
+    $lastStatus = try { $CertificateRequest.GetLastStatus() } catch { $null }
+
+    if ([string]::IsNullOrWhiteSpace([string]$dispositionMessage)) {
+        $dispositionMessage = 'unavailable'
+    }
+
+    # COM exposes HRESULT values as signed integers; normalize to eight-digit hexadecimal
+    # so the value can be looked up directly in AD CS and Windows error documentation.
+    $statusText = if ($null -eq $lastStatus) {
+        'unavailable'
+    }
+    else {
+        '0x{0:X8}' -f ([uint32]([int64]$lastStatus -band 0xFFFFFFFFL))
+    }
+
+    "Request ID: $requestId; CA message: $dispositionMessage; last status: $statusText"
+}
+
+#endregion
+
 #region ### New-CertificateCreationRequest ###
 
 ##############################################
@@ -1026,12 +1753,12 @@ function Find-TemplateName {
 
 <#
 .SYNOPSIS
-    Create a new certificate request in Azure Key Vault, submit it to the specified CA, export the issued certificate to a PFX file protected to specified users/groups.
+    Create a Key Vault certificate request, merge the complete CA chain, and export a root-excluded PFX protected to specified users/groups.
 
 .DESCRIPTION
     This function creates a new certificate request in Azure Key Vault and submits it to the specified Certificate Authority (CA) for issuance.
-    It prepares the necessary tags, handles existing in-progress requests, and uses the Certificate Enrollment API to submit the request.
-    The resulting certificate is then exported to a PFX file protected to the specified users/groups.
+    It prepares the necessary tags, handles existing in-progress requests, and uses the Certificate Enrollment API to retrieve and validate the complete certificate chain.
+    The complete leaf-to-root chain is merged into Key Vault. The exact merged secret version is verified and exported as a PFX containing the private-key leaf and all intermediates, while excluding the self-issued root.
 
 .PARAMETER VaultName
     The name of the Azure Key Vault where the certificate will be stored.
@@ -1082,6 +1809,15 @@ function New-CertificateCreationRequest {
         # for audit symmetry with RevokedJobId.
         [Parameter()][string]$RenewedJobId
     )
+
+    # Validate every local export dependency before creating a Key Vault CSR or contacting the
+    # CA. This prevents bad paths, ACL rights, or domain principals from causing late failure.
+    $pfxPreparation = Initialize-PfxExportTarget `
+        -PfxRootFolder $PfxRootFolder `
+        -Hostname $Hostname `
+        -ProtectTo $PfxProtectTo
+    $PfxTargetFolder = $pfxPreparation.TargetFolder
+    $ProtectionSids = $pfxPreparation.ProtectionSids
 
     # prepare tags for the certificate
     $tagPfxValue = Convert-PfxProtectToForTag -Value $PfxProtectTo
@@ -1156,9 +1892,11 @@ function New-CertificateCreationRequest {
     # CR_OUT_BASE64HEADER = 0x0,
     # CR_OUT_BASE64 = 0x1,
     # CR_OUT_BINARY = 0x2
+    # CR_OUT_CHAIN = 0x100
 
     Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "CA: Sending request to the CA $CA using template $($CertificateTemplateName) for certificate $CertificateName..."
-    $CertEncoded = $null
+    $CertRequest = $null
+    $pkcs7Response = $null
     try {
         $CertRequest = New-Object -ComObject CertificateAuthority.Request
         $CertRequestStatus = $CertRequest.Submit(0x1, $csr, "CertificateTemplate:$CertificateTemplateName", $CA)
@@ -1170,23 +1908,30 @@ function New-CertificateCreationRequest {
 
         switch ($CertRequestStatus) {
             $CR_DISP_DENIED {
-                throw [System.Exception]::new("New-CertificateCreationRequest: CA: Request was denied. Check the CA $CA for details.")
+                $caDiagnostic = Get-CaRequestDiagnostic -CertificateRequest $CertRequest
+                throw [System.Exception]::new("New-CertificateCreationRequest: CA: Request was denied by $CA. $caDiagnostic")
             }
             $CR_DISP_ISSUED {
                 Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "CA: Certificate Request for $CertificateName submitted successfully."
-                $CertEncoded = $CertRequest.GetCertificate(0x0)
-                Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "Certificate received from CA $CA"
+                # CR_OUT_BASE64HEADER | CR_OUT_CHAIN returns PKCS#7 containing the issued leaf
+                # and every issuer certificate through the self-issued root.
+                $pkcs7Response = $CertRequest.GetCertificate(0x100)
+                Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "Complete certificate chain received from CA $CA."
             }
             $CR_DISP_UNDER_SUBMISSION {
-                throw [System.Exception]::new("New-CertificateCreationRequest: CA: Request to $CA is pending. This runbook expects immediate issuance. Review template/CA configuration.")
+                $caDiagnostic = Get-CaRequestDiagnostic -CertificateRequest $CertRequest
+                throw [System.Exception]::new("New-CertificateCreationRequest: CA: Request to $CA is pending. This runbook expects immediate issuance. $caDiagnostic")
             }
             default {
-                throw [System.Exception]::new("New-CertificateCreationRequest: CA: Request to $CA failed with status $CertRequestStatus")
+                $caDiagnostic = Get-CaRequestDiagnostic -CertificateRequest $CertRequest
+                throw [System.Exception]::new("New-CertificateCreationRequest: CA: Request to $CA returned disposition $CertRequestStatus instead of issuing the certificate. $caDiagnostic")
             }
         }
     }
     catch {
-        throw [System.Exception]::new("New-CertificateCreationRequest: CA: Error submitting request to $CA", $_.Exception)
+        # Keep the CA diagnostic in the outer message because Automation logging may display
+        # Exception.Message without rendering the complete inner-exception chain.
+        throw [System.Exception]::new("New-CertificateCreationRequest: CA: Error submitting request to $CA. $($_.Exception.Message)", $_.Exception)
     }
     finally {
         if ($CertRequest) {
@@ -1195,125 +1940,281 @@ function New-CertificateCreationRequest {
         }
     }
 
-    # we need to save the certificate in a temporary file because the Import-AzKeyVaultCertificate cmdlet does not accept a base64 string as input
-    $CertEncodedFile = New-TemporaryFile
-    Set-Content -Path $CertEncodedFile -Value $CertEncoded
-
-    # import the certificate into the key vault
-    Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "KeyVault: Importing the certificate $CertificateName into the key vault $VaultName..."
+    $keyVaultCertificates = $null
+    $exportChain = $null
+    $caResponseCertificates = ConvertFrom-Base64Pkcs7 -Content $pkcs7Response
     try {
-        $newCert = Import-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -FilePath $CertEncodedFile
-        if ($null -eq $newCert) {
-            throw [System.Exception]::new('New-CertificateCreationRequest: KeyVault: Error importing certificate into the key vault: returned null result.')
+        # Validate the physical CA response before sending any certificate material to Key Vault.
+        # This rejects leaf-only, ambiguous, disconnected, and cryptographically invalid chains.
+        if ($caResponseCertificates.Count -lt 2) {
+            throw [System.Exception]::new("New-CertificateCreationRequest: CA returned PKCS#7 containing only $($caResponseCertificates.Count) certificate(s); the issuer chain is missing.")
         }
-    }
-    catch {
-        throw [System.Exception]::new("New-CertificateCreationRequest: KeyVault: Error importing certificate $CertificateName into key vault $VaultName", $_.Exception)
-    }
-    finally {
-        # Always remove temporary file
-        Remove-Item -Path $CertEncodedFile -Force -ErrorAction SilentlyContinue
-    }
-    Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "KeyVault: Certificate $CertificateName imported into the key vault $($VaultName)."
+        $caChain = Get-OrderedCertificateChain -Certificates $caResponseCertificates -Source CaResponse
+        Assert-CertificateChain -Certificates $caChain
 
-    # Create root folder if needed
-    if (-not (Test-Path -Path $PfxRootFolder)) {
-        Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Creating the PFX root folder: $PfxRootFolder"
-        New-Item -Path $PfxRootFolder -ItemType Directory -Force | Out-Null
-    }
-    Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Root folder verified: $PfxRootFolder"
-
-    $PfxTargetFolder = Join-Path -Path $PfxRootFolder -ChildPath $Hostname
-
-    if (-not (Test-Path -Path $PfxTargetFolder)) {
-        Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Creating the target folder for PFX: $PfxTargetFolder"
-        New-Item -Path $PfxTargetFolder -ItemType Directory -Force | Out-Null
-    }
-
-    # Set ACLs on the target folder. This operation is repeated, for security, even if the folder already exists.
-    try {
-        # Start with current ACL, then fully protect (no inheritance, do not preserve inherited ACEs)
-        $acl = Get-Acl -Path $PfxTargetFolder
-        $acl.SetAccessRuleProtection($true, $false)  # protect; remove inherited
-
-        # Remove any existing explicit ACEs so only our defined set remains
-        foreach ($rule in @($acl.Access)) { $null = $acl.RemoveAccessRule($rule) }
-
-        $inheritFlags = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
-        $propFlags = [System.Security.AccessControl.PropagationFlags]::None
-
-        # Required full-control principals
-        foreach ($adm in @('BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM')) {
-            $ace = New-Object System.Security.AccessControl.FileSystemAccessRule($adm, 'FullControl', $inheritFlags, $propFlags, 'Allow')
-            $acl.AddAccessRule($ace)
+        Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "CA: Validated $($caChain.Count) certificate(s) in the complete leaf-to-root chain for $CertificateName."
+        foreach ($certificate in $caChain) {
+            Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "CA chain member: subject '$($certificate.Subject)', issuer '$($certificate.Issuer)'."
         }
 
-        # Limited principals (Read & Execute)
-        foreach ($principal in $PfxProtectTo) {
-            if ([string]::IsNullOrWhiteSpace($principal)) { continue }
-            $ace = New-Object System.Security.AccessControl.FileSystemAccessRule($principal, 'ReadAndExecute', $inheritFlags, $propFlags, 'Allow')
-            $acl.AddAccessRule($ace)
-        }
-
-        Set-Acl -Path $PfxTargetFolder -AclObject $acl
-        Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: ACL set on target folder (inheritance disabled, custom ACEs only): $PfxTargetFolder"
-    }
-    catch {
-        throw [System.Exception]::new("New-CertificateCreationRequest: PFX: Error setting permissions on $PfxTargetFolder", $_.Exception)
-    }
-
-    $pfxFile = Join-Path -Path $PfxTargetFolder -ChildPath "$($CertificateName).pfx"
-    Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Export path: $pfxFile"
-
-    Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Retrieving secret for $CertificateName from vault $VaultName..."
-    try {
-        $certBase64 = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertificateName -AsPlainText
-    }
-    catch {
-        throw [System.Exception]::new("New-CertificateCreationRequest: PFX: Error retrieving secret for $CertificateName", $_.Exception)
-    }
-    if ([string]::IsNullOrEmpty($certBase64)) {
-        throw [System.Exception]::new("New-CertificateCreationRequest: PFX: Retrieved secret is empty for $CertificateName")
-    }
-
-    $certBytes = [Convert]::FromBase64String($certBase64); $certBase64 = $null
-    $x509Cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($certBytes, [string]::Empty, 'Exportable')
-    $certBytes = $null
-    if (-not $x509Cert.HasPrivateKey) {
-        $x509Cert = $null; throw [System.Exception]::new("New-CertificateCreationRequest: PFX: Private key missing for $CertificateName")
-    }
-    try {
-        $null = $x509Cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Pfx)
-    }
-    catch {
-        $x509Cert = $null; throw [System.Exception]::new('New-CertificateCreationRequest: PFX: Private key not exportable', $_.Exception)
-    }
-
-    if (Test-Path -Path $pfxFile) {
-        Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Removing existing file $pfxFile"
+        # Reuse the Automation Account's managed-identity Az context and keep the Key Vault
+        # bearer token as a SecureString through merge and exact-version secret retrieval.
+        $keyVaultToken = $null
         try {
-            Remove-Item -Path $pfxFile -Force
+            $tokenResult = Get-AzAccessToken -ResourceTypeName KeyVault -AsSecureString
+            if ($null -eq $tokenResult -or $null -eq $tokenResult.Token) {
+                throw [System.Exception]::new('Get-AzAccessToken returned no secure token.')
+            }
+            $keyVaultToken = $tokenResult.Token
         }
         catch {
-            $x509Cert = $null; throw [System.Exception]::new("New-CertificateCreationRequest: PFX: Cannot remove existing file $pfxFile", $_.Exception)
+            throw [System.Exception]::new("New-CertificateCreationRequest: KeyVault: Error acquiring a data-plane token for vault $VaultName.", $_.Exception)
+        }
+
+        try {
+            Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "KeyVault: Merging the complete certificate chain into pending certificate $CertificateName in vault $VaultName..."
+            $mergedCertificate = Merge-KeyVaultCertificateChain `
+                -VaultName $VaultName `
+                -CertificateName $CertificateName `
+                -Certificates $caChain `
+                -Token $keyVaultToken
+
+            # Treat the service-returned certificate ID as untrusted input. The version is used
+            # for an exact tag update, so it must belong to the expected vault and certificate.
+            try {
+                $certificateUri = [Uri][string]$mergedCertificate.id
+            }
+            catch {
+                throw [System.Exception]::new("New-CertificateCreationRequest: KeyVault returned an invalid certificate ID '$($mergedCertificate.id)'.", $_.Exception)
+            }
+            if (-not $certificateUri.IsAbsoluteUri -or
+                $certificateUri.Scheme -ine 'https' -or
+                $certificateUri.Host -ine "$VaultName.vault.azure.net" -or
+                -not $certificateUri.IsDefaultPort -or
+                -not [string]::IsNullOrEmpty($certificateUri.Query) -or
+                -not [string]::IsNullOrEmpty($certificateUri.Fragment)) {
+                throw [System.Exception]::new("New-CertificateCreationRequest: KeyVault returned an unexpected certificate ID '$($mergedCertificate.id)'.")
+            }
+
+            $certificatePath = @($certificateUri.AbsolutePath.Trim('/').Split('/'))
+            if ($certificatePath.Count -ne 3 -or
+                $certificatePath[0] -ine 'certificates' -or
+                [Uri]::UnescapeDataString($certificatePath[1]) -cne $CertificateName -or
+                [string]::IsNullOrWhiteSpace($certificatePath[2])) {
+                throw [System.Exception]::new("New-CertificateCreationRequest: KeyVault returned an unexpected certificate ID '$($mergedCertificate.id)'.")
+            }
+            $certificateVersion = $certificatePath[2]
+
+            # Key Vault replaces tags as one set. Start with tags returned by the merge, retain
+            # unrelated values, and overlay the current request's mandatory and optional tags.
+            $mergedTags = @{}
+            $mergedTagProperty = $mergedCertificate.PSObject.Properties['tags']
+            if ($null -ne $mergedTagProperty -and $null -ne $mergedTagProperty.Value) {
+                if ($mergedTagProperty.Value -is [System.Collections.IDictionary]) {
+                    foreach ($key in $mergedTagProperty.Value.Keys) {
+                        $mergedTags[$key] = [string]$mergedTagProperty.Value[$key]
+                    }
+                }
+                else {
+                    foreach ($property in $mergedTagProperty.Value.PSObject.Properties) {
+                        $mergedTags[$property.Name] = [string]$property.Value
+                    }
+                }
+            }
+
+            $tagUpdateRequired = $false
+            foreach ($tag in $tags.GetEnumerator()) {
+                if (-not $mergedTags.ContainsKey($tag.Key) -or $mergedTags[$tag.Key] -cne [string]$tag.Value) {
+                    $tagUpdateRequired = $true
+                }
+                $mergedTags[$tag.Key] = [string]$tag.Value
+            }
+
+            if ($tagUpdateRequired) {
+                Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "KeyVault: Updating request tags on certificate $CertificateName version $certificateVersion."
+                try {
+                    # Do not retry this state-changing update automatically. The merged tag set
+                    # makes a deliberate, exact-version replacement through the Az cmdlet.
+                    $taggedCertificate = Update-AzKeyVaultCertificate `
+                        -VaultName $VaultName `
+                        -Name $CertificateName `
+                        -Version $certificateVersion `
+                        -Tag $mergedTags `
+                        -PassThru
+                }
+                catch {
+                    throw [System.Exception]::new("New-CertificateCreationRequest: KeyVault: Error updating tags on certificate $CertificateName version $certificateVersion.", $_.Exception)
+                }
+
+                # Normalize the cmdlet response to a hashtable so verification is independent
+                # of the concrete dictionary type returned by the installed Az.KeyVault version.
+                $verifiedTags = @{}
+                if ($null -ne $taggedCertificate -and $null -ne $taggedCertificate.Tags) {
+                    foreach ($key in $taggedCertificate.Tags.Keys) {
+                        $verifiedTags[$key] = [string]$taggedCertificate.Tags[$key]
+                    }
+                }
+            }
+            else {
+                # The merge response represents the exact new version and already contains every
+                # requested tag, so no additional state-changing call is necessary.
+                $verifiedTags = $mergedTags
+            }
+
+            foreach ($tag in $tags.GetEnumerator()) {
+                if (-not $verifiedTags.ContainsKey($tag.Key) -or $verifiedTags[$tag.Key] -cne [string]$tag.Value) {
+                    throw [System.Exception]::new("New-CertificateCreationRequest: KeyVault certificate $CertificateName version $certificateVersion is missing expected tag '$($tag.Key)'.")
+                }
+            }
+
+            Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "KeyVault: Complete certificate chain merged and request tags verified for certificate $CertificateName version $certificateVersion in vault $VaultName."
+
+            # Use the sid returned by this merge instead of a latest-version lookup. This binds
+            # PFX creation to the exact certificate version completed by the current operation.
+            Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "KeyVault: Retrieving exact PKCS#12 secret version for certificate $CertificateName version $certificateVersion..."
+            $secretBase64 = Get-KeyVaultCertificateSecretValue `
+                -VaultName $VaultName `
+                -SecretId ([string]$mergedCertificate.sid) `
+                -Token $keyVaultToken
+
+            $certificateBytes = $null
+            try {
+                $certificateBytes = [Convert]::FromBase64String($secretBase64)
+                $secretBase64 = $null
+                $keyVaultCertificates = [System.Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
+                $importFlags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable -bor
+                    [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
+
+                # EphemeralKeySet keeps the Key Vault private key out of the Hybrid Worker's
+                # persistent user and machine key stores while it is prepared for PFX export.
+                $keyVaultCertificates.Import($certificateBytes, [string]::Empty, $importFlags)
+
+                # The final PFX must be built only from material physically returned by Key Vault.
+                # Comparing against the CA response proves that the merge persisted every member.
+                Assert-CertificateSet -Expected $caChain -Actual $keyVaultCertificates -Context 'Key Vault persistence'
+                $exportChain = Get-OrderedCertificateChain `
+                    -Certificates $keyVaultCertificates `
+                    -Source KeyVaultSecret `
+                    -ExcludeRoot
+
+                Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "KeyVault: Verified $($keyVaultCertificates.Count) persisted chain certificate(s); $($exportChain.Count) leaf/intermediate certificate(s) selected for PFX export after root exclusion."
+                foreach ($certificate in $exportChain) {
+                    Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX chain member: subject '$($certificate.Subject)', issuer '$($certificate.Issuer)', private key '$($certificate.HasPrivateKey)'."
+                }
+            }
+            catch {
+                # Import can partially populate a collection. Dispose it here on failure because
+                # the later PFX cleanup block is reached only after this preparation succeeds.
+                if ($null -ne $keyVaultCertificates) {
+                    foreach ($certificate in $keyVaultCertificates) {
+                        $certificate.Dispose()
+                    }
+                    $keyVaultCertificates = $null
+                }
+                throw
+            }
+            finally {
+                # The decoded PKCS#12 contains private-key material and must not remain in memory
+                # beyond collection import. The Base64 reference is also released promptly.
+                $secretBase64 = $null
+                if ($null -ne $certificateBytes) {
+                    [Array]::Clear($certificateBytes, 0, $certificateBytes.Length)
+                }
+            }
+        }
+        finally {
+            # SecureString implements IDisposable. Release the token as soon as all Key Vault
+            # merge and exact-version retrieval work is complete.
+            if ($null -ne $keyVaultToken) {
+                $keyVaultToken.Dispose()
+            }
+        }
+    }
+    finally {
+        # The PKCS#7 decoder owns these certificate objects until this creation path finishes
+        # validating and merging them; dispose every member on both success and failure.
+        foreach ($certificate in $caResponseCertificates) {
+            $certificate.Dispose()
         }
     }
 
     try {
-        Export-PfxWithGroupProtection -Cert $x509Cert -ProtectTo $PfxProtectTo -PfxFile $pfxFile
-    }
-    catch {
-        throw [System.Exception]::new("New-CertificateCreationRequest: PFX: Export failure for $CertificateName", $_.Exception)
+        # All remaining PFX work consumes the verified Key Vault collection. Keeping it inside
+        # this try/finally guarantees that ephemeral private-key handles are always released.
+
+        # Reapply and revalidate the prerequisites because CA and Key Vault operations may take
+        # long enough for directory permissions or domain membership to change after preflight.
+        $pfxPreparation = Initialize-PfxExportTarget `
+            -PfxRootFolder $PfxRootFolder `
+            -Hostname $Hostname `
+            -ProtectTo $PfxProtectTo
+        $PfxTargetFolder = $pfxPreparation.TargetFolder
+        $ProtectionSids = $pfxPreparation.ProtectionSids
+
+        $pfxFile = Join-Path -Path $PfxTargetFolder -ChildPath "$($CertificateName).pfx"
+        $temporaryPfxFile = Join-Path -Path $PfxTargetFolder -ChildPath ".$($CertificateName).$([Guid]::NewGuid().ToString('N')).tmp"
+        Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Export path: $pfxFile"
+
+        # Preserve the previous explicit private-key exportability check. Capture and clear the
+        # probe because a PFX byte array contains sensitive private-key material.
+        $privateKeyProbe = $null
+        try {
+            $privateKeyProbe = $exportChain[0].Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Pfx)
+        }
+        catch {
+            throw [System.Exception]::new("New-CertificateCreationRequest: PFX: Private key is not exportable for certificate $CertificateName.", $_.Exception)
+        }
+        finally {
+            if ($null -ne $privateKeyProbe) {
+                [Array]::Clear($privateKeyProbe, 0, $privateKeyProbe.Length)
+            }
+        }
+
+        try {
+            # Export only certificates physically downloaded from the exact Key Vault secret.
+            # The ordered set contains the private-key leaf and intermediates, but not the root.
+            Export-PfxWithGroupProtection `
+                -Certificates $exportChain `
+                -ProtectionSids $ProtectionSids `
+                -PfxFile $temporaryPfxFile
+
+            # A Hybrid Worker may create a PFX protected to other domain SIDs without being
+            # authorized to decrypt it. Verify successful non-empty output without reopening it.
+            if (-not (Test-Path -LiteralPath $temporaryPfxFile -PathType Leaf)) {
+                throw [System.Exception]::new("PFX export did not create temporary file $temporaryPfxFile.")
+            }
+            $temporaryPfx = Get-Item -LiteralPath $temporaryPfxFile
+            if ($temporaryPfx.Length -le 0) {
+                throw [System.Exception]::new("PFX export created an empty temporary file $temporaryPfxFile.")
+            }
+
+            # The temporary file is created in the target directory so replacement stays on the
+            # same volume. An existing valid PFX remains untouched until export fully succeeds.
+            [System.IO.File]::Move($temporaryPfxFile, $pfxFile, $true)
+        }
+        catch {
+            throw [System.Exception]::new("New-CertificateCreationRequest: PFX: Export failure for $CertificateName.", $_.Exception)
+        }
+        finally {
+            # Move removes the temporary path on success; this handles every failure path.
+            Remove-Item -LiteralPath $temporaryPfxFile -Force -ErrorAction SilentlyContinue
+        }
+
+        if (-not (Test-Path -LiteralPath $pfxFile -PathType Leaf)) {
+            throw [System.Exception]::new("New-CertificateCreationRequest: PFX: Export did not create $pfxFile")
+        }
+
+        Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Certificate $CertificateName exported with $($exportChain.Count) leaf/intermediate chain member(s) to $pfxFile."
     }
     finally {
-        $x509Cert = $null
+        # Dispose every certificate imported from the Key Vault PKCS#12. This also releases the
+        # ephemeral private-key handle associated with the leaf certificate.
+        if ($null -ne $keyVaultCertificates) {
+            foreach ($certificate in $keyVaultCertificates) {
+                $certificate.Dispose()
+            }
+        }
     }
-
-    if (-not (Test-Path -Path $pfxFile)) {
-        throw [System.Exception]::new("New-CertificateCreationRequest: PFX: Export did not create $pfxFile")
-    }
-
-    Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Certificate $CertificateName exported to $pfxFile"
 }
 
 #endregion
@@ -1525,7 +2426,8 @@ function Get-CertificateByThumbprint {
 
 .DESCRIPTION
     This function revokes the specified version of a certificate stored in Azure Key Vault:
-      1. Loads the secret of the specific version to extract the X.509 serial number.
+      1. Loads the version-specific PKCS#12 collection and selects its private-key leaf to
+         extract the X.509 serial number.
       2. Submits a revocation request to the Certificate Authority (CA) for that serial.
       3. Disables that Key Vault version (attributes.enabled=false) and tags it with
          Revoked=true, RevokedAt, RevocationReason, RevokedJobId. Existing tags on the
@@ -1596,20 +2498,48 @@ function New-CertificateRevocationRequest {
         throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Certificate $CertificateName version $CertificateVersion secret is empty in key vault $VaultName")
     }
 
-    # convert the base64 string to a byte array and create an X509Certificate2 object
-    $certBytes = [Convert]::FromBase64String($certBase64)
-    $certBase64 = $null
-    $x509Cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($certBytes, [string]::Empty, 'Exportable')
-
-    # save the serial number of this specific version
-    $serialNumber = $x509Cert.SerialNumber
-
-    # cleanup objects that are no longer needed
-    $x509Cert = $null
     $certBytes = $null
+    $certificates = $null
+    try {
+        $certBytes = [Convert]::FromBase64String($certBase64)
+        $certBase64 = $null
+        $certificates = [System.Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
+        $importFlags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable -bor
+            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
+
+        # Import every PKCS#12 bag because new certificate versions contain the physical chain.
+        # EphemeralKeySet prevents the leaf private key from persisting in a worker key store.
+        $certificates.Import($certBytes, [string]::Empty, $importFlags)
+
+        # The private key identifies the issued leaf independently of PKCS#12 bag ordering.
+        # Wrap the complete pipeline so one result remains an array under strict mode.
+        $leafCertificates = @($certificates | Where-Object HasPrivateKey)
+        if ($leafCertificates.Count -ne 1) {
+            throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Expected exactly one private-key leaf in certificate $CertificateName version $CertificateVersion; found $($leafCertificates.Count).")
+        }
+
+        # Capture only the serial number before disposing the complete imported collection.
+        $serialNumber = $leafCertificates[0].SerialNumber
+    }
+    finally {
+        # The decoded PKCS#12 carries private-key material. Clear its byte buffer and dispose
+        # every imported certificate, including partial imports from a failing collection load.
+        $certBase64 = $null
+        if ($null -ne $certBytes) {
+            [Array]::Clear($certBytes, 0, $certBytes.Length)
+        }
+        if ($null -ne $certificates) {
+            foreach ($certificate in $certificates) {
+                $certificate.Dispose()
+            }
+        }
+    }
 
     Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "CA: Sending revocation request for certificate $CertificateName version $CertificateVersion (serial $serialNumber) to the CA $CA using reason $($RevocationReason)..."
 
+    # Initialize before COM activation so the finally block remains safe under StrictMode
+    # when New-Object fails before assigning the CertificateAuthority.Admin instance.
+    $CertAdmin = $null
     try {
         $CertAdmin = New-Object -ComObject CertificateAuthority.Admin
         $CertAdmin.RevokeCertificate($CA, $serialNumber, $RevocationReason, 0)
@@ -1972,7 +2902,7 @@ switch ($requestBody.type) {
         }
         else {
             Write-CertLCLog -Section 'Dispatcher.Renewal' -Message "NotifyTo addresses found for certificate $CertificateName in vault ${VaultName}: $rawNotifyTo"
-            $notifyTo = $rawNotifyTo.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+            $notifyTo = @($rawNotifyTo.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
         }
 
         # Certificate subject
@@ -1984,7 +2914,7 @@ switch ($requestBody.type) {
         if ($null -ne $san) {
             # $DNS.Format(0) returns a string like: DNS Name=server01.contoso.com, DNS Name=server01.litware.com.
             # Transform it into an array of DNS names using regex; remove the "DNS Name=" prefix and split by comma
-            $CertificateDnsNames = ($san.Format(0) -replace 'DNS Name=', '').Split(',').Trim() | Where-Object { $_ -ne '' }
+            $CertificateDnsNames = @(($san.Format(0) -replace 'DNS Name=', '').Split(',').Trim() | Where-Object { $_ -ne '' })
         }
 
         # get the OID of the Certificate Template
@@ -2269,7 +3199,7 @@ switch ($requestBody.type) {
         }
         else {
             Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "NotifyTo addresses found for certificate $CertificateName version $CertificateVersion in vault ${VaultName}: $rawNotifyTo"
-            $notifyTo = $rawNotifyTo.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+            $notifyTo = @($rawNotifyTo.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
         }
 
         # Idempotency guard: if this version is already marked as revoked, exit cleanly with a
@@ -2283,9 +3213,11 @@ switch ($requestBody.type) {
             $revokedAt     = if ($cert.Tags.ContainsKey('RevokedAt'))        { [string]$cert.Tags['RevokedAt'] }        else { '<unknown>' }
             $revokedReason = if ($cert.Tags.ContainsKey('RevocationReason')) { [string]$cert.Tags['RevocationReason'] } else { '<unknown>' }
             $revokedJobId  = if ($cert.Tags.ContainsKey('RevokedJobId'))     { [string]$cert.Tags['RevokedJobId'] }     else { '<unknown>' }
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' `
-                -Message "Certificate '$CertificateName' version '$CertificateVersion' (thumbprint $CertificateThumbprint) is ALREADY REVOKED (RevokedAt=$revokedAt, RevocationReason=$revokedReason, RevokedJobId=$revokedJobId). Ignoring duplicate revocation request." `
-                -NotifyTo $notifyTo @smtpArgs
+            # The requested end state already exists, so complete successfully and let the
+            # Function acknowledge the queue message instead of scheduling another retry.
+            Write-CertLCLog -Section 'Dispatcher.Revocation' -Level 'Warning' `
+                -Message "Certificate '$CertificateName' version '$CertificateVersion' (thumbprint $CertificateThumbprint) is ALREADY REVOKED (RevokedAt=$revokedAt, RevocationReason=$revokedReason, RevokedJobId=$revokedJobId). Treating duplicate revocation request as idempotent success."
+            return
         }
 
         # end of validation. Now process the certificate revocation request
@@ -2297,7 +3229,9 @@ switch ($requestBody.type) {
             New-CertificateRevocationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateVersion $CertificateVersion -RevocationReason $RevocationReason -JobId $jobId -ExistingTags $cert.Tags
         }
         catch {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message 'Error processing certificate revocation request' -Inner $_.Exception -NotifyTo $NotifyTo
+            # Include the configured SMTP transport so a genuine CA or Key Vault revocation
+            # failure can notify the recipients stored on this exact certificate version.
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message 'Error processing certificate revocation request' -Inner $_.Exception -NotifyTo $NotifyTo @smtpArgs
         }
 
         # If the revoked version was the latest version of the certificate, warn the operator:
