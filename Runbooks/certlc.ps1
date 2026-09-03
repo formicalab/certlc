@@ -3194,9 +3194,11 @@ switch ($requestBody.type) {
             $revokedAt     = if ($cert.Tags.ContainsKey('RevokedAt'))        { [string]$cert.Tags['RevokedAt'] }        else { '<unknown>' }
             $revokedReason = if ($cert.Tags.ContainsKey('RevocationReason')) { [string]$cert.Tags['RevocationReason'] } else { '<unknown>' }
             $revokedJobId  = if ($cert.Tags.ContainsKey('RevokedJobId'))     { [string]$cert.Tags['RevokedJobId'] }     else { '<unknown>' }
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' `
-                -Message "Certificate '$CertificateName' version '$CertificateVersion' (thumbprint $CertificateThumbprint) is ALREADY REVOKED (RevokedAt=$revokedAt, RevocationReason=$revokedReason, RevokedJobId=$revokedJobId). Ignoring duplicate revocation request." `
-                -NotifyTo $notifyTo @smtpArgs
+            # The requested end state already exists, so complete successfully and let the
+            # Function acknowledge the queue message instead of scheduling another retry.
+            Write-CertLCLog -Section 'Dispatcher.Revocation' -Level 'Warning' `
+                -Message "Certificate '$CertificateName' version '$CertificateVersion' (thumbprint $CertificateThumbprint) is ALREADY REVOKED (RevokedAt=$revokedAt, RevocationReason=$revokedReason, RevokedJobId=$revokedJobId). Treating duplicate revocation request as idempotent success."
+            return
         }
 
         # end of validation. Now process the certificate revocation request
@@ -3208,7 +3210,9 @@ switch ($requestBody.type) {
             New-CertificateRevocationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateVersion $CertificateVersion -RevocationReason $RevocationReason -JobId $jobId -ExistingTags $cert.Tags
         }
         catch {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message 'Error processing certificate revocation request' -Inner $_.Exception -NotifyTo $NotifyTo
+            # Include the configured SMTP transport so a genuine CA or Key Vault revocation
+            # failure can notify the recipients stored on this exact certificate version.
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message 'Error processing certificate revocation request' -Inner $_.Exception -NotifyTo $NotifyTo @smtpArgs
         }
 
         # If the revoked version was the latest version of the certificate, warn the operator:

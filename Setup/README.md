@@ -436,7 +436,7 @@ The solution follows a secure-by-default architecture:
 - Role-based access control (RBAC) follows the principle of least privilege
 - Automation Account variables for sensitive data are encrypted
 - Key Vault uses RBAC authorization and soft delete protection
-- The runbook never deletes certificates from Key Vault: revocations are recorded by disabling the specific version and tagging it (`Revoked=true`, `RevokedAt`, `RevocationReason`, `RevokedJobId`). Renewed versions are likewise tagged with `RenewedJobId` for traceability. A duplicate revocation against an already-revoked version is rejected up-front with an `ALREADY REVOKED` error and the previous audit tags are preserved. Vault soft-delete / purge-protection settings still apply to operator actions performed outside the runbook
+- The runbook never deletes certificates from Key Vault: revocations are recorded by disabling the specific version and tagging it (`Revoked=true`, `RevokedAt`, `RevocationReason`, `RevokedJobId`). Renewed versions are likewise tagged with `RenewedJobId` for traceability. A duplicate revocation against an already-revoked version logs `ALREADY REVOKED`, preserves the previous audit tags, and completes successfully without calling the CA or sending another notification. Genuine revocation failures use the configured SMTP transport when the matched certificate version has `NotifyTo` recipients. Vault soft-delete / purge-protection settings still apply to operator actions performed outside the runbook
 - Diagnostic settings enabled on critical resources (Automation Account, Key Vault) for audit logging
 
 ## Files

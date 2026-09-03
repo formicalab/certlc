@@ -96,7 +96,7 @@ The exported, SID-protected PFX contains the private-key leaf and every intermed
 1. A revocation request with a certificate thumbprint (any version, current or older) is sent to the Storage Queue
 2. The Function App triggers the `certlc` runbook
 3. The runbook locates the matching Key Vault version by thumbprint using paginated Key Vault REST requests: it checks each certificate name's latest-version `x5t` first, then enumerates older versions when needed
-4. **Idempotency guard**: if the version already carries `Revoked=true`, the runbook fails fast with an `ALREADY REVOKED` log line that includes the previous `RevokedAt`, `RevocationReason`, and `RevokedJobId`. The CA is not called again and existing tags are preserved
+4. **Idempotency guard**: if the version already carries `Revoked=true`, the runbook logs `ALREADY REVOKED` with the previous `RevokedAt`, `RevocationReason`, and `RevokedJobId`, then completes successfully so the duplicate queue message is acknowledged. The CA is not called again, no duplicate notification is sent, and existing tags are preserved
 5. Otherwise, the runbook extracts the version's serial number and submits a revocation request to the CA for that serial
 6. The matching Key Vault version is set to `enabled = false` and tagged with audit metadata (`Revoked=true`, `RevokedAt`, `RevocationReason`, `RevokedJobId`). Existing tags on the version (e.g. `NotifyTo`, `Hostname`, `PfxProtectTo`) are preserved. **No Key Vault objects are deleted by the runbook**; other versions of the same certificate are left untouched, and the certificate object remains in the vault for audit
 
