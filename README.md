@@ -127,6 +127,8 @@ CertLC stores the following tags on individual Key Vault certificate versions. C
 
 The runbook's Key Vault REST reads for thumbprint discovery and exact secret retrieval, plus its LDAP template lookup, use a retry helper with up to four total attempts. It retries HTTP 408, 429, 500, 502, 503, and 504 responses and selected network, timeout, I/O, web, and COM exceptions. `Retry-After` takes precedence over exponential backoff with jitter, and delays are capped at 30 seconds. State-changing certificate creation/merge/update calls and CA enrollment/revocation calls are not passed through this retry helper, avoiding automatic duplicate side effects.
 
+The Function bridge acknowledges a queue message only when the Automation job reaches `Completed`. `Failed`, `Stopped`, `Suspended`, and `Blocked` fail the Function invocation so queue retry and poison-message handling remain active. Transitional states are polled for up to `RunbookPollingTimeoutMinutes` (25 minutes in the Bicep deployment); an unknown state or elapsed deadline fails closed. Automation output retrieval is best-effort and cannot turn an otherwise completed lifecycle operation into a duplicate queue retry.
+
 ## Repository Structure
 
 ```

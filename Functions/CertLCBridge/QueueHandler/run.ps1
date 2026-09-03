@@ -41,20 +41,20 @@ $ErrorActionPreference = "Stop"
 
 # Ensure we only connect if needed - this is normally done at cold start by profile.ps1 but we want to ensure the context is valid
 try {
-    $context = Get-AzContext
+  $context = Get-AzContext
 
-    if (-not $context -or -not $context.Account -or $context.Account.Id -eq "NotLoggedIn") {
-        Write-Warning "No valid Azure context found. Attempting Identity-based login..."
-        Disable-AzContextAutosave -Scope Process | Out-Null
-        Connect-AzAccount -Identity -ErrorAction Stop | Out-Null
-        Write-Information "Identity-based login succeeded."
-    }
-    else {
-        Write-Information "Using existing Azure context: $($context.Account.Id)"
-    }
+  if (-not $context -or -not $context.Account -or $context.Account.Id -eq "NotLoggedIn") {
+    Write-Warning "No valid Azure context found. Attempting Identity-based login..."
+    Disable-AzContextAutosave -Scope Process | Out-Null
+    Connect-AzAccount -Identity -ErrorAction Stop | Out-Null
+    Write-Information "Identity-based login succeeded."
+  }
+  else {
+    Write-Information "Using existing Azure context: $($context.Account.Id)"
+  }
 }
 catch {
-    throw "Failed to verify or establish Azure login context: $_"
+  throw "Failed to verify or establish Azure login context: $_"
 }
 
 
@@ -98,6 +98,19 @@ if ([string]::IsNullOrEmpty($RunbookName)) {
   Write-Error "RunbookName environment variable is not set or it is empty. Check function's App Settings."
 }
 
+# Keep polling below the Function host's normal execution window. Operators can increase or
+# decrease this limit through App Settings without changing the function code.
+$runbookPollingTimeoutMinutes = 25
+$configuredPollingTimeout = [Environment]::GetEnvironmentVariable("RunbookPollingTimeoutMinutes", "Process")
+if (-not [string]::IsNullOrWhiteSpace($configuredPollingTimeout)) {
+  $parsedPollingTimeout = 0
+  if (-not [int]::TryParse($configuredPollingTimeout, [ref]$parsedPollingTimeout) -or
+      $parsedPollingTimeout -lt 1 -or $parsedPollingTimeout -gt 180) {
+    Write-Error "RunbookPollingTimeoutMinutes must be an integer from 1 through 180. Current value: '$configuredPollingTimeout'."
+  }
+  $runbookPollingTimeoutMinutes = $parsedPollingTimeout
+}
+
 Write-Information "Starting runbook $RunbookName in Automation Account $AutomationAccountName in Resource Group $ResourceGroupName on Hybrid Worker Group $HybridWorkerGroupName ..."
 
 try {
@@ -115,28 +128,68 @@ $jobId = $res.JobId
 
 Write-Information "Runbook started with job id: $($res.JobId)"
 
-# wait for the runbook to complete
-$job = Get-AzAutomationJob -Id $jobId -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName
-while ($job.Status -ne 'Completed' -and $job.Status -ne 'Failed' -and $job.Status -ne 'Suspended') {
-Write-Information "Runbook job id: $($jobId), status: $($job.Status)"
-  Start-Sleep -Seconds 5
-  $job = Get-AzAutomationJob -Id $jobId -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName
-}
-Write-Information "Runbook job id: $($jobId), status: $($job.Status)"
+# Poll with an explicit state policy so only Completed acknowledges the queue message. States
+# that can still advance are observed until the deadline; failed or unknown states fail closed.
+$pollingDeadline = [DateTime]::UtcNow.AddMinutes($runbookPollingTimeoutMinutes)
+$pollingIntervalSeconds = 5
+$continuingStates = @('New', 'Activating', 'Queued', 'Starting', 'Running', 'Resuming', 'Stopping', 'Disconnected')
+$failedStates = @('Failed', 'Stopped', 'Suspended', 'Blocked')
+$terminalError = $null
+$job = $null
 
-# write the output of the runbook
+:pollAutomationJob while ($true) {
+  try {
+    $job = Get-AzAutomationJob -Id $jobId -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName
+  }
+  catch {
+    throw "Unable to retrieve Automation job $jobId while polling: $_"
+  }
+  if ($null -eq $job -or [string]::IsNullOrWhiteSpace([string]$job.Status)) {
+    throw "Automation job $jobId returned no job object or status while polling."
+  }
+
+  $jobStatus = [string]$job.Status
+  Write-Information "Runbook job id: $jobId, status: $jobStatus"
+
+  if ($jobStatus -eq 'Completed') {
+    break pollAutomationJob
+  }
+  if ($jobStatus -in $failedStates) {
+    $terminalError = "Automation job $jobId ended in unsuccessful terminal state '$jobStatus'."
+    break pollAutomationJob
+  }
+  if ($jobStatus -notin $continuingStates) {
+    $terminalError = "Automation job $jobId returned unrecognized state '$jobStatus'."
+    break pollAutomationJob
+  }
+  if ([DateTime]::UtcNow -ge $pollingDeadline) {
+    $terminalError = "Automation job $jobId did not reach a terminal state within $runbookPollingTimeoutMinutes minute(s); last state was '$jobStatus'."
+    break pollAutomationJob
+  }
+
+  Start-Sleep -Seconds $pollingIntervalSeconds
+}
+
+# Retrieve output for diagnostics, but never retry a successfully completed lifecycle operation
+# solely because Automation output retrieval is temporarily unavailable.
 Write-Information "Runbook job id: $($jobId), output:"
-Get-AzAutomationJobOutput -Id $job.JobId -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName | ForEach-Object {
-  if ($_.Summary) {
-    $lastMsg = $_.Summary
-    Write-Information $lastMsg
+$lastMsg = '<no output was returned>'
+try {
+  Get-AzAutomationJobOutput -Id $jobId -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName | ForEach-Object {
+    if ($_.Summary) {
+      $lastMsg = $_.Summary
+      Write-Information $lastMsg
+    }
   }
 }
+catch {
+  $lastMsg = "Automation output retrieval failed: $($_.Exception.Message)"
+  Write-Warning "Runbook job id $jobId output could not be retrieved: $($_.Exception.Message)"
+}
 
-# if the runbook failed, generate an error (this will stop the function execution and mark the queue item as failed)
-if ($job.Status -eq 'Failed') {
-  $errorMessage = "Runbook job id: $($jobId) has failed! Last message from job was: $lastMsg"
-  Write-Error $errorMessage
+# Propagate every non-completed outcome so queue retry and poison-message handling remain active.
+if ($terminalError) {
+  throw "$terminalError Last runbook output: $lastMsg"
 }
 
 <# old code used to invoke the webhook directly, but now we use the runbook.
