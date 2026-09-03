@@ -150,7 +150,7 @@ CertLC/
 │   ├── normalnotification.html # Email template for successful operations
 │   └── errornotification.html  # Email template for failures
 ├── LogAnalytics/               # Custom table configuration
-│   └── customTable/            # Schema and transformation for certlc_CL table
+│   └── customTable/            # Schema and transformation for certlcstats_CL table
 ├── Workbooks/                  # Azure Monitor workbooks
 │   ├── certlc.workbook         # Certificate statistics dashboard
 │   └── *.kql                   # KQL queries for visualizations

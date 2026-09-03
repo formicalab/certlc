@@ -19,7 +19,7 @@ param runbookName = 'certlc'
 param runtimeEnvironmentName = 'certlc-PowerShell-7-6'
 param keyVaultName = 'flazkv-certlc-itn-001'
 param dataCollectionEndpointName = 'dce-certlc-itn-001'
-param dataCollectionRuleName = 'dcr-certlc-itn-001'
+param dataCollectionRuleName = 'dcr-certlcstats-itn-001'
 
 // Automation account variables
 param automationAccountVarCA = 'flazdc03.lab.formicalab.casa\\SubCA' // Name of the CA to use (for the automation account variable)

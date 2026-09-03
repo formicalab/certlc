@@ -261,7 +261,7 @@
             "type": 3,
             "content": {
               "version": "KqlItem/1.0",
-              "query": "// Purpose: Show certificate status summary for ONLY certificates that currently exist in the Key Vault\r\n// Problem: The runbook writes hourly snapshots, but deleted certificates remain in Log Analytics\r\n// Solution: Filter out certificates that weren't reported in the most recent successful runbook execution\r\n//\r\n// Logic:\r\n// 1. Get the completion time of the last SUCCESSFUL certlcstats runbook execution from job logs\r\n//    - This is safer than using certificate timestamps because:\r\n//      * It relies on actual job execution records, not certificate data\r\n//      * It handles cases where no certificates exist or all are deleted\r\n//      * It ensures we only consider data from completed (not failed) runs\r\n// 2. For each certificate Name, get its most recent entry (arg_max)\r\n// 3. Filter to only certificates updated within 5 minutes before the last successful job completion\r\n//    - If a certificate exists in Key Vault, it was written during the last successful cycle\r\n//    - If a certificate was deleted from Key Vault, it won't have been updated recently\r\n//    - 5 minutes allows for the runbook execution time to process all certificates\r\n// 4. Calculate status based on expiration time\r\n// 5. Summarize counts and percentages by status\r\n\r\nlet LastSuccessfulRunbookExecution = toscalar(\r\n    AzureDiagnostics\r\n    | where Category == \"JobLogs\"\r\n    | where Resource =~ \"{AutomationAccount:name}\"\r\n    | where RunbookName_s =~ tostring(split(\"{StatsRunbook}\", \"/\")[-1])  // The selected stats collection runbook\r\n    | where ResultType =~ \"Completed\"       // Only successful completions\r\n    | summarize arg_max(TimeGenerated, *)   // Get the most recent completed job\r\n    | project TimeGenerated\r\n);\r\n\r\nlet latestCerts = certlc_CL\r\n| summarize arg_max(LastUpdate = TimeGenerated, Name, Subject, Template, Created, Expires) by Name\r\n| where LastUpdate >= (LastSuccessfulRunbookExecution - 5m)  // Only show certs from the last successful cycle\r\n| extend RawTimeToExpire = Expires - now()  // timespan\r\n| extend Status = case(\r\n    RawTimeToExpire < 0d, \"❌ Expired\",\r\n    RawTimeToExpire < 30d, \"⚠️ Expiring Soon\",\r\n    \"✅ OK\");\r\n\r\nlet totalCount = toscalar(latestCerts | summarize count());\r\n\r\nlatestCerts\r\n| summarize Count = count() by Status\r\n| extend Total = totalCount\r\n| extend Percentage = round(100.0 * Count / Total, 2)\r\n| project Status, Count, Percentage\r\n| order by Status asc\r\n",
+              "query": "// Purpose: Show certificate status summary for ONLY certificates that currently exist in the Key Vault\r\n// Problem: The runbook writes hourly snapshots, but deleted certificates remain in Log Analytics\r\n// Solution: Select the snapshot emitted by the most recent successful runbook execution\r\n//\r\n// Logic:\r\n// 1. Get the JobId of the latest successful certlcstats execution\r\n// 2. Extract its Snapshot ID marker from the matching output stream\r\n// 3. Select only rows carrying that SnapshotId (an empty scan returns no rows)\r\n// 4. Calculate and summarize certificate status\r\n\r\nlet LatestSuccessfulJobId = toscalar(\r\n    AzureDiagnostics\r\n    | where Category == \"JobLogs\"\r\n    | where Resource =~ \"{AutomationAccount:name}\"\r\n    | where RunbookName_s =~ tostring(split(\"{StatsRunbook}\", \"/\")[-1])\r\n    | where ResultType =~ \"Completed\"\r\n    | summarize arg_max(TimeGenerated, JobId_g)\r\n    | project JobId = tostring(JobId_g)\r\n);\r\n\r\nlet LatestSnapshotId = toscalar(\r\n    AzureDiagnostics\r\n    | where Category == \"JobStreams\"\r\n    | where Resource =~ \"{AutomationAccount:name}\"\r\n    | where RunbookName_s =~ tostring(split(\"{StatsRunbook}\", \"/\")[-1])\r\n    | where tostring(JobId_g) == LatestSuccessfulJobId\r\n    | where StreamType_s =~ \"Output\"\r\n    | extend SnapshotId = extract(@\"Snapshot ID:\\s*([0-9A-Fa-f-]{36})\", 1, ResultDescription)\r\n    | where isnotempty(SnapshotId)\r\n    | summarize arg_max(TimeGenerated, SnapshotId)\r\n    | project SnapshotId\r\n);\r\n\r\nlet latestCerts = certlcstats_CL\r\n| where SnapshotId == LatestSnapshotId\r\n| extend LastUpdate = TimeGenerated\r\n| extend RawTimeToExpire = Expires - now()  // timespan\r\n| extend Status = case(\r\n    RawTimeToExpire < 0d, \"❌ Expired\",\r\n    RawTimeToExpire < 30d, \"⚠️ Expiring Soon\",\r\n    \"✅ OK\");\r\n\r\nlet totalCount = toscalar(latestCerts | summarize count());\r\n\r\nlatestCerts\r\n| summarize Count = count() by Status\r\n| extend Total = totalCount\r\n| extend Percentage = round(100.0 * Count / Total, 2)\r\n| project Status, Count, Percentage\r\n| order by Status asc\r\n",
               "size": 3,
               "title": "Status of certificates in the key vault - Last refreshed (UTC): {LastUpdateFormatted}",
               "noDataMessageStyle": 4,
@@ -381,7 +381,7 @@
             "type": 3,
             "content": {
               "version": "KqlItem/1.0",
-              "query": "// Purpose: Show detailed certificate information for ONLY certificates that currently exist in the Key Vault\r\n// Problem: The runbook writes hourly snapshots, but deleted certificates remain in Log Analytics\r\n// Solution: Filter out certificates that weren't reported in the most recent successful runbook execution\r\n//\r\n// Logic:\r\n// 1. Get the completion time of the last SUCCESSFUL certlcstats runbook execution from job logs\r\n//    - This is safer than using certificate timestamps because:\r\n//      * It relies on actual job execution records, not certificate data\r\n//      * It handles cases where no certificates exist or all are deleted\r\n//      * It ensures we only consider data from completed (not failed) runs\r\n// 2. For each certificate Name, get its most recent entry (arg_max)\r\n// 3. Filter to only certificates updated within 5 minutes before the last successful job completion\r\n//    - If a certificate exists in Key Vault, it was written during the last successful cycle\r\n//    - If a certificate was deleted from Key Vault, it won't have been updated recently\r\n//    - 5 minutes allows for the runbook execution time to process all certificates\r\n// 4. Calculate status based on expiration time and format time-to-expire\r\n// 5. Display certificate details sorted by expiration urgency\r\n\r\nlet LastSuccessfulRunbookExecution = toscalar(\r\n    AzureDiagnostics\r\n    | where Category == \"JobLogs\"\r\n    | where Resource =~ \"{AutomationAccount:name}\"\r\n    | where RunbookName_s =~ tostring(split(\"{StatsRunbook}\", \"/\")[-1])  // The selected stats collection runbook\r\n    | where ResultType =~ \"Completed\"       // Only successful completions\r\n    | summarize arg_max(TimeGenerated, *)   // Get the most recent completed job\r\n    | project TimeGenerated\r\n);\r\n\r\ncertlc_CL\r\n| summarize arg_max(LastUpdate = TimeGenerated, Name, Subject, Template, Created, Expires) by Name\r\n| where LastUpdate >= (LastSuccessfulRunbookExecution - 5m)  // Only show certs from the last successful cycle\r\n| extend RawTimeToExpire = Expires - now()  // timespan\r\n| extend TimeToExpire = format_timespan(RawTimeToExpire, 'd.hh:mm:ss')  // e.g., \"3.12:45:00\"\r\n| extend Status = case(\r\n    RawTimeToExpire < 0d, \"❌ Expired\",\r\n    RawTimeToExpire < 30d, \"⚠️ Expiring Soon\",\r\n    \"✅ OK\"\r\n)\r\n| order by RawTimeToExpire asc  // Most urgent (expired/expiring soon) first\r\n| project Status, LastUpdate, Name, Subject, Template, Created, Expires, TimeToExpire",
+              "query": "// Purpose: Show detailed certificate information for ONLY certificates that currently exist in the Key Vault\r\n// Problem: The runbook writes hourly snapshots, but deleted certificates remain in Log Analytics\r\n// Solution: Select the snapshot emitted by the most recent successful runbook execution\r\n//\r\n// Logic:\r\n// 1. Get the JobId of the latest successful certlcstats execution\r\n// 2. Extract its Snapshot ID marker from the matching output stream\r\n// 3. Select only rows carrying that SnapshotId (an empty scan returns no rows)\r\n// 4. Calculate status and display certificate details\r\n\r\nlet LatestSuccessfulJobId = toscalar(\r\n    AzureDiagnostics\r\n    | where Category == \"JobLogs\"\r\n    | where Resource =~ \"{AutomationAccount:name}\"\r\n    | where RunbookName_s =~ tostring(split(\"{StatsRunbook}\", \"/\")[-1])\r\n    | where ResultType =~ \"Completed\"\r\n    | summarize arg_max(TimeGenerated, JobId_g)\r\n    | project JobId = tostring(JobId_g)\r\n);\r\n\r\nlet LatestSnapshotId = toscalar(\r\n    AzureDiagnostics\r\n    | where Category == \"JobStreams\"\r\n    | where Resource =~ \"{AutomationAccount:name}\"\r\n    | where RunbookName_s =~ tostring(split(\"{StatsRunbook}\", \"/\")[-1])\r\n    | where tostring(JobId_g) == LatestSuccessfulJobId\r\n    | where StreamType_s =~ \"Output\"\r\n    | extend SnapshotId = extract(@\"Snapshot ID:\\s*([0-9A-Fa-f-]{36})\", 1, ResultDescription)\r\n    | where isnotempty(SnapshotId)\r\n    | summarize arg_max(TimeGenerated, SnapshotId)\r\n    | project SnapshotId\r\n);\r\n\r\ncertlcstats_CL\r\n| where SnapshotId == LatestSnapshotId\r\n| extend LastUpdate = TimeGenerated\r\n| extend RawTimeToExpire = Expires - now()  // timespan\r\n| extend TimeToExpire = format_timespan(RawTimeToExpire, 'd.hh:mm:ss')  // e.g., \"3.12:45:00\"\r\n| extend Status = case(\r\n    RawTimeToExpire < 0d, \"❌ Expired\",\r\n    RawTimeToExpire < 30d, \"⚠️ Expiring Soon\",\r\n    \"✅ OK\"\r\n)\r\n| order by RawTimeToExpire asc  // Most urgent (expired/expiring soon) first\r\n| project Status, LastUpdate, Name, Subject, Template, Created, Expires, TimeToExpire",
               "size": 3,
               "title": "Details - last refreshed (UTC): {LastUpdateFormatted}",
               "noDataMessageStyle": 4,
@@ -560,6 +560,149 @@
         "version": "NotebookGroup/1.0",
         "groupType": "editable",
         "items": [
+          {
+            "type": 3,
+            "content": {
+              "version": "KqlItem/1.0",
+              "query": "let TraceSummary = AppTraces\n| where AppRoleName =~ \"{FunctionApp:name}\"\n| where Message has_any (\"CERTLC:\", \"Runbook started with job id:\", \"Runbook job id:\")\n| summarize\n    Started = minif(TimeGenerated, Message has \"CERTLC: full message received\"),\n    Completed = countif(Message has \"status: Completed\") > 0,\n    LastTrace = max(TimeGenerated)\n  by OperationId\n| where isnotnull(Started);\nlet ExceptionSummary = AppExceptions\n| where AppRoleName =~ \"{FunctionApp:name}\"\n| summarize ExceptionCount = count() by OperationId;\nlet Operations = TraceSummary\n| join kind=leftouter ExceptionSummary on OperationId\n| extend Status = case(ExceptionCount > 0, \"Failed\", Completed, \"Completed\", \"In progress or unknown\"),\n         DurationSeconds = (LastTrace - Started) / 1s;\nlet Summary = materialize(Operations\n| summarize\n    Total = count(),\n    Completed = countif(Status == \"Completed\"),\n    Failed = countif(Status == \"Failed\"),\n    FailureRatePct = round(100.0 * countif(Status == \"Failed\") / count(), 1),\n    P95DurationSeconds = round(percentile(DurationSeconds, 95), 1));\nunion\n(Summary | project Metric = \"Invocations\", Value = tostring(Total)),\n(Summary | project Metric = \"Completed\", Value = tostring(Completed)),\n(Summary | project Metric = \"Failed\", Value = tostring(Failed)),\n(Summary | project Metric = \"Failure rate\", Value = strcat(FailureRatePct, \"%\")),\n(Summary | project Metric = \"P95 duration\", Value = strcat(P95DurationSeconds, \" s\"))",
+              "size": 3,
+              "title": "Function bridge summary",
+              "noDataMessageStyle": 4,
+              "timeContextFromParameter": "TimeRange",
+              "showRefreshButton": true,
+              "queryType": 0,
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ],
+              "visualization": "tiles",
+              "tileSettings": {
+                "showBorder": true,
+                "titleContent": {
+                  "columnMatch": "Metric",
+                  "formatter": 1
+                },
+                "leftContent": {
+                  "columnMatch": "Value",
+                  "formatter": 1
+                }
+              }
+            },
+            "name": "Function bridge summary"
+          },
+          {
+            "type": 3,
+            "content": {
+              "version": "KqlItem/1.0",
+              "query": "let TraceSummary = AppTraces\n| where AppRoleName =~ \"{FunctionApp:name}\"\n| where Message has_any (\"CERTLC:\", \"Runbook started with job id:\", \"Runbook job id:\")\n| summarize\n    Started = minif(TimeGenerated, Message has \"CERTLC: full message received\"),\n    Completed = countif(Message has \"status: Completed\") > 0\n  by OperationId\n| where isnotnull(Started);\nlet ExceptionSummary = AppExceptions\n| where AppRoleName =~ \"{FunctionApp:name}\"\n| summarize ExceptionCount = count() by OperationId;\nTraceSummary\n| join kind=leftouter ExceptionSummary on OperationId\n| extend Status = case(ExceptionCount > 0, \"Failed\", Completed, \"Completed\", \"In progress or unknown\")\n| summarize Invocations = count(), Failed = countif(Status == \"Failed\") by Time = bin(Started, 1h)\n| order by Time asc",
+              "size": 3,
+              "title": "Function bridge volume and failures",
+              "noDataMessageStyle": 4,
+              "timeContextFromParameter": "TimeRange",
+              "showRefreshButton": true,
+              "queryType": 0,
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ],
+              "visualization": "timechart",
+              "chartSettings": {
+                "xAxis": "Time",
+                "yAxis": [
+                  "Invocations",
+                  "Failed"
+                ]
+              }
+            },
+            "customWidth": "50",
+            "name": "Function bridge trend"
+          },
+          {
+            "type": 3,
+            "content": {
+              "version": "KqlItem/1.0",
+              "query": "let TraceSummary = AppTraces\n| where AppRoleName =~ \"{FunctionApp:name}\"\n| where Message has_any (\"CERTLC:\", \"Runbook started with job id:\", \"Runbook job id:\")\n| summarize\n    Started = minif(TimeGenerated, Message has \"CERTLC: full message received\"),\n    EventType = take_anyif(extract(@\"CERTLC: event type:\\s*(.+)$\", 1, Message), Message has \"CERTLC: event type:\"),\n    RunbookJobId = take_anyif(extract(@\"job id:\\s*([0-9a-fA-F-]{36})\", 1, Message), Message has \"job id:\"),\n    Completed = countif(Message has \"status: Completed\") > 0,\n    LastTrace = max(TimeGenerated)\n  by OperationId\n| where isnotnull(Started);\nlet ExceptionSummary = AppExceptions\n| where AppRoleName =~ \"{FunctionApp:name}\"\n| summarize ExceptionCount = count() by OperationId;\nTraceSummary\n| join kind=leftouter ExceptionSummary on OperationId\n| extend Status = case(ExceptionCount > 0, \"Failed\", Completed, \"Completed\", \"In progress or unknown\"),\n         Duration = LastTrace - Started\n| top 10 by Duration desc\n| project Started, Status, EventType, RunbookJobId, Duration",
+              "size": 3,
+              "title": "Slowest Function bridge operations",
+              "noDataMessageStyle": 4,
+              "timeContextFromParameter": "TimeRange",
+              "showRefreshButton": true,
+              "showExportToExcel": true,
+              "queryType": 0,
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ],
+              "visualization": "table",
+              "gridSettings": {
+                "formatters": [
+                  {
+                    "columnMatch": "Started",
+                    "formatter": 6,
+                    "formatOptions": {
+                      "customColumnWidthSetting": "20ch"
+                    },
+                    "dateFormat": {
+                      "showUtcTime": null,
+                      "formatName": "shortDateTimeNoMsPattern"
+                    }
+                  },
+                  {
+                    "columnMatch": "Status",
+                    "formatter": 1
+                  }
+                ],
+                "rowLimit": 10,
+                "filter": true
+              }
+            },
+            "customWidth": "50",
+            "name": "Slowest Function bridge operations"
+          },
+          {
+            "type": 3,
+            "content": {
+              "version": "KqlItem/1.0",
+              "query": "let BridgeOperations = AppTraces\n| where AppRoleName =~ \"{FunctionApp:name}\"\n| where Message has_any (\"CERTLC:\", \"Runbook started with job id:\", \"Runbook job id:\")\n| summarize by OperationId;\nlet FunctionFailures = BridgeOperations\n| join kind=inner (\n    AppExceptions\n    | where AppRoleName =~ \"{FunctionApp:name}\"\n    | summarize arg_max(TimeGenerated, OuterMessage) by OperationId\n  ) on OperationId\n| project Time = TimeGenerated, Source = \"Function bridge\", Id = OperationId, Details = tostring(OuterMessage);\nlet FailedJobs = AzureDiagnostics\n| where Category == \"JobLogs\"\n| where Resource =~ \"{AutomationAccount:name}\"\n| where RunbookName_s =~ tostring(split(\"{Runbook:name}\", \"/\")[-1])\n| summarize arg_max(TimeGenerated, ResultType) by JobId_g\n| where ResultType =~ \"Failed\"\n| extend JobId = tostring(JobId_g);\nlet JobErrors = AzureDiagnostics\n| where Category == \"JobStreams\"\n| where Resource =~ \"{AutomationAccount:name}\"\n| where RunbookName_s =~ tostring(split(\"{Runbook:name}\", \"/\")[-1])\n| where StreamType_s == \"Error\"\n| summarize arg_max(TimeGenerated, ResultDescription) by JobId = tostring(JobId_g)\n| project JobId, ErrorMessage = replace_regex(tostring(ResultDescription), @\"\\x1B\\[[0-9;]*[A-Za-z]\", \"\");\nunion\nFunctionFailures,\n(FailedJobs\n| join kind=leftouter JobErrors on JobId\n| project Time = TimeGenerated, Source = \"Automation job\", Id = JobId, Details = ErrorMessage)\n| top 20 by Time desc",
+              "size": 3,
+              "title": "Recent failures",
+              "noDataMessageStyle": 4,
+              "timeContextFromParameter": "TimeRange",
+              "showRefreshButton": true,
+              "showExportToExcel": true,
+              "queryType": 0,
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ],
+              "visualization": "table",
+              "gridSettings": {
+                "formatters": [
+                  {
+                    "columnMatch": "Time",
+                    "formatter": 6,
+                    "formatOptions": {
+                      "customColumnWidthSetting": "20ch"
+                    },
+                    "dateFormat": {
+                      "showUtcTime": null,
+                      "formatName": "shortDateTimeNoMsPattern"
+                    }
+                  },
+                  {
+                    "columnMatch": "Details",
+                    "formatter": 1,
+                    "formatOptions": {
+                      "customColumnWidthSetting": "50%"
+                    }
+                  }
+                ],
+                "rowLimit": 20,
+                "filter": true
+              }
+            },
+            "name": "Recent failures"
+          },
           {
             "type": 3,
             "content": {

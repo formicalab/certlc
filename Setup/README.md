@@ -200,11 +200,11 @@ The Bicep template creates and configures the following Azure resources:
   - Linked to Log Analytics Workspace
   - Local authentication disabled — telemetry is ingested via the Function App's managed identity (Monitoring Metrics Publisher role) using `APPLICATIONINSIGHTS_AUTHENTICATION_STRING=Authorization=AAD`
 
-#### 4. **Custom Table** (`certlc_CL`)
+#### 4. **Custom Table** (`certlcstats_CL`)
 - **Type**: Custom table in Log Analytics Workspace
 - **Purpose**: Stores certificate statistics updated by the `certlcstats.ps1` runbook
 - **Configuration**: 30-day retention, Analytics plan
-- **Schema**: 8 columns including TimeGenerated, Thumbprint, Name, Created, Expires, Subject, Template, DNSNames
+- **Schema**: 9 columns including TimeGenerated, SnapshotId, Thumbprint, Name, Created, Expires, Subject, Template, DNSNames
 
 #### 5. **Data Collection Endpoint (DCE)**
 - **Purpose**: Ingestion endpoint for custom logs and metrics
@@ -214,9 +214,9 @@ The Bicep template creates and configures the following Azure resources:
 #### 6. **Data Collection Rule (DCR)**
 - **Purpose**: Defines data transformation and routing for custom certificate statistics
 - **Configuration**:
-  - Stream declaration: `Custom-certlc_CL`
+  - Stream declaration: `Custom-certlcstats_CL`
   - KQL transformation: Converts string dates to datetime and adds TimeGenerated
-  - Destination: Log Analytics Workspace custom table (`certlc_CL`)
+  - Destination: Log Analytics Workspace custom table (`certlcstats_CL`)
 - **Used by**: Automation Account runbook to publish certificate statistics
 
 #### 7. **Azure Monitor Workbook**
@@ -435,7 +435,7 @@ After deploying the infrastructure, complete these additional steps:
      6. For certificate near-expiry events, verify Event Grid captures the event and delivers to the queue
    - **Verify statistics collection**:
      - Run the `certlcstats` runbook manually or wait for the schedule (if enabled)
-     - Query the custom table in Log Analytics: `certlc_CL | order by TimeGenerated desc`
+      - Query the custom table in Log Analytics: `certlcstats_CL | order by TimeGenerated desc`
      - Verify certificate data appears with correct fields (Thumbprint, Name, Expires, Subject, etc.)
 
 ## Security Notes

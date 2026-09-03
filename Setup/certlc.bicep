@@ -41,7 +41,7 @@ param functionAppName string
 @description('The name of the Log Analytics workspace for centralized logging and monitoring. Stores diagnostic logs, custom certificate statistics, and application telemetry.')
 param logAnalyticsWorkspaceName string
 
-@description('Retention in days for the Log Analytics workspace and the certlc_CL custom table. Range 30-730. Default 30 (lab-friendly).')
+@description('Retention in days for the Log Analytics workspace and the certlcstats_CL custom table. Range 30-730. Default 30 (lab-friendly).')
 @minValue(30)
 @maxValue(730)
 param logAnalyticsRetentionInDays int = 30
@@ -282,9 +282,10 @@ resource dataCollectionEndpoint 'Microsoft.Insights/dataCollectionEndpoints@2024
   tags: commonTags
 }
 
-// Schema of the certlc_CL custom table data columns (shared between the LAW custom table and the DCR stream).
+// Schema of the certlcstats_CL custom table data columns (shared between the LAW custom table and the DCR stream).
 // The LAW table additionally prepends a TimeGenerated column (the DCR computes it via transformKql).
 var certlcDataColumns = [
+  { name: 'SnapshotId', type: 'string' }
   { name: 'Thumbprint', type: 'string' }
   { name: 'Name',       type: 'string' }
   { name: 'Created',    type: 'datetime' }
@@ -296,12 +297,12 @@ var certlcDataColumns = [
 
 // Custom Table for Certificate Statistics
 resource customTable 'Microsoft.OperationalInsights/workspaces/tables@2025-07-01' = {
-  name: 'certlc_CL'
+  name: 'certlcstats_CL'
   parent: logAnalyticsWorkspace
   properties: {
     retentionInDays: logAnalyticsRetentionInDays
     schema: {
-      name: 'certlc_CL'
+      name: 'certlcstats_CL'
       columns: concat(
         [ { name: 'TimeGenerated', type: 'datetime' } ],
         certlcDataColumns
@@ -317,7 +318,7 @@ resource dataCollectionRule 'Microsoft.Insights/dataCollectionRules@2024-03-11' 
   properties: {
     dataCollectionEndpointId: dataCollectionEndpoint.id
     streamDeclarations: {
-      'Custom-certlc_CL': {
+      'Custom-certlcstats_CL': {
         columns: certlcDataColumns
       }
     }
@@ -332,13 +333,13 @@ resource dataCollectionRule 'Microsoft.Insights/dataCollectionRules@2024-03-11' 
     dataFlows: [
       {
         streams: [
-          'Custom-certlc_CL'
+          'Custom-certlcstats_CL'
         ]
         destinations: [
           'clv2ws1'
         ]
         transformKql: 'source | extend Created = todatetime(Created), Expires = todatetime(Expires) | extend TimeGenerated = now()'
-        outputStream: 'Custom-certlc_CL'
+        outputStream: 'Custom-certlcstats_CL'
       }
     ]
   }
@@ -551,7 +552,7 @@ var automationAccountVariableValues = {
   'certlc-smtppassword':       automationAccountVarSmtpPassword
   'certlc-stats-keyvault':     keyVault.name
   'certlc-stats-immutableid':  dataCollectionRule.properties.immutableId
-  'certlc-stats-streamname':   'Custom-certlc_CL'
+  'certlc-stats-streamname':   'Custom-certlcstats_CL'
   'certlc-stats-ingestionurl': dataCollectionEndpoint.properties.logsIngestion.endpoint
 }
 var automationAccountVariableNames = [
