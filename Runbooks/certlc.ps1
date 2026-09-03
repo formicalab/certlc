@@ -664,7 +664,10 @@ function Format-PfxProtectTo {
         [Parameter()] [object] $InputValue
     )
 
-    if (-not $InputValue) { return @() }
+    if (-not $InputValue) {
+        Write-Output -NoEnumerate @()
+        return
+    }
 
     # Wrap single string
     if ($InputValue -isnot [System.Array]) {
@@ -688,8 +691,9 @@ function Format-PfxProtectTo {
     $out = foreach ($n in $normalized) {
         if ($seen.Add($n)) { $n }
     }
-    # Force array output even when single element to keep downstream .Count usage safe under StrictMode
-    return @($out)
+    # PowerShell enumerates arrays written by return, collapsing zero items to $null and one item
+    # to a scalar. Suppress enumeration so callers always receive the documented array type.
+    Write-Output -NoEnumerate @($out)
 }
 
 #endregion
@@ -775,11 +779,15 @@ function Convert-PfxProtectToFromTag {
         [string] $TagValue
     )
 
-    if ([string]::IsNullOrWhiteSpace($TagValue)) { return @() }
+    if ([string]::IsNullOrWhiteSpace($TagValue)) {
+        Write-Output -NoEnumerate @()
+        return
+    }
 
     # Parse then normalize to keep parity with input handling
-    $raw = $TagValue.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
-    return Format-PfxProtectTo -InputValue $raw
+    $raw = @($TagValue.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+    $normalized = Format-PfxProtectTo -InputValue $raw
+    Write-Output -NoEnumerate @($normalized)
 }
 
 #endregion
@@ -949,7 +957,9 @@ function Initialize-PfxExportTarget {
         throw [System.Exception]::new("Initialize-PfxExportTarget: PFX directory '$targetPath' cannot accept the required ACL and file operations.", $_.Exception)
     }
 
-    Write-CertLCLog -Section 'Initialize-PfxExportTarget' -Message "PFX: Export prerequisites validated for target folder $targetPath and $($protectionSids.Count) protection principal(s)."
+    # This function returns a data object to its caller. Route its log away from the success
+    # stream so assignment captures only the object below, not a mixed log-and-result array.
+    Write-CertLCLog -Section 'Initialize-PfxExportTarget' -Message "PFX: Export prerequisites validated for target folder $targetPath and $($protectionSids.Count) protection principal(s)." | Write-Information -InformationAction Continue
     return [pscustomobject]@{
         TargetFolder   = $targetPath
         ProtectionSids = $protectionSids.ToArray()
@@ -1300,7 +1310,9 @@ function Merge-KeyVaultCertificateChain {
     $escapedCertificateName = [Uri]::EscapeDataString($CertificateName)
     $uri = "https://$VaultName.vault.azure.net/certificates/$escapedCertificateName/pending/merge?api-version=2025-07-01"
 
-    Write-CertLCLog -Section 'Merge-KeyVaultCertificateChain' -Message "KeyVault: Submitting $($x5c.Count) explicitly encoded certificate(s) for pending certificate $CertificateName in vault $VaultName."
+    # This function returns the Key Vault response object. Keep its informational log off the
+    # success stream so callers do not receive a mixed log-and-response array under StrictMode.
+    Write-CertLCLog -Section 'Merge-KeyVaultCertificateChain' -Message "KeyVault: Submitting $($x5c.Count) explicitly encoded certificate(s) for pending certificate $CertificateName in vault $VaultName." | Write-Information -InformationAction Continue
 
     # Do not wrap this state-changing POST in Invoke-WithRetry. A transport failure can occur
     # after Key Vault commits the merge, making an automatic retry operationally ambiguous.
@@ -1484,12 +1496,12 @@ function Export-PfxWithGroupProtection {
     )
 
     # Add native interop helpers
-    if (-not ('Win32Native' -as [type])) {
+    if (-not ('CertLCPfxNative' -as [type])) {
         Add-Type -TypeDefinition @'
         using System;
         using System.Runtime.InteropServices;
 
-        public static class Win32Native
+        public static class CertLCPfxNative
         {
             [StructLayout(LayoutKind.Sequential)]
             public struct BLOB
@@ -1505,14 +1517,9 @@ function Export-PfxWithGroupProtection {
             [DllImport("ncrypt.dll")]
             public static extern int NCryptCloseProtectionDescriptor(IntPtr hDesc);
 
-            [DllImport("crypt32.dll", CharSet = CharSet.Ansi, SetLastError = true)]
-            public static extern IntPtr CertOpenStore(
-                string storeProvider, uint encoding, IntPtr hCryptProv,
-                uint flags, IntPtr pvPara);
-
-            [DllImport("crypt32.dll", SetLastError = true)]
-            public static extern bool CertAddCertificateContextToStore(
-                IntPtr hStore, IntPtr pCert, uint disp, IntPtr ppOut);
+            [DllImport("crypt32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+            public static extern IntPtr PFXImportCertStore(
+                ref BLOB pfx, string password, uint flags);
 
             [DllImport("crypt32.dll", SetLastError = true)]
             public static extern bool CertCloseStore(IntPtr hStore, uint flags);
@@ -1530,31 +1537,39 @@ function Export-PfxWithGroupProtection {
 
     # create protection descriptor
     $hDesc = [IntPtr]::Zero
-    $hr = [Win32Native]::NCryptCreateProtectionDescriptor($rule, 0, [ref]$hDesc)
+    $hr = [CertLCPfxNative]::NCryptCreateProtectionDescriptor($rule, 0, [ref]$hDesc)
     if ($hr) {
         throw 'Export-PfxWithGroupProtection: NCryptCreateProtectionDescriptor failed: 0x{0:X}' -f $hr
     }
     Write-CertLCLog -Section 'Export-PfxWithGroupProtection' -Message "Protection descriptor handle: $hDesc"
 
-    try {
+    $sourcePfxBytes = $null
+    $sourcePfxBuffer = [IntPtr]::Zero
+    $store = [IntPtr]::Zero
+    $passwordBytes = [System.Security.Cryptography.RandomNumberGenerator]::GetBytes(40)
+    $password = [System.Convert]::ToBase64String($passwordBytes)
+    [Array]::Clear($passwordBytes, 0, $passwordBytes.Length)
 
-        # Create memory store
-        $store = [Win32Native]::CertOpenStore('Memory', 0, [IntPtr]::Zero, 0x2000, [IntPtr]::Zero)
+    try {
+        # Import an intermediate in-memory PKCS#12 into a non-persistent native store. This
+        # preserves the private-key association that is lost when only certificate contexts
+        # are copied into a new memory store.
+        $sourcePfxBytes = ([System.Security.Cryptography.X509Certificates.X509Certificate2Collection]$Certificates).Export(
+            [System.Security.Cryptography.X509Certificates.X509ContentType]::Pfx,
+            $password)
+        $sourcePfxBuffer = [Runtime.InteropServices.Marshal]::AllocHGlobal($sourcePfxBytes.Length)
+        [Runtime.InteropServices.Marshal]::Copy($sourcePfxBytes, 0, $sourcePfxBuffer, $sourcePfxBytes.Length)
+        $sourcePfx = New-Object CertLCPfxNative+BLOB
+        $sourcePfx.cbData = $sourcePfxBytes.Length
+        $sourcePfx.pbData = $sourcePfxBuffer
+        $store = [CertLCPfxNative]::PFXImportCertStore([ref]$sourcePfx, $password, 0x0001 -bor 0x8000)
         if ($store -eq [IntPtr]::Zero) {
-            throw 'Export-PfxWithGroupProtection: CertOpenStore failed: 0x{0:X}' -f [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            throw 'Export-PfxWithGroupProtection: PFXImportCertStore failed: 0x{0:X}' -f [Runtime.InteropServices.Marshal]::GetLastWin32Error()
         }
-        Write-CertLCLog -Section 'Export-PfxWithGroupProtection' -Message "Memory store handle: $store"
+        Write-CertLCLog -Section 'Export-PfxWithGroupProtection' -Message "Private-key PFX imported into native memory store: $store"
 
         try {
-
-            # Add every selected chain member to one memory store. Only the leaf is expected
-            # to carry a private key; issuer certificates add their public material to the PFX.
-            foreach ($certificate in $Certificates) {
-                if (-not [Win32Native]::CertAddCertificateContextToStore($store, $certificate.Handle, 3, [IntPtr]::Zero)) {
-                    throw "Export-PfxWithGroupProtection: CertAddCertificateContextToStore failed for '$($certificate.Subject)': $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
-                }
-            }
-            Write-CertLCLog -Section 'Export-PfxWithGroupProtection' -Message "$($Certificates.Count) certificate(s) added to memory store."
+            Write-CertLCLog -Section 'Export-PfxWithGroupProtection' -Message "$($Certificates.Count) certificate(s) imported into native memory store."
 
             # Wrap the handle in an IntPtr buffer
             $pvPara = [Runtime.InteropServices.Marshal]::AllocHGlobal([IntPtr]::Size)
@@ -1562,14 +1577,11 @@ function Export-PfxWithGroupProtection {
 
             try {
 
-                # generate a random password for the PFX (as per documentation, if not used the API should generate one, but it seems it does not and uses empty or "0" as passwords)
-                $password = [System.Convert]::ToBase64String([System.Security.Cryptography.RandomNumberGenerator]::GetBytes(40))
-
                 # Query size of PFX so that we know how much buffer to allocate (pass 1)
-                $blob = New-Object Win32Native+BLOB
-                $flags = 0x0004 -bor 0x0010 -bor 0x0020  # EXPORT_PRIVATE_KEYS | INCLUDE_EXTENDED_PROPERTIES | PROTECT_TO_DOMAIN_SIDS
+                $blob = New-Object CertLCPfxNative+BLOB
+                $flags = 0x0002 -bor 0x0004 -bor 0x0010 -bor 0x0020  # REPORT_NOT_ABLE_TO_EXPORT_PRIVATE_KEY | EXPORT_PRIVATE_KEYS | INCLUDE_EXTENDED_PROPERTIES | PROTECT_TO_DOMAIN_SIDS
 
-                if (-not [Win32Native]::PFXExportCertStoreEx($store, [ref]$blob, $password, $pvPara, $flags)) {
+                if (-not [CertLCPfxNative]::PFXExportCertStoreEx($store, [ref]$blob, $password, $pvPara, $flags)) {
                     throw ('Export-PfxWithGroupProtection:: size query failed: 0x{0:X}' -f [Runtime.InteropServices.Marshal]::GetLastWin32Error())
                 }
                 Write-CertLCLog -Section 'Export-PfxWithGroupProtection' -Message "PFX size will be: $($blob.cbData) bytes"
@@ -1579,7 +1591,7 @@ function Export-PfxWithGroupProtection {
 
                 # do export to the memory store
                 try {
-                    if (-not [Win32Native]::PFXExportCertStoreEx($store, [ref]$blob, $password, $pvPara, $flags)) {
+                    if (-not [CertLCPfxNative]::PFXExportCertStoreEx($store, [ref]$blob, $password, $pvPara, $flags)) {
                         throw ('Export-PfxWithGroupProtection: export to memory store failed: 0x{0:X}' -f [Runtime.InteropServices.Marshal]::GetLastWin32Error())
                     }
                     Write-CertLCLog -Section 'Export-PfxWithGroupProtection' 'Export to memory store successful.'
@@ -1604,12 +1616,19 @@ function Export-PfxWithGroupProtection {
         }
         finally {
             # close the memory store
-            [Win32Native]::CertCloseStore($store, 0) | Out-Null
+            [CertLCPfxNative]::CertCloseStore($store, 0) | Out-Null
         }
     }
     finally {
+        $password = $null
+        if ($sourcePfxBuffer -ne [IntPtr]::Zero) {
+            [Runtime.InteropServices.Marshal]::FreeHGlobal($sourcePfxBuffer)
+        }
+        if ($null -ne $sourcePfxBytes) {
+            [Array]::Clear($sourcePfxBytes, 0, $sourcePfxBytes.Length)
+        }
         # free the protection descriptor handle
-        [Win32Native]::NCryptCloseProtectionDescriptor($hDesc) | Out-Null
+        [CertLCPfxNative]::NCryptCloseProtectionDescriptor($hDesc) | Out-Null
     }
 }
 
@@ -2883,7 +2902,7 @@ switch ($requestBody.type) {
         }
         else {
             Write-CertLCLog -Section 'Dispatcher.Renewal' -Message "NotifyTo addresses found for certificate $CertificateName in vault ${VaultName}: $rawNotifyTo"
-            $notifyTo = $rawNotifyTo.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+            $notifyTo = @($rawNotifyTo.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
         }
 
         # Certificate subject
@@ -2895,7 +2914,7 @@ switch ($requestBody.type) {
         if ($null -ne $san) {
             # $DNS.Format(0) returns a string like: DNS Name=server01.contoso.com, DNS Name=server01.litware.com.
             # Transform it into an array of DNS names using regex; remove the "DNS Name=" prefix and split by comma
-            $CertificateDnsNames = ($san.Format(0) -replace 'DNS Name=', '').Split(',').Trim() | Where-Object { $_ -ne '' }
+            $CertificateDnsNames = @(($san.Format(0) -replace 'DNS Name=', '').Split(',').Trim() | Where-Object { $_ -ne '' })
         }
 
         # get the OID of the Certificate Template
@@ -3180,7 +3199,7 @@ switch ($requestBody.type) {
         }
         else {
             Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "NotifyTo addresses found for certificate $CertificateName version $CertificateVersion in vault ${VaultName}: $rawNotifyTo"
-            $notifyTo = $rawNotifyTo.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+            $notifyTo = @($rawNotifyTo.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
         }
 
         # Idempotency guard: if this version is already marked as revoked, exit cleanly with a

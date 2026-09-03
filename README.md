@@ -129,6 +129,8 @@ The runbook's Key Vault REST reads for thumbprint discovery and exact secret ret
 
 The Function bridge acknowledges a queue message only when the Automation job reaches `Completed`. `Failed`, `Stopped`, `Suspended`, and `Blocked` fail the Function invocation so queue retry and poison-message handling remain active. Transitional states are polled for up to `RunbookPollingTimeoutMinutes` (25 minutes in the Bicep deployment); an unknown state or elapsed deadline fails closed. Automation output retrieval is best-effort and cannot turn an otherwise completed lifecycle operation into a duplicate queue retry.
 
+Queue-trigger retries are bounded by [host.json](Functions/CertLCBridge/host.json): CertLC currently uses `maxDequeueCount: 5` and `visibilityTimeout: 00:00:30`, so a failed message is processed at most five times with a 30-second delay between unsuccessful attempts. Every attempt starts a separate Automation job. After the fifth failure, the Functions host moves the message from `certlc` to `certlc-poison`; it is not retried again unless an operator resubmits it. These settings can be changed in `host.json` and redeployed, or overridden per environment with the Function App settings `AzureFunctionsJobHost__extensions__queues__maxDequeueCount` and `AzureFunctionsJobHost__extensions__queues__visibilityTimeout`.
+
 ## Repository Structure
 
 ```
