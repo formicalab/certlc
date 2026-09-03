@@ -784,6 +784,278 @@ function Convert-PfxProtectToFromTag {
 
 #endregion
 
+#region ### Certificate chain helpers ###
+
+#########################################
+# FUNCTIONS - Certificate chain helpers #
+#########################################
+
+<#
+.SYNOPSIS
+    Compare two X.500 distinguished names by their encoded values.
+
+.DESCRIPTION
+    Certificate subject and issuer strings can use different formatting while representing
+    the same distinguished name. Comparing RawData avoids formatting-dependent mismatches.
+
+.PARAMETER Left
+    The first distinguished name to compare.
+
+.PARAMETER Right
+    The second distinguished name to compare.
+#>
+function Test-DistinguishedNameEqual {
+    [OutputType([bool])]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Security.Cryptography.X509Certificates.X500DistinguishedName]$Left,
+
+        [Parameter(Mandatory = $true)]
+        [System.Security.Cryptography.X509Certificates.X500DistinguishedName]$Right
+    )
+
+    return [Convert]::ToBase64String($Left.RawData) -ceq [Convert]::ToBase64String($Right.RawData)
+}
+
+<#
+.SYNOPSIS
+    Decode a Base64 PKCS#7 certificate response.
+
+.DESCRIPTION
+    Removes optional PEM headers and whitespace, decodes the PKCS#7 payload, and imports all
+    certificates into one X509Certificate2Collection. Temporary decoded bytes are cleared.
+
+.PARAMETER Content
+    Base64 or PEM-formatted PKCS#7 certificate content returned by AD CS.
+
+.OUTPUTS
+    System.Security.Cryptography.X509Certificates.X509Certificate2Collection
+#>
+function ConvertFrom-Base64Pkcs7 {
+    [OutputType([System.Security.Cryptography.X509Certificates.X509Certificate2Collection])]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Content
+    )
+
+    # AD CS can return either plain Base64 or Base64 with PEM boundary lines.
+    $base64 = $Content -replace '(?m)^-----[^\r\n]+-----\s*$', '' -replace '\s', ''
+    try {
+        $bytes = [Convert]::FromBase64String($base64)
+    }
+    catch {
+        throw [System.Exception]::new("ConvertFrom-Base64Pkcs7: CA response is not valid Base64 PKCS#7: $($_.Exception.Message)", $_.Exception)
+    }
+
+    $collection = [System.Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
+    try {
+        $collection.Import($bytes)
+    }
+    catch {
+        throw [System.Exception]::new("ConvertFrom-Base64Pkcs7: CA response could not be decoded as PKCS#7: $($_.Exception.Message)", $_.Exception)
+    }
+    finally {
+        # Certificate bytes are public material, but clearing transient buffers keeps cleanup
+        # consistent with the later PKCS#12 path, which also carries private-key material.
+        [Array]::Clear($bytes, 0, $bytes.Length)
+    }
+
+    # PowerShell normally enumerates collections on output. Preserve the collection object so
+    # strict-mode callers can reliably use .Count even when a response contains one certificate.
+    Write-Output -NoEnumerate $collection
+}
+
+<#
+.SYNOPSIS
+    Order a certificate collection from leaf to self-issued root.
+
+.DESCRIPTION
+    Selects exactly one leaf, follows encoded issuer-to-subject relationships, and rejects
+    ambiguous issuers, unrelated certificates, or a chain without a self-issued root.
+
+.PARAMETER Certificates
+    The certificate collection to order.
+
+.PARAMETER Source
+    Identifies whether the collection came from AD CS or a Key Vault PKCS#12 secret. AD CS
+    leaf selection uses Basic Constraints; Key Vault leaf selection uses the private key.
+
+.PARAMETER ExcludeRoot
+    Remove the self-issued root after ordering. At least one intermediate must remain.
+
+.OUTPUTS
+    System.Security.Cryptography.X509Certificates.X509Certificate2[]
+#>
+function Get-OrderedCertificateChain {
+    [OutputType([System.Security.Cryptography.X509Certificates.X509Certificate2[]])]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2Collection]$Certificates,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('CaResponse', 'KeyVaultSecret')]
+        [string]$Source,
+
+        [Parameter()]
+        [switch]$ExcludeRoot
+    )
+
+    # Wrap the complete conditional expression. Wrapping only each branch still permits
+    # PowerShell to unwrap a one-item result before assignment under strict mode.
+    $leafCandidates = @(if ($Source -eq 'KeyVaultSecret') {
+        $Certificates | Where-Object HasPrivateKey
+    }
+    else {
+        $Certificates | Where-Object {
+            $basicConstraints = $_.Extensions |
+                Where-Object { $_ -is [System.Security.Cryptography.X509Certificates.X509BasicConstraintsExtension] } |
+                Select-Object -First 1
+            $null -eq $basicConstraints -or -not $basicConstraints.CertificateAuthority
+        }
+    })
+    if ($leafCandidates.Count -ne 1) {
+        throw [System.Exception]::new("Get-OrderedCertificateChain: Expected exactly one leaf certificate in $Source; found $($leafCandidates.Count).")
+    }
+
+    # Keep unconsumed certificates in a mutable list so each issuer can be used exactly once.
+    $remaining = [System.Collections.Generic.List[System.Security.Cryptography.X509Certificates.X509Certificate2]]::new()
+    foreach ($certificate in $Certificates) {
+        if ($certificate.Thumbprint -cne $leafCandidates[0].Thumbprint) {
+            $remaining.Add($certificate)
+        }
+    }
+
+    $ordered = [System.Collections.Generic.List[System.Security.Cryptography.X509Certificates.X509Certificate2]]::new()
+    $current = $leafCandidates[0]
+    while ($null -ne $current) {
+        $ordered.Add($current)
+        if (Test-DistinguishedNameEqual -Left $current.SubjectName -Right $current.IssuerName) {
+            break
+        }
+
+        # Encoded distinguished-name comparison avoids locale and formatting differences in
+        # the display strings exposed by Subject and Issuer.
+        $issuers = @($remaining | Where-Object {
+            Test-DistinguishedNameEqual -Left $_.SubjectName -Right $current.IssuerName
+        })
+        if ($issuers.Count -ne 1) {
+            throw [System.Exception]::new("Get-OrderedCertificateChain: Expected one issuer for '$($current.Subject)' in $Source; found $($issuers.Count).")
+        }
+
+        $current = $issuers[0]
+        $null = $remaining.Remove($current)
+    }
+
+    if ($remaining.Count -gt 0) {
+        throw [System.Exception]::new("Get-OrderedCertificateChain: $Source contains $($remaining.Count) certificate(s) outside the leaf's issuer chain.")
+    }
+    if (-not (Test-DistinguishedNameEqual -Left $ordered[$ordered.Count - 1].SubjectName -Right $ordered[$ordered.Count - 1].IssuerName)) {
+        throw [System.Exception]::new("Get-OrderedCertificateChain: $Source does not terminate in a self-issued root certificate.")
+    }
+
+    if ($ExcludeRoot) {
+        $ordered.RemoveAt($ordered.Count - 1)
+        if ($ordered.Count -lt 2) {
+            throw [System.Exception]::new("Get-OrderedCertificateChain: $Source contains no intermediate CA certificate after the root is excluded.")
+        }
+    }
+
+    # Prevent output-pipeline enumeration so a one-item result remains an array for strict mode.
+    Write-Output -NoEnumerate $ordered.ToArray()
+}
+
+<#
+.SYNOPSIS
+    Assert that two certificate collections contain exactly the same certificates.
+
+.DESCRIPTION
+    Compares certificate counts and unique thumbprints. This detects missing, unexpected,
+    and duplicate certificates without relying on collection order.
+
+.PARAMETER Expected
+    The expected certificates.
+
+.PARAMETER Actual
+    The certificate collection being verified.
+
+.PARAMETER Context
+    Description included in a mismatch error.
+#>
+function Assert-CertificateSet {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2[]]$Expected,
+
+        [Parameter(Mandatory = $true)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2Collection]$Actual,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Context
+    )
+
+    # Count comparison detects duplicate certificate bags that unique thumbprints alone hide.
+    $expectedThumbprints = @($Expected.Thumbprint | Sort-Object -Unique)
+    $actualThumbprints = @($Actual.Thumbprint | Sort-Object -Unique)
+    $missing = @($expectedThumbprints | Where-Object { $_ -notin $actualThumbprints })
+    $unexpected = @($actualThumbprints | Where-Object { $_ -notin $expectedThumbprints })
+    if ($Expected.Count -ne $Actual.Count -or $missing.Count -gt 0 -or $unexpected.Count -gt 0) {
+        throw [System.Exception]::new("Assert-CertificateSet: $Context certificate mismatch. Expected $($Expected.Count), found $($Actual.Count). Missing: $($missing -join ', '); unexpected: $($unexpected -join ', ').")
+    }
+}
+
+<#
+.SYNOPSIS
+    Cryptographically validate an ordered certificate chain without network retrieval.
+
+.DESCRIPTION
+    Builds the supplied leaf-to-root chain using only its final certificate as a custom trust
+    root and its intermediate certificates as the extra store. Revocation and certificate
+    downloads are disabled so validation cannot silently supplement the supplied collection.
+
+.PARAMETER Certificates
+    Certificates ordered from leaf to self-issued root.
+#>
+function Assert-CertificateChain {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2[]]$Certificates
+    )
+
+    $chain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
+    try {
+        # Validate only the physical CA response. Downloads could conceal a missing intermediate.
+        $chain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+        $chain.ChainPolicy.DisableCertificateDownloads = $true
+        $chain.ChainPolicy.TrustMode = [System.Security.Cryptography.X509Certificates.X509ChainTrustMode]::CustomRootTrust
+        $null = $chain.ChainPolicy.CustomTrustStore.Add($Certificates[-1])
+
+        # The first item is the leaf and the last is the custom root; only middle items belong
+        # in ExtraStore. Avoid constructing a descending range when there are no intermediates.
+        if ($Certificates.Count -gt 2) {
+            foreach ($certificate in $Certificates[1..($Certificates.Count - 2)]) {
+                $null = $chain.ChainPolicy.ExtraStore.Add($certificate)
+            }
+        }
+
+        if (-not $chain.Build($Certificates[0])) {
+            $status = ($chain.ChainStatus.StatusInformation | ForEach-Object { $_.Trim() }) -join '; '
+            throw [System.Exception]::new("Assert-CertificateChain: AD CS returned an invalid certificate chain: $status")
+        }
+    }
+    finally {
+        $chain.Dispose()
+    }
+}
+
+#endregion
+
 #region ### Export-PfxWithGroupProtection ###
 
 #############################################
