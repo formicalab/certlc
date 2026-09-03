@@ -2206,7 +2206,8 @@ function Get-CertificateByThumbprint {
 
 .DESCRIPTION
     This function revokes the specified version of a certificate stored in Azure Key Vault:
-      1. Loads the secret of the specific version to extract the X.509 serial number.
+      1. Loads the version-specific PKCS#12 collection and selects its private-key leaf to
+         extract the X.509 serial number.
       2. Submits a revocation request to the Certificate Authority (CA) for that serial.
       3. Disables that Key Vault version (attributes.enabled=false) and tags it with
          Revoked=true, RevokedAt, RevocationReason, RevokedJobId. Existing tags on the
@@ -2277,17 +2278,42 @@ function New-CertificateRevocationRequest {
         throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Certificate $CertificateName version $CertificateVersion secret is empty in key vault $VaultName")
     }
 
-    # convert the base64 string to a byte array and create an X509Certificate2 object
-    $certBytes = [Convert]::FromBase64String($certBase64)
-    $certBase64 = $null
-    $x509Cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($certBytes, [string]::Empty, 'Exportable')
-
-    # save the serial number of this specific version
-    $serialNumber = $x509Cert.SerialNumber
-
-    # cleanup objects that are no longer needed
-    $x509Cert = $null
     $certBytes = $null
+    $certificates = $null
+    try {
+        $certBytes = [Convert]::FromBase64String($certBase64)
+        $certBase64 = $null
+        $certificates = [System.Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
+        $importFlags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable -bor
+            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
+
+        # Import every PKCS#12 bag because new certificate versions contain the physical chain.
+        # EphemeralKeySet prevents the leaf private key from persisting in a worker key store.
+        $certificates.Import($certBytes, [string]::Empty, $importFlags)
+
+        # The private key identifies the issued leaf independently of PKCS#12 bag ordering.
+        # Wrap the complete pipeline so one result remains an array under strict mode.
+        $leafCertificates = @($certificates | Where-Object HasPrivateKey)
+        if ($leafCertificates.Count -ne 1) {
+            throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Expected exactly one private-key leaf in certificate $CertificateName version $CertificateVersion; found $($leafCertificates.Count).")
+        }
+
+        # Capture only the serial number before disposing the complete imported collection.
+        $serialNumber = $leafCertificates[0].SerialNumber
+    }
+    finally {
+        # The decoded PKCS#12 carries private-key material. Clear its byte buffer and dispose
+        # every imported certificate, including partial imports from a failing collection load.
+        $certBase64 = $null
+        if ($null -ne $certBytes) {
+            [Array]::Clear($certBytes, 0, $certBytes.Length)
+        }
+        if ($null -ne $certificates) {
+            foreach ($certificate in $certificates) {
+                $certificate.Dispose()
+            }
+        }
+    }
 
     Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "CA: Sending revocation request for certificate $CertificateName version $CertificateVersion (serial $serialNumber) to the CA $CA using reason $($RevocationReason)..."
 
