@@ -1056,6 +1056,209 @@ function Assert-CertificateChain {
 
 #endregion
 
+#region ### Key Vault certificate chain REST helpers ###
+
+##################################################
+# FUNCTIONS - Key Vault chain REST API helpers   #
+##################################################
+
+<#
+.SYNOPSIS
+    Merge an ordered certificate chain into a pending Key Vault certificate request.
+
+.DESCRIPTION
+    Exports every supplied certificate as DER, encodes the certificates into the Key Vault
+    x5c JSON array, and completes an existing pending certificate operation through the
+    Key Vault REST API. Certificates must be supplied in leaf-to-root order.
+
+.PARAMETER VaultName
+    Name of the Key Vault containing the pending certificate request.
+
+.PARAMETER CertificateName
+    Name of the pending Key Vault certificate.
+
+.PARAMETER Certificates
+    The complete certificate chain in leaf-to-root order.
+
+.PARAMETER Token
+    SecureString bearer token for the Key Vault data-plane resource.
+
+.OUTPUTS
+    PSCustomObject containing the completed Key Vault certificate bundle.
+
+.NOTES
+    The pending merge POST is intentionally not retried because it changes service state.
+    An automatic retry could obscure whether Key Vault completed the first request.
+#>
+function Merge-KeyVaultCertificateChain {
+    [OutputType([pscustomobject])]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidatePattern('^[A-Za-z0-9-]{3,24}$')]
+        [string]$VaultName,
+
+        [Parameter(Mandatory = $true)]
+        [ValidatePattern('^[A-Za-z0-9-]+$')]
+        [string]$CertificateName,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateCount(2, 2147483647)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2[]]$Certificates,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNull()]
+        [System.Security.SecureString]$Token
+    )
+
+    # Key Vault requires each x5c member to contain the Base64-encoded DER certificate.
+    # Preserve the supplied leaf-to-root order because the pending merge API consumes the
+    # array as the certificate chain associated with the Key Vault-generated private key.
+    $x5c = @($Certificates | ForEach-Object {
+        [Convert]::ToBase64String($_.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
+    })
+    $body = @{ x5c = $x5c } | ConvertTo-Json -Depth 3 -Compress
+    $escapedCertificateName = [Uri]::EscapeDataString($CertificateName)
+    $uri = "https://$VaultName.vault.azure.net/certificates/$escapedCertificateName/pending/merge?api-version=2025-07-01"
+
+    Write-CertLCLog -Section 'Merge-KeyVaultCertificateChain' -Message "KeyVault: Submitting $($x5c.Count) explicitly encoded certificate(s) for pending certificate $CertificateName in vault $VaultName."
+
+    # Do not wrap this state-changing POST in Invoke-WithRetry. A transport failure can occur
+    # after Key Vault commits the merge, making an automatic retry operationally ambiguous.
+    try {
+        $response = Invoke-RestMethod `
+            -Uri $uri `
+            -Method POST `
+            -Authentication Bearer `
+            -Token $Token `
+            -ContentType 'application/json' `
+            -Body $body
+    }
+    catch {
+        throw [System.Exception]::new("Merge-KeyVaultCertificateChain: Key Vault pending merge failed for certificate $CertificateName in vault $VaultName.", $_.Exception)
+    }
+
+    # The exact certificate and secret version identifiers are required by later steps. Read
+    # properties defensively because strict mode rejects access to omitted REST properties.
+    $idProperty = if ($null -eq $response) { $null } else { $response.PSObject.Properties['id'] }
+    $sidProperty = if ($null -eq $response) { $null } else { $response.PSObject.Properties['sid'] }
+    if ($null -eq $idProperty -or [string]::IsNullOrWhiteSpace([string]$idProperty.Value) -or
+        $null -eq $sidProperty -or [string]::IsNullOrWhiteSpace([string]$sidProperty.Value)) {
+        throw [System.Exception]::new('Merge-KeyVaultCertificateChain: Key Vault pending merge returned no certificate or secret version identifier.')
+    }
+
+    return $response
+}
+
+<#
+.SYNOPSIS
+    Retrieve the PKCS#12 value for an exact Key Vault certificate secret version.
+
+.DESCRIPTION
+    Validates the versioned secret identifier returned by Key Vault, retrieves that exact
+    secret through the Key Vault REST API, and verifies that it contains a non-empty PKCS#12
+    value. The request uses the runbook retry helper because a version-specific GET is idempotent.
+
+.PARAMETER VaultName
+    Name of the Key Vault that must own the secret identifier.
+
+.PARAMETER SecretId
+    Versioned Key Vault secret identifier returned in the certificate merge response.
+
+.PARAMETER Token
+    SecureString bearer token for the Key Vault data-plane resource.
+
+.OUTPUTS
+    System.String containing the Base64-encoded PKCS#12 secret value.
+#>
+function Get-KeyVaultCertificateSecretValue {
+    [OutputType([string])]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidatePattern('^[A-Za-z0-9-]{3,24}$')]
+        [string]$VaultName,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$SecretId,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNull()]
+        [System.Security.SecureString]$Token
+    )
+
+    # Treat the service-returned identifier as untrusted input. Restrict it to the expected
+    # HTTPS data-plane host before allowing Invoke-RestMethod to make a request.
+    try {
+        $secretUri = [Uri]$SecretId
+    }
+    catch {
+        throw [System.ArgumentException]::new("Get-KeyVaultCertificateSecretValue: Key Vault returned an invalid secret ID '$SecretId'.", 'SecretId', $_.Exception)
+    }
+    $expectedHost = "$VaultName.vault.azure.net"
+    if (-not $secretUri.IsAbsoluteUri -or
+        $secretUri.Scheme -ine 'https' -or
+        $secretUri.Host -ine $expectedHost -or
+        -not $secretUri.IsDefaultPort -or
+        -not [string]::IsNullOrEmpty($secretUri.Query) -or
+        -not [string]::IsNullOrEmpty($secretUri.Fragment)) {
+        throw [System.ArgumentException]::new("Get-KeyVaultCertificateSecretValue: Expected an HTTPS secret ID on '$expectedHost'; received '$SecretId'.", 'SecretId')
+    }
+
+    # A certificate-backed secret ID must identify one concrete version. Reject collection,
+    # latest-version, or unrelated Key Vault resource paths before issuing the GET.
+    $pathSegments = @($secretUri.AbsolutePath.Trim('/').Split('/'))
+    if ($pathSegments.Count -ne 3 -or
+        $pathSegments[0] -ine 'secrets' -or
+        [string]::IsNullOrWhiteSpace([Uri]::UnescapeDataString($pathSegments[1])) -or
+        [string]::IsNullOrWhiteSpace($pathSegments[2])) {
+        throw [System.ArgumentException]::new("Get-KeyVaultCertificateSecretValue: Expected a versioned certificate secret ID; received '$SecretId'.", 'SecretId')
+    }
+
+    $uri = "$($secretUri.AbsoluteUri.TrimEnd('/'))?api-version=2025-07-01"
+
+    # Copy function-scope values into locals before creating the closure. This ensures
+    # GetNewClosure captures both values when Invoke-WithRetry executes the script block.
+    $requestUri = $uri
+    $requestToken = $Token
+    $operation = {
+        Invoke-RestMethod `
+            -Uri $requestUri `
+            -Method GET `
+            -Authentication Bearer `
+            -Token $requestToken `
+            -ContentType 'application/json'
+    }.GetNewClosure()
+
+    try {
+        # Version-specific secret retrieval is idempotent and safe for transient retries.
+        $secret = Invoke-WithRetry `
+            -ScriptBlock $operation `
+            -OperationName "KV GET certificate secret $($pathSegments[1])/$($pathSegments[2])" `
+            -Section 'Get-KeyVaultCertificateSecretValue'
+    }
+    catch {
+        throw [System.Exception]::new("Get-KeyVaultCertificateSecretValue: Failed to retrieve versioned secret '$SecretId'.", $_.Exception)
+    }
+
+    # Read REST properties defensively for strict mode and require Key Vault's PKCS#12 marker.
+    $contentTypeProperty = if ($null -eq $secret) { $null } else { $secret.PSObject.Properties['contentType'] }
+    if ($null -eq $contentTypeProperty -or [string]$contentTypeProperty.Value -ine 'application/x-pkcs12') {
+        $actualContentType = if ($null -eq $contentTypeProperty) { '<missing>' } else { [string]$contentTypeProperty.Value }
+        throw [System.Exception]::new("Get-KeyVaultCertificateSecretValue: Secret '$SecretId' has content type '$actualContentType'; expected 'application/x-pkcs12'.")
+    }
+
+    $valueProperty = if ($null -eq $secret) { $null } else { $secret.PSObject.Properties['value'] }
+    if ($null -eq $valueProperty -or [string]::IsNullOrWhiteSpace([string]$valueProperty.Value)) {
+        throw [System.Exception]::new("Get-KeyVaultCertificateSecretValue: Key Vault returned an empty value for versioned secret '$SecretId'.")
+    }
+
+    return [string]$valueProperty.Value
+}
+
+#endregion
+
 #region ### Export-PfxWithGroupProtection ###
 
 #############################################
