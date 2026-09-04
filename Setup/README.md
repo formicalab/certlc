@@ -389,7 +389,7 @@ After deploying the infrastructure, complete these additional steps:
 4. **Enable Certificate Statistics Collection** (Optional):
    - The hourly schedule for `certlcstats` runbook is created but NOT linked
    - To enable automatic statistics collection:
-     - Option A: Uncomment the `jobScheduleCertLCStats` resource in `certlc.bicep` and redeploy
+    - Option A: Uncomment the `jobScheduleCertLCStats` resource in `modules/automation.bicep` and redeploy
      - Option B: Manually link the schedule `schedule-certlcstats-hourly` to the `certlcstats` runbook in Azure Portal
      - Option C: Use Azure CLI: `az automation job-schedule create`
    - The schedule will run the runbook every hour on the hybrid worker group
@@ -445,7 +445,7 @@ The solution follows a secure-by-default architecture:
 - Storage, Function App, Automation Account, and Key Vault data-plane access use private endpoints with public access disabled. Azure Monitor endpoints, including Application Insights ingestion and the DCE, remain public and require controlled outbound access from the workloads
 - Azure resource access uses managed identities and RBAC without storage keys, instrumentation keys, or Azure service-principal secrets. The optional SMTP integration can use the encrypted `automationAccountVarSmtpUser` and `automationAccountVarSmtpPassword` credentials, and external Automation webhook calls authenticate through the secret token embedded in the webhook URL. Protect and rotate those exceptions as credentials
 - Sensitive parameters (like SMTP password) are marked with `@secure()` decorator
-- Sensitive outputs (like DCR immutable ID) are protected with `@secure()` decorator
+- The DCR immutable ID is exposed as a normal deployment output because it identifies the ingestion rule and is not a credential
 - All resources are tagged with `solution: 'CertLC'` for easy identification
 - Role-based access control (RBAC) follows the principle of least privilege
 - Automation Account variables for sensitive data are encrypted
@@ -455,6 +455,7 @@ The solution follows a secure-by-default architecture:
 
 ## Files
 
-- `certlc.bicep` - Main Bicep template
+- `certlc.bicep` - Main Bicep orchestration template and public parameter/output contract
+- `modules/` - Bicep modules for storage, observability, Automation, Function App, Key Vault, integrations, and the workbook; each service module owns its private endpoints
 - `parameters.dev.bicepparam` - Bicep parameter file
 - `README.md` - This file

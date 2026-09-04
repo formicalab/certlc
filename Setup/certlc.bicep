@@ -111,789 +111,128 @@ var commonTags = {
   purpose: 'Certificate Lifecycle Management'
 }
 
-// Azure built-in role definition IDs
-var roleDefinitions = {
-  storageQueueDataReader: '19e7f393-937e-4f77-808e-94535e297925'
-  storageQueueDataMessageSender: 'c6a89b2d-59bc-44d0-9896-0f6e12d7b80a'
-  keyVaultCertificatesOfficer: 'a4417e6f-fecd-4de8-b567-7b0420556985'
-  keyVaultSecretsOfficer: 'b86a8fe4-44ce-4948-aee5-eccb2c155cd7'
-  reader: 'acdd72a7-3385-48ef-bd42-f606fba81ae7'
-  monitoringMetricsPublisher: '3913510d-42f4-4e42-8a64-420c390055eb'
-  storageBlobDataOwner: 'b7e6dc6d-f1e8-4753-8033-0f276bb0955b'
-  storageBlobDataContributor: 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
-  storageQueueDataMessageProcessor: '8a0f0c08-91a1-4084-bc3d-661d67233fed'
-  storageQueueDataContributor: '974c5e8b-45b9-4653-ba55-5f855dd0fb88'
-  automationOperator: 'd3881f73-407a-4167-8283-e981cbba0404'
-}
-
-/**********************/
-/* EXISTING RESOURCES */
-/**********************/
-
-// References to existing Private DNS Zones in their subscription
-resource blobDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' existing = {
-  name: 'privatelink.blob.${environment().suffixes.storage}'
-  scope: resourceGroup(dnsZonesSubscriptionId, dnsZonesResourceGroupName)
-}
-
-resource keyVaultDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' existing = {
-  name: 'privatelink.vaultcore.azure.net'
-  scope: resourceGroup(dnsZonesSubscriptionId, dnsZonesResourceGroupName)
-}
-
-resource queueDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' existing = {
-  name: 'privatelink.queue.${environment().suffixes.storage}'
-  scope: resourceGroup(dnsZonesSubscriptionId, dnsZonesResourceGroupName)
-}
-
-resource webAppDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' existing = {
-  name: 'privatelink.azurewebsites.net'
-  scope: resourceGroup(dnsZonesSubscriptionId, dnsZonesResourceGroupName)
-}
-
-resource automationAccountDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' existing = {
-  name: 'privatelink.azure-automation.net'
-  scope: resourceGroup(dnsZonesSubscriptionId, dnsZonesResourceGroupName)
-}
-
 /*****************/
 /* NEW RESOURCES */
 /*****************/
 
-// Storage Account
-resource storageAccount 'Microsoft.Storage/storageAccounts@2026-04-01' = {
-  name: storageAccountName
-  location: location
-  sku: {
-    name: 'Standard_LRS'
-  }
-  kind: 'StorageV2'
-  properties: {
-    accessTier: 'Hot'
-    defaultToOAuthAuthentication: true
-    allowBlobPublicAccess: false
-    allowSharedKeyAccess: false
-    allowCrossTenantReplication: false
-    minimumTlsVersion: 'TLS1_2'
-    supportsHttpsTrafficOnly: true
-    networkAcls: {
-      bypass: 'AzureServices'
-      defaultAction: 'Deny'
-    }
-    publicNetworkAccess: 'Disabled'
-    encryption: {
-      services: {
-        blob: {
-          enabled: true
-        }
-        queue: {
-          enabled: true
-        }
-      }
-    }
-  }
-  resource blobServices 'blobServices' = {
-    name: 'default'
-    properties: {}
-    resource deploymentContainer 'containers' = {
-      name: 'azure-webjobs-hosts'
-      properties: {}
-    }
-    resource deadLetterContainer 'containers' = {
-      name: 'eventgrid-deadletter'
-      properties: {}
-    }
-  }
-  resource queueServices 'queueServices' = {
-    name: 'default'
-    properties: {}
-    resource queues 'queues' = {
-      name: 'certlc'
-      properties: {}
-    }
-  }
-
-  tags: commonTags
-}
-
-// Private endpoints for the storage account (blob + queue).
-// Declared here (before the function app) so the function app can depend on them: the function app
-// reaches storage via private link, so it must not start before its PEs and DNS records are ready.
-var storagePeDefs = [
-  { peName: 'pe-blob-${storageAccountName}',  plsConnName: 'pls-${storageAccountName}', groupId: 'blob',  nicName: 'nic-pe-${storageAccountName}',       dnsKey: 'blob' }
-  { peName: 'pe-queue-${storageAccountName}', plsConnName: 'pls-${storageAccountName}', groupId: 'queue', nicName: 'nic-pe-queue-${storageAccountName}', dnsKey: 'queue' }
-]
-
-resource storagePrivateEndpoints 'Microsoft.Network/privateEndpoints@2025-07-01' = [for d in storagePeDefs: {
-  name: d.peName
-  location: location
-  properties: {
-    subnet: { id: peSubnetId }
-    privateLinkServiceConnections: [
-      {
-        name: d.plsConnName
-        properties: {
-          privateLinkServiceId: storageAccount.id
-          groupIds: [ d.groupId ]
-        }
-      }
-    ]
-    customNetworkInterfaceName: d.nicName
-  }
-  tags: commonTags
-}]
-
-resource storagePrivateEndpointDnsGroups 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2025-07-01' = [for (d, i) in storagePeDefs: {
-  parent: storagePrivateEndpoints[i]
-  name: 'default'
-  properties: {
-    privateDnsZoneConfigs: [
-      {
-        name: 'config1'
-        properties: {
-          privateDnsZoneId: d.dnsKey == 'blob' ? blobDnsZone.id : queueDnsZone.id
-        }
-      }
-    ]
-  }
-}]
-
-// Log Analytics Workspace
-resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2025-07-01' = {
-  name: logAnalyticsWorkspaceName
-  location: location
-  properties: {
-    sku: {
-      name: 'PerGB2018'
-    }
-    retentionInDays: logAnalyticsRetentionInDays
-    features: {
-      disableLocalAuth: true
-    }
-  }
-  tags: commonTags
-}
-
-// Data Collection Endpoint
-resource dataCollectionEndpoint 'Microsoft.Insights/dataCollectionEndpoints@2024-03-11' = {
-  name: dataCollectionEndpointName
-  location: location
-  properties: {
-    networkAcls: {
-      publicNetworkAccess: 'Enabled'
-    }
-  }
-  tags: commonTags
-}
-
-// Schema of the certlcstats_CL custom table data columns (shared between the LAW custom table and the DCR stream).
-// The LAW table additionally prepends a TimeGenerated column (the DCR computes it via transformKql).
-var certlcDataColumns = [
-  { name: 'SnapshotId', type: 'string' }
-  { name: 'Thumbprint', type: 'string' }
-  { name: 'Name',       type: 'string' }
-  { name: 'Created',    type: 'datetime' }
-  { name: 'Expires',    type: 'datetime' }
-  { name: 'Subject',    type: 'string' }
-  { name: 'Template',   type: 'string' }
-  { name: 'DNSNames',   type: 'string' }
-]
-
-// Custom Table for Certificate Statistics
-resource customTable 'Microsoft.OperationalInsights/workspaces/tables@2025-07-01' = {
-  name: 'certlcstats_CL'
-  parent: logAnalyticsWorkspace
-  properties: {
-    retentionInDays: logAnalyticsRetentionInDays
-    schema: {
-      name: 'certlcstats_CL'
-      columns: concat(
-        [ { name: 'TimeGenerated', type: 'datetime' } ],
-        certlcDataColumns
-      )
-    }
-  }
-}
-
-// Data Collection Rule for Certificate Statistics
-resource dataCollectionRule 'Microsoft.Insights/dataCollectionRules@2024-03-11' = {
-  name: dataCollectionRuleName
-  location: location
-  properties: {
-    dataCollectionEndpointId: dataCollectionEndpoint.id
-    streamDeclarations: {
-      'Custom-certlcstats_CL': {
-        columns: certlcDataColumns
-      }
-    }
-    destinations: {
-      logAnalytics: [
-        {
-          workspaceResourceId: logAnalyticsWorkspace.id
-          name: 'clv2ws1'
-        }
-      ]
-    }
-    dataFlows: [
-      {
-        streams: [
-          'Custom-certlcstats_CL'
-        ]
-        destinations: [
-          'clv2ws1'
-        ]
-        transformKql: 'source | extend Created = todatetime(Created), Expires = todatetime(Expires) | extend TimeGenerated = now()'
-        outputStream: 'Custom-certlcstats_CL'
-      }
-    ]
-  }
-  dependsOn: [
-    customTable  // the DCR must be created after the custom table
-  ]
-  tags: commonTags
-}
-
-// Application Insights
-// IMPORTANT: Deploy AFTER all Log Analytics operations are complete to avoid "Workspace not active" errors
-resource applicationInsights 'Microsoft.Insights/components@2020-02-02' = {
-  name: applicationInsightsName
-  location: location
-  kind: 'web'
-  properties: {
-    Application_Type: 'web'
-    WorkspaceResourceId: logAnalyticsWorkspace.id
-    DisableLocalAuth: true
-  }
-  dependsOn: [
-    // Wait until the customTable (the last LAW child to provision) exists. By then the workspace backend is
-    // fully ready, which avoids the "Workspace not active" race that App Insights would otherwise hit on first
-    // deployment. (logAnalyticsWorkspace itself is already an implicit dep via WorkspaceResourceId.)
-    customTable
-  ]
-  tags: commonTags
-}
-
-// Flexible Consumption Plan for the function app
-resource flexServicePlan 'Microsoft.Web/serverfarms@2025-03-01' = {
-  name: 'asp-${functionAppName}'
-  location: location
-  kind: 'functionapp'
-  sku: {
-    tier: 'FlexConsumption'
-    name: 'FC1'
-  }
-  properties: {
-    reserved: true
-  }
-  tags: commonTags
-}
-
-// Function App
-resource functionApp 'Microsoft.Web/sites@2025-03-01' = {
-  name: functionAppName
-  location: location
-  kind: 'functionapp,linux'
-  identity: {
-    type: 'SystemAssigned'
-  }
-  properties: {
-    serverFarmId: flexServicePlan.id
-    httpsOnly: true
-    clientAffinityEnabled: false
-    keyVaultReferenceIdentity: 'SystemAssigned'
-    virtualNetworkSubnetId: fnSubnetId
-    publicNetworkAccess: 'Disabled'
-    siteConfig: {
-      minTlsVersion: '1.2'
-      ftpsState: 'Disabled'
-      http20Enabled: true
-    }
-    functionAppConfig: {
-      deployment: {
-        storage: {
-          type: 'blobContainer'
-          value: '${storageAccount.properties.primaryEndpoints.blob}${storageAccount::blobServices::deploymentContainer.name}'
-          authentication: {
-            type: 'SystemAssignedIdentity'
-          }
-        }
-      }
-      scaleAndConcurrency: {
-        maximumInstanceCount: 100
-        instanceMemoryMB: 2048
-      }
-      runtime: {
-        name: 'powerShell'
-        version: '7.6'
-      }
-    }
-  }
-  resource appSettings 'config' = {
-    name: 'appsettings'
-    properties: {
-      AutomationAccountName: automationAccount.name
-      HybridWorkerGroupName: hybridWorkerGroupName
-      RunbookName: runbookName
-      ResourceGroupName: resourceGroup().name
-      // End polling before the Function host's normal execution window while allowing typical certificate operations to finish.
-      RunbookPollingTimeoutMinutes: '25'
-      AzureWebJobsStorage__credential: 'managedidentity'
-      AzureWebJobsStorage__blobServiceUri: storageAccount.properties.primaryEndpoints.blob
-      AzureWebJobsStorage__queueServiceUri: storageAccount.properties.primaryEndpoints.queue
-      APPLICATIONINSIGHTS_AUTHENTICATION_STRING: 'Authorization=AAD'
-      APPLICATIONINSIGHTS_CONNECTION_STRING: applicationInsights.properties.ConnectionString
-    }
-  }
-  dependsOn: [
-    storagePrivateEndpoints // create the function only after the PEs for the storage account are ready
-  ]
-  tags: commonTags
-}
-
-// Automation Account with its managed identity
-resource automationAccount 'Microsoft.Automation/automationAccounts@2024-10-23' = {
-  name: automationAccountName
-  location: location
-  identity: {
-    type: 'SystemAssigned'
-  }
-  properties: {
-    publicNetworkAccess: false
-    // Local auth must remain enabled so that webhooks invoked via key in the URL query string keep working
-    // (callers cannot use AAD). Do NOT set this to true unless all webhook callers have been migrated to AAD.
-    disableLocalAuth: false
-    sku: {
-      name: 'Basic'
-    }
-  }
-  tags: commonTags
-
-  // Custom runtime environment based on PowerShell 7.6 with Az module preloaded
-  resource runtimeEnv 'runtimeEnvironments@2024-10-23' = {
-    name: runtimeEnvironmentName
+module storage './modules/storage.bicep' = {
+  name: 'certlc-storage'
+  params: {
     location: location
-    properties: {
-      runtime: {
-        language: 'PowerShell'
-        version: '7.6'
-      }
-      defaultPackages: {
-        Az: '15.1.0'
-        'Azure CLI': '2.77.0'
-      }
-    }
+    storageAccountName: storageAccountName
+    peSubnetId: peSubnetId
+    blobDnsZoneId: resourceId(dnsZonesSubscriptionId, dnsZonesResourceGroupName, 'Microsoft.Network/privateDnsZones', 'privatelink.blob.${environment().suffixes.storage}')
+    queueDnsZoneId: resourceId(dnsZonesSubscriptionId, dnsZonesResourceGroupName, 'Microsoft.Network/privateDnsZones', 'privatelink.queue.${environment().suffixes.storage}')
     tags: commonTags
   }
+}
 
-  // Primary certificate lifecycle runbook
-  resource runbookCertLC 'runbooks@2024-10-23' = {
-    name: runbookName
+module observability './modules/observability.bicep' = {
+  name: 'certlc-observability'
+  params: {
     location: location
-    properties: {
-      runbookType: 'PowerShell'
-      logProgress: false
-      logVerbose: false
-      description: 'Certificate lifecycle management runbook for enrollment, renewal, and revocation'
-      runtimeEnvironment: runtimeEnv.name
-    }
+    logAnalyticsWorkspaceName: logAnalyticsWorkspaceName
+    logAnalyticsRetentionInDays: logAnalyticsRetentionInDays
+    applicationInsightsName: applicationInsightsName
+    dataCollectionEndpointName: dataCollectionEndpointName
+    dataCollectionRuleName: dataCollectionRuleName
     tags: commonTags
   }
-  
-  // Runbook: certlcstats
-  resource runbookCertLCStats 'runbooks@2024-10-23' = {
-    name: 'certlcstats'
+}
+
+module functionApp './modules/function-app.bicep' = {
+  name: 'certlc-function-app'
+  params: {
     location: location
-    properties: {
-      runbookType: 'PowerShell'
-      logProgress: false
-      logVerbose: false
-      description: 'Certificate statistics collection runbook for monitoring and reporting'
-      runtimeEnvironment: runtimeEnv.name
-    }
+    functionAppName: functionAppName
+    functionSubnetId: fnSubnetId
+    deploymentContainerUri: storage.outputs.deploymentContainerUri
+    storageBlobEndpoint: storage.outputs.blobEndpoint
+    storageQueueEndpoint: storage.outputs.queueEndpoint
+    applicationInsightsConnectionString: observability.outputs.applicationInsightsConnectionString
+    automationAccountName: automation.outputs.name
+    hybridWorkerGroupName: hybridWorkerGroupName
+    runbookName: runbookName
+    peSubnetId: peSubnetId
+    privateDnsZoneId: resourceId(dnsZonesSubscriptionId, dnsZonesResourceGroupName, 'Microsoft.Network/privateDnsZones', 'privatelink.azurewebsites.net')
     tags: commonTags
   }
-
-  // Schedule for certlcstats runbook - runs every hour
-  // Note: Schedule is created but NOT linked to runbook initially (disabled state)
-  // To enable: Link the schedule to the runbook in Azure Portal or via Azure CLI
-  resource scheduleCertLCStats 'schedules@2024-10-23' = {
-    name: 'schedule-certlcstats-hourly'
-    properties: {
-      description: 'Runs certlcstats runbook every hour to collect certificate statistics (manually link to enable)'
-      startTime: scheduleStartTime
-      frequency: 'Hour'
-      interval: 1
-      timeZone: 'UTC'
-    }
-  }
-
-  // Uncomment to automatically link schedule to runbook (enables automatic execution on hybrid worker group)
-  // resource jobScheduleCertLCStats 'jobSchedules@2024-10-23' = {
-  //   name: guid(automationAccount.id, 'certlcstats-schedule')
-  //   properties: {
-  //     runbook: {
-  //       name: runbookCertLCStats.name
-  //     }
-  //     schedule: {
-  //       name: scheduleCertLCStats.name
-  //     }
-  //     runOn: hybridWorkerGroupName  // Execute on hybrid worker group (not Azure sandbox)
-  //   }
-  // }
 }
 
-// Automation Account variables (loop). Values are JSON-string-encoded by serializing a single-item array
-// and removing its brackets, which preserves the quotes and escapes required by the Automation API.
-// Note: the [for] iteratee must be calculable at the start of deployment (BCP178), so it lists only literal
-// variable names; the actual values (some of which reference runtime resource properties) are looked up via
-// the automationAccountVariableValues map inside the loop body.
-var automationAccountVariableValues = {
-  'certlc-ca':                 automationAccountVarCA
-  'certlc-pfxrootfolder':      automationAccountVarPfxRootFolder
-  'certlc-smtpfrom':           automationAccountVarSmtpFrom
-  'certlc-smtpserver':         automationAccountVarSmtpServer
-  'certlc-smtpuser':           automationAccountVarSmtpUser
-  'certlc-smtppassword':       automationAccountVarSmtpPassword
-  'certlc-stats-keyvault':     keyVault.name
-  'certlc-stats-immutableid':  dataCollectionRule.properties.immutableId
-  'certlc-stats-streamname':   'Custom-certlcstats_CL'
-  'certlc-stats-ingestionurl': dataCollectionEndpoint.properties.logsIngestion.endpoint
-}
-var automationAccountVariableNames = [
-  'certlc-ca'
-  'certlc-pfxrootfolder'
-  'certlc-smtpfrom'
-  'certlc-smtpserver'
-  'certlc-smtpuser'
-  'certlc-smtppassword'
-  'certlc-stats-keyvault'
-  'certlc-stats-immutableid'
-  'certlc-stats-streamname'
-  'certlc-stats-ingestionurl'
-]
-
-resource automationAccountVariables 'Microsoft.Automation/automationAccounts/variables@2024-10-23' = [for n in automationAccountVariableNames: {
-  parent: automationAccount
-  name: n
-  properties: {
-    value: substring(string([automationAccountVariableValues[n]]), 1, max(0, length(string([automationAccountVariableValues[n]])) - 2))
-    isEncrypted: true
-  }
-}]
-
-// Hybrid Worker Group
-resource hybridWorkerGroup 'Microsoft.Automation/automationAccounts/hybridRunbookWorkerGroups@2024-10-23' = {
-  name: hybridWorkerGroupName
-  parent: automationAccount
-  properties: {
-    // Hybrid worker group properties - workers will be added separately
+module automation './modules/automation.bicep' = {
+  name: 'certlc-automation'
+  params: {
+    location: location
+    automationAccountName: automationAccountName
+    hybridWorkerGroupName: hybridWorkerGroupName
+    runbookName: runbookName
+    runtimeEnvironmentName: runtimeEnvironmentName
+    scheduleStartTime: scheduleStartTime
+    ca: automationAccountVarCA
+    pfxRootFolder: automationAccountVarPfxRootFolder
+    smtpFrom: automationAccountVarSmtpFrom
+    smtpServer: automationAccountVarSmtpServer
+    smtpUser: automationAccountVarSmtpUser
+    smtpPassword: automationAccountVarSmtpPassword
+    keyVaultName: keyVault.outputs.name
+    dataCollectionRuleImmutableId: observability.outputs.dataCollectionRuleImmutableId
+    dataCollectionEndpointIngestionUrl: observability.outputs.dceIngestionEndpoint
+    logAnalyticsWorkspaceId: observability.outputs.logAnalyticsWorkspaceId
+    peSubnetId: peSubnetId
+    privateDnsZoneId: resourceId(dnsZonesSubscriptionId, dnsZonesResourceGroupName, 'Microsoft.Network/privateDnsZones', 'privatelink.azure-automation.net')
+    tags: commonTags
   }
 }
 
-// Diagnostic Settings for Automation Account
-resource automationAccountDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
-  name: 'diag-${automationAccountName}'
-  scope: automationAccount
-  properties: {
-    workspaceId: logAnalyticsWorkspace.id
-    logs: [
-      {
-        category: 'JobLogs'
-        enabled: true
-      }
-      {
-        category: 'JobStreams'
-        enabled: true
-      }
-    ]
-    metrics: [
-      {
-        category: 'AllMetrics'
-        enabled: true
-      }
-    ]
-  }
-}
-
-// KeyVault
-resource keyVault 'Microsoft.KeyVault/vaults@2026-02-01' = {
-  name: keyVaultName
-  location: location
-  properties: {
-    sku: {
-      family: 'A'
-      name: 'standard'
-    }
-    tenantId: subscription().tenantId
-    enableSoftDelete: true
+module keyVault './modules/key-vault.bicep' = {
+  name: 'certlc-key-vault'
+  params: {
+    location: location
+    keyVaultName: keyVaultName
     softDeleteRetentionInDays: keyVaultSoftDeleteRetentionInDays
-    enablePurgeProtection: true
-    enableRbacAuthorization: true
-    publicNetworkAccess: 'Disabled'
-  }
-  tags: commonTags
-}
-
-// Private endpoints for the application-tier resources: Function App, Automation Account (Webhook + DSCAndHybridWorker), Key Vault.
-// Declared here (after the Key Vault) so all target resources are already in scope.
-var appPeDefs = [
-  { peName: 'pe-sites-${functionAppName}',                    plsConnName: 'pls-${functionAppName}',                          groupId: 'sites',              nicName: 'nic-pe-${functionAppName}',                          targetKey: 'function', dnsKey: 'webapp' }
-  { peName: 'pe-webhook-${automationAccountName}',            plsConnName: 'pls-${automationAccountName}',                    groupId: 'Webhook',            nicName: 'nic-pe-webhook-${automationAccountName}',            targetKey: 'aa',       dnsKey: 'aa' }
-  { peName: 'pe-dscandhybridworker-${automationAccountName}', plsConnName: 'pls-dscandhybridworker-${automationAccountName}', groupId: 'DSCAndHybridWorker', nicName: 'nic-pe-dscandhybridworker-${automationAccountName}', targetKey: 'aa',       dnsKey: 'aa' }
-  { peName: 'pe-vault-${keyVaultName}',                       plsConnName: 'pls-${keyVaultName}',                             groupId: 'vault',              nicName: 'nic-pe-${keyVaultName}',                             targetKey: 'kv',       dnsKey: 'kv' }
-]
-
-// Lookup maps (resource ids are calculable at start; DNS zone ids likewise). Looked up inside the loop body.
-var appPeTargetIds = {
-  function: functionApp.id
-  aa: automationAccount.id
-  kv: keyVault.id
-}
-var appPeDnsZoneIds = {
-  webapp: webAppDnsZone.id
-  aa: automationAccountDnsZone.id
-  kv: keyVaultDnsZone.id
-}
-
-resource appPrivateEndpoints 'Microsoft.Network/privateEndpoints@2025-07-01' = [for d in appPeDefs: {
-  name: d.peName
-  location: location
-  properties: {
-    subnet: { id: peSubnetId }
-    privateLinkServiceConnections: [
-      {
-        name: d.plsConnName
-        properties: {
-          privateLinkServiceId: appPeTargetIds[d.targetKey]
-          groupIds: [ d.groupId ]
-        }
-      }
-    ]
-    customNetworkInterfaceName: d.nicName
-  }
-  tags: commonTags
-}]
-
-resource appPrivateEndpointDnsGroups 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2025-07-01' = [for (d, i) in appPeDefs: {
-  parent: appPrivateEndpoints[i]
-  name: 'default'
-  properties: {
-    privateDnsZoneConfigs: [
-      {
-        name: 'config1'
-        properties: {
-          privateDnsZoneId: appPeDnsZoneIds[d.dnsKey]
-        }
-      }
-    ]
-  }
-}]
-
-// Diagnostic Settings for Key Vault
-resource keyVaultDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
-  name: 'diag-${keyVaultName}'
-  scope: keyVault
-  properties: {
-    workspaceId: logAnalyticsWorkspace.id
-    logs: [
-      {
-        category: 'AuditEvent'
-        enabled: true
-      }
-      {
-        category: 'AzurePolicyEvaluationDetails'
-        enabled: true
-      }
-    ]
-    metrics: [
-      {
-        category: 'AllMetrics'
-        enabled: true
-      }
-    ]
+    logAnalyticsWorkspaceId: observability.outputs.logAnalyticsWorkspaceId
+    peSubnetId: peSubnetId
+    privateDnsZoneId: resourceId(dnsZonesSubscriptionId, dnsZonesResourceGroupName, 'Microsoft.Network/privateDnsZones', 'privatelink.vaultcore.azure.net')
+    tags: commonTags
   }
 }
 
-// Event Grid System Topic for the KeyVault
-resource keyVaultEventGridSystemTopic 'Microsoft.EventGrid/systemTopics@2025-02-15' = {
-  name: 'egst-${keyVaultName}'
-  location: location
-  identity: {
-    type: 'SystemAssigned'
-  }
-  properties: {
-    source: keyVault.id
-    topicType: 'Microsoft.KeyVault.Vaults'
-  }
-  tags: commonTags
-}
-
-// Event Grid subscription for the KeyVault to the queue
-// This subscription filters only the CertificateNearExpiry events and sends them to the storage queue
-resource keyVaultEventGridSubscription 'Microsoft.EventGrid/systemTopics/eventSubscriptions@2025-02-15' = {
-  parent: keyVaultEventGridSystemTopic
-  name: 'egs-${keyVaultEventGridSystemTopic.name}'
-  properties: {
-    destination: {
-      endpointType: 'StorageQueue'
-      properties: {
-        resourceId: storageAccount.id
-        queueName: 'certlc'
-        queueMessageTimeToLiveInSeconds: 86400 // 1 day
-      }
-    }
-    eventDeliverySchema: 'CloudEventSchemaV1_0'
-    filter: {
-      includedEventTypes: [
-        'Microsoft.KeyVault.CertificateNearExpiry'
-      ]
-      isSubjectCaseSensitive: false
-    }
-    retryPolicy: {
-      maxDeliveryAttempts: 30
-      eventTimeToLiveInMinutes: 1440 // 1 day
-    }
-    deadLetterWithResourceIdentity: {
-      identity: {
-        type: 'SystemAssigned'
-      }
-      deadLetterDestination: {
-        endpointType: 'StorageBlob'
-        properties: {
-          resourceId: storageAccount.id
-          blobContainerName: 'eventgrid-deadletter'
-        }
-      }
-    }
-  }
-  dependsOn: [
-    storageRoleAssignments // ensure all storage role grants (incl. Storage Blob Data Contributor for dead-letter) are in place before EG validates destinations
-  ]
-}
-
-// Resolve environment-specific workbook defaults during template compilation/deployment.
-var workbookTemplate = loadTextContent('../Workbooks/certlcstats.workbook')
-var workbookWithWorkspace = replace(workbookTemplate, '__LOG_ANALYTICS_WORKSPACE_ID__', logAnalyticsWorkspace.id)
-var workbookWithAutomation = replace(workbookWithWorkspace, '__AUTOMATION_ACCOUNT_ID__', automationAccount.id)
-var workbookWithMainRunbook = replace(workbookWithAutomation, '__MAIN_RUNBOOK_ID__', '${automationAccount.id}/runbooks/${runbookName}')
-var workbookWithStatsRunbook = replace(workbookWithMainRunbook, '__STATS_RUNBOOK_ID__', '${automationAccount.id}/runbooks/certlcstats')
-var workbookContent = replace(workbookWithStatsRunbook, '__FUNCTION_APP_ID__', functionApp.id)
-
-// Azure Monitor Workbook for Certificate Statistics
-resource workbookCertLCStats 'Microsoft.Insights/workbooks@2023-06-01' = {
-  name: guid(resourceGroup().id, 'certlcstats')
-  location: location
-  kind: 'shared'
-  properties: {
-    displayName: 'certlcstats'
-    serializedData: workbookContent
-    category: 'workbook'
-    sourceId: logAnalyticsWorkspace.id
-  }
-  dependsOn: [
-    applicationInsights  // Wait for App Insights to ensure workspace is fully active
-  ]
-  tags: union(commonTags, {
-    'hidden-title': 'certlcstats'
-  })
-}
-
-// Role Assignments (grouped by scope so each loop has a constant scope, as required by Bicep)
-// Note: variable arrays used in [for] cannot contain runtime resource references (BCP178), so principals are
-// referenced by literal key here and resolved inside the loop body via the principalIds map below.
-var principalIds = {
-  eg: keyVaultEventGridSystemTopic.identity.principalId
-  aa: automationAccount.identity.principalId
-  fa: functionApp.identity.principalId
-}
-
-// On Storage Account: EG (read/send queue, dead-letter blob) + Function App (blob owner, queue processor, queue contributor)
-var storageRoleAssignmentDefs = [
-  { key: 'eventGridStorageQueueDataReader',             roleId: roleDefinitions.storageQueueDataReader,           principalKey: 'eg', description: 'EventGrid SystemTopic -> Storage Queue Data Reader -> Storage Account' }
-  { key: 'eventGridStorageQueueDataMessageSender',      roleId: roleDefinitions.storageQueueDataMessageSender,    principalKey: 'eg', description: 'EventGrid SystemTopic -> Storage Queue Data Message Sender -> Storage Account' }
-  { key: 'eventGridStorageBlobDataContributor',         roleId: roleDefinitions.storageBlobDataContributor,       principalKey: 'eg', description: 'EventGrid SystemTopic -> Storage Blob Data Contributor -> Storage Account (for dead-letter)' }
-  { key: 'functionAppStorageBlobDataOwner',             roleId: roleDefinitions.storageBlobDataOwner,             principalKey: 'fa', description: 'Function App -> Storage Blob Data Owner -> Storage Account' }
-  { key: 'functionAppStorageQueueDataMessageProcessor', roleId: roleDefinitions.storageQueueDataMessageProcessor, principalKey: 'fa', description: 'Function App -> Storage Queue Data Message Processor -> Storage Account' }
-  { key: 'functionAppStorageQueueDataContributor',      roleId: roleDefinitions.storageQueueDataContributor,      principalKey: 'fa', description: 'Function App -> Storage Queue Data Contributor -> Storage Account' }
-]
-resource storageRoleAssignments 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for d in storageRoleAssignmentDefs: {
-  scope: storageAccount
-  name: guid(subscription().id, resourceGroup().id, d.key)
-  properties: {
-    description: d.description
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', d.roleId)
-    principalId: principalIds[d.principalKey]
-    principalType: 'ServicePrincipal'
-  }
-}]
-
-// On Key Vault: Automation Account (certificates officer, secrets officer)
-var keyVaultRoleAssignmentDefs = [
-  { key: 'automationAccountKeyVaultCertificatesOfficer', roleId: roleDefinitions.keyVaultCertificatesOfficer, principalKey: 'aa', description: 'Automation Account -> Key Vault Certificates Officer -> Key Vault' }
-  { key: 'automationAccountKeyVaultSecretsOfficer',      roleId: roleDefinitions.keyVaultSecretsOfficer,      principalKey: 'aa', description: 'Automation Account -> Key Vault Secrets Officer -> Key Vault' }
-]
-resource keyVaultRoleAssignments 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for d in keyVaultRoleAssignmentDefs: {
-  scope: keyVault
-  name: guid(subscription().id, resourceGroup().id, d.key)
-  properties: {
-    description: d.description
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', d.roleId)
-    principalId: principalIds[d.principalKey]
-    principalType: 'ServicePrincipal'
-  }
-}]
-
-// On Automation Account: AA self-reader (needed by hybrid workers to read AA variables) + Function App (reader, automation operator)
-var automationAccountRoleAssignmentDefs = [
-  { key: 'automationAccountReader',            roleId: roleDefinitions.reader,             principalKey: 'aa', description: 'Automation Account -> Reader -> Automation Account (self; required for hybrid workers to read AA variables)' }
-  { key: 'functionAppAutomationAccountReader', roleId: roleDefinitions.reader,             principalKey: 'fa', description: 'Function App -> Reader -> Automation Account' }
-  { key: 'functionAppAutomationOperator',      roleId: roleDefinitions.automationOperator, principalKey: 'fa', description: 'Function App -> Automation Operator -> Automation Account' }
-]
-resource automationAccountRoleAssignments 'Microsoft.Authorization/roleAssignments@2022-04-01' = [for d in automationAccountRoleAssignmentDefs: {
-  scope: automationAccount
-  name: guid(subscription().id, resourceGroup().id, d.key)
-  properties: {
-    description: d.description
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', d.roleId)
-    principalId: principalIds[d.principalKey]
-    principalType: 'ServicePrincipal'
-  }
-}]
-
-// Singletons (one-of-a-kind scope; no benefit from a loop)
-
-// On Data Collection Rule: Automation Account (Monitoring Metrics Publisher) to allow AA to write custom logs
-resource automationAccountMonitoringMetricsPublisher 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(subscription().id, resourceGroup().id, 'automationAccountMonitoringMetricsPublisher')
-  scope: dataCollectionRule
-  properties: {
-    description: 'Automation Account -> Monitoring Metrics Publisher -> DCR'
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleDefinitions.monitoringMetricsPublisher)
-    principalId: automationAccount.identity.principalId
-    principalType: 'ServicePrincipal'
+module integrations './modules/integrations.bicep' = {
+  name: 'certlc-integrations'
+  params: {
+    location: location
+    storageAccountName: storageAccountName
+    storageAccountId: storage.outputs.storageAccountId
+    keyVaultName: keyVaultName
+    keyVaultId: keyVault.outputs.id
+    automationAccountName: automationAccountName
+    automationPrincipalId: automation.outputs.principalId
+    functionAppPrincipalId: functionApp.outputs.principalId
+    dataCollectionRuleName: dataCollectionRuleName
+    applicationInsightsName: applicationInsightsName
+    tags: commonTags
   }
 }
 
-// On Application Insights: Function App (Monitoring Metrics Publisher) to instrument the Function App
-resource functionAppMonitoringMetricsPublisher 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(subscription().id, resourceGroup().id, 'functionAppMonitoringMetricsPublisher')
-  scope: applicationInsights
-  properties: {
-    description: 'Function App -> Monitoring Metrics Publisher -> Application Insights'
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roleDefinitions.monitoringMetricsPublisher)
-    principalId: functionApp.identity.principalId
-    principalType: 'ServicePrincipal'
+module workbook './modules/workbook.bicep' = {
+  name: 'certlc-workbook'
+  params: {
+    location: location
+    logAnalyticsWorkspaceId: observability.outputs.logAnalyticsWorkspaceId
+    automationAccountId: automation.outputs.id
+    runbookName: runbookName
+    functionAppId: functionApp.outputs.id
+    tags: commonTags
   }
 }
 
 // Output all resource IDs and important properties
-output storageAccountId string = storageAccount.id
-output storageAccountQueueUri string = storageAccount.properties.primaryEndpoints.queue
-output automationAccountId string = automationAccount.id
-output keyVaultId string = keyVault.id
-output functionAppId string = functionApp.id
-output logAnalyticsWorkspaceId string = logAnalyticsWorkspace.id
-output applicationInsightsId string = applicationInsights.id
-output dceIngestionEndpoint string = dataCollectionEndpoint.properties.logsIngestion.endpoint
-@secure()
-output dataCollectionRuleImmutableId string = dataCollectionRule.properties.immutableId
+output storageAccountId string = storage.outputs.storageAccountId
+output storageAccountQueueUri string = storage.outputs.queueEndpoint
+output automationAccountId string = automation.outputs.id
+output keyVaultId string = keyVault.outputs.id
+output functionAppId string = functionApp.outputs.id
+output logAnalyticsWorkspaceId string = observability.outputs.logAnalyticsWorkspaceId
+output applicationInsightsId string = observability.outputs.applicationInsightsId
+output dceIngestionEndpoint string = observability.outputs.dceIngestionEndpoint
+output dataCollectionRuleImmutableId string = observability.outputs.dataCollectionRuleImmutableId
