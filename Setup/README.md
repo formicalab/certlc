@@ -141,7 +141,7 @@ The deployment requires the following parameters (configured in `parameters.dev.
 | `actionGroupName` | Name of the dedicated Action Group (defaults to `ag-<logAnalyticsWorkspaceName>`) |
 | `alertEmailReceivers` | Optional Action Group email receiver objects with `name`, `emailAddress`, and `useCommonAlertSchema` properties |
 
-Alerts are opt-in so existing deployments remain unchanged. To create the dedicated Action Group and alert rules, add values like these to the environment parameter file:
+Alerts are opt-in at the template level, so existing deployments remain unchanged unless `enableAlerts` is set to `true`. The checked-in development parameter file enables them for the current environment. For another environment, add values like these to its parameter file:
 
 ```bicep
 param enableAlerts = true
@@ -156,6 +156,20 @@ param alertEmailReceivers = [
 ```
 
 An empty `alertEmailReceivers` array is valid and leaves alerts visible in Azure Monitor without sending email notifications.
+
+### Enabling Alerts on an Existing Deployment
+
+The alert feature is additive. A normal root-template deployment can enable it when every environment parameter, including secure values, is current. Do not deploy a checked-in placeholder such as `automationAccountVarSmtpPassword` to a live environment because the root deployment manages the encrypted Automation variable.
+
+To add only the monitoring feature without replaying unrelated or sensitive parameters, deploy `modules/alerts.bicep` directly with a temporary environment-specific `.bicepparam` file. Supply the existing Storage Account name, Automation Account ID, Event Grid system topic ID and subscription name, Log Analytics workspace ID, Action Group settings, and tags. Always run the standalone deployment in this order:
+
+```powershell
+az deployment group validate --resource-group <resource-group> --parameters .\parameters.alerts.<environment>.bicepparam
+az deployment group what-if --resource-group <resource-group> --parameters .\parameters.alerts.<environment>.bicepparam
+az deployment group create --resource-group <resource-group> --parameters .\parameters.alerts.<environment>.bicepparam
+```
+
+Remove the temporary parameter file after verification, especially when it contains environment-specific notification addresses.
 
 ## Deployment
 
@@ -453,7 +467,8 @@ After deploying the infrastructure, complete these additional steps:
   - These firewall rules and SNAT configuration are not created by this template and must be configured in the customer network containing `fnSubnetId`. For details, see [Azure service tags](https://learn.microsoft.com/azure/virtual-network/service-tags-overview)
 7. **Grant CA Permissions**: Assign the hybrid worker's computer account Enroll permissions on the CA templates
 8. **Review the Workbook**: Open the deployed `certlcstats` workbook and verify that its resource selectors reference the deployed Log Analytics workspace, Automation Account, runbooks, and Function App. The repository file `Workbooks/certlcstats.workbook` is authoritative; later Bicep deployments overwrite workbook changes made only in the portal. If the tokenized file is imported manually instead, the workbook still opens, but its five resource parameters must be selected and saved in the portal before the queries can run.
-9. **Test End-to-End**:
+9. **Review Alerts** (when enabled): Verify the dedicated Action Group receiver is enabled, all six alert rules target that Action Group, and the Storage Queue service has the `StorageWrite` diagnostic setting. The receiver may get an initial stale-statistics notification while the `certlcstats` schedule remains unlinked.
+10. **Test End-to-End**:
    - **Create a test certificate** using the utility scripts in the `Utilities` folder:
      - `testnewcert.ps1` - Request a new certificate enrollment
      - `testrenewcert.ps1` - Request certificate renewal
