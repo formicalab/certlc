@@ -237,7 +237,7 @@ The Bicep template creates and configures the following Azure resources:
 - **Configuration**:
   - Integrated with VNet via delegated subnet
   - Connected to Storage Account and Application Insights using its system-assigned managed identity for authentication (no instrumentation keys or connection strings with secrets)
-  - Runtime: PowerShell 7.4
+  - Runtime: PowerShell 7.6
   - Hardened: HTTPS only, FTPS state disabled, public network access restricted to the private endpoint
 - **Private Endpoint**: Secured with private endpoint for site access
 
@@ -412,7 +412,7 @@ After deploying the infrastructure, complete these additional steps:
       func azure functionapp publish <function-app-name>
       ```
 
-      Replace `<function-app-name>` with the deployed `functionAppName` parameter value. No PowerShell-specific option is required: the local project declares `FUNCTIONS_WORKER_RUNTIME=powershell`, and the Bicep template configures the target Function App for PowerShell 7.4. For command details, see [deploying a Flex Consumption app with Core Tools](https://learn.microsoft.com/azure/azure-functions/flex-consumption-how-to#deploy-your-code-project).
+      Replace `<function-app-name>` with the deployed `functionAppName` parameter value. No PowerShell-specific option is required: the local project declares `FUNCTIONS_WORKER_RUNTIME=powershell`, and the Bicep template configures the target Function App for PowerShell 7.6. For command details, see [deploying a Flex Consumption app with Core Tools](https://learn.microsoft.com/azure/azure-functions/flex-consumption-how-to#deploy-your-code-project).
 
 6. **Configure Function App Outbound Connectivity**: The Function App uses the public Application Insights ingestion endpoint for telemetry and also requires public Azure endpoints such as Microsoft Entra ID. Configure controlled internet egress for the delegated Function App subnet (`fnSubnetId`):
   - Configure the customer-provided firewall to allow outbound HTTPS on TCP 443 from the delegated subnet to the `AzureCloud` service tag. `AzureCloud` is intentionally broader than an Application Insights-specific tag so the function can also reach its other required Azure public endpoints
