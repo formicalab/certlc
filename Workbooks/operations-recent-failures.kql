@@ -1,0 +1,31 @@
+let BridgeOperations = AppTraces
+| where AppRoleName =~ "{FunctionApp:name}"
+| where Message has_any ("CERTLC:", "Runbook started with job id:", "Runbook job id:")
+| summarize by OperationId;
+let FunctionFailures = BridgeOperations
+| join kind=inner (
+    AppExceptions
+    | where AppRoleName =~ "{FunctionApp:name}"
+    | summarize arg_max(TimeGenerated, OuterMessage) by OperationId
+  ) on OperationId
+| project Time = TimeGenerated, Source = "Function bridge", Id = OperationId, Details = tostring(OuterMessage);
+let FailedJobs = AzureDiagnostics
+| where Category == "JobLogs"
+| where Resource =~ "{AutomationAccount:name}"
+| where RunbookName_s =~ tostring(split("{Runbook:name}", "/")[-1])
+| summarize arg_max(TimeGenerated, ResultType) by JobId_g
+| where ResultType =~ "Failed"
+| extend JobId = tostring(JobId_g);
+let JobErrors = AzureDiagnostics
+| where Category == "JobStreams"
+| where Resource =~ "{AutomationAccount:name}"
+| where RunbookName_s =~ tostring(split("{Runbook:name}", "/")[-1])
+| where StreamType_s == "Error"
+| summarize arg_max(TimeGenerated, ResultDescription) by JobId = tostring(JobId_g)
+| project JobId, ErrorMessage = replace_regex(tostring(ResultDescription), @"\x1B\[[0-9;]*[A-Za-z]", "");
+union
+FunctionFailures,
+(FailedJobs
+| join kind=leftouter JobErrors on JobId
+| project Time = TimeGenerated, Source = "Automation job", Id = JobId, Details = ErrorMessage)
+| top 20 by Time desc

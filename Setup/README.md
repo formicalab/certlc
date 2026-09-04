@@ -224,7 +224,8 @@ The Bicep template creates and configures the following Azure resources:
 - **Purpose**: Provides a dashboard for monitoring certificate lifecycle and statistics
 - **Configuration**:
   - Name: `certlcstats`
-  - Initially empty (queries and visualizations can be added post-deployment)
+  - Complete workbook definition loaded from `Workbooks/certlcstats.workbook` and published by Bicep
+  - Deployment replaces the workbook's resource-ID tokens with the resources created by the template
   - Linked to Log Analytics Workspace as data source
   - Depends on Application Insights to ensure workspace stability
 
@@ -236,7 +237,7 @@ The Bicep template creates and configures the following Azure resources:
 - **Configuration**:
   - Integrated with VNet via delegated subnet
   - Connected to Storage Account and Application Insights using its system-assigned managed identity for authentication (no instrumentation keys or connection strings with secrets)
-  - Runtime: PowerShell 7.4
+  - Runtime: PowerShell 7.6
   - Hardened: HTTPS only, FTPS state disabled, public network access restricted to the private endpoint
 - **Private Endpoint**: Secured with private endpoint for site access
 
@@ -411,7 +412,7 @@ After deploying the infrastructure, complete these additional steps:
       func azure functionapp publish <function-app-name>
       ```
 
-      Replace `<function-app-name>` with the deployed `functionAppName` parameter value. No PowerShell-specific option is required: the local project declares `FUNCTIONS_WORKER_RUNTIME=powershell`, and the Bicep template configures the target Function App for PowerShell 7.4. For command details, see [deploying a Flex Consumption app with Core Tools](https://learn.microsoft.com/azure/azure-functions/flex-consumption-how-to#deploy-your-code-project).
+      Replace `<function-app-name>` with the deployed `functionAppName` parameter value. No PowerShell-specific option is required: the local project declares `FUNCTIONS_WORKER_RUNTIME=powershell`, and the Bicep template configures the target Function App for PowerShell 7.6. For command details, see [deploying a Flex Consumption app with Core Tools](https://learn.microsoft.com/azure/azure-functions/flex-consumption-how-to#deploy-your-code-project).
 
 6. **Configure Function App Outbound Connectivity**: The Function App uses the public Application Insights ingestion endpoint for telemetry and also requires public Azure endpoints such as Microsoft Entra ID. Configure controlled internet egress for the delegated Function App subnet (`fnSubnetId`):
   - Configure the customer-provided firewall to allow outbound HTTPS on TCP 443 from the delegated subnet to the `AzureCloud` service tag. `AzureCloud` is intentionally broader than an Application Insights-specific tag so the function can also reach its other required Azure public endpoints
@@ -419,7 +420,7 @@ After deploying the infrastructure, complete these additional steps:
     - Verify that DNS can resolve the required public Azure endpoints and that Application Insights telemetry is received after the function starts
   - These firewall rules and SNAT configuration are not created by this template and must be configured in the customer network containing `fnSubnetId`. For details, see [Azure service tags](https://learn.microsoft.com/azure/virtual-network/service-tags-overview)
 7. **Grant CA Permissions**: Assign the hybrid worker's computer account Enroll permissions on the CA templates
-8. **Customize Workbook** (Optional): Add queries and visualizations to the `certlcstats` workbook for certificate monitoring
+8. **Review the Workbook**: Open the deployed `certlcstats` workbook and verify that its resource selectors reference the deployed Log Analytics workspace, Automation Account, runbooks, and Function App. The repository file `Workbooks/certlcstats.workbook` is authoritative; later Bicep deployments overwrite workbook changes made only in the portal. If the tokenized file is imported manually instead, the workbook still opens, but its five resource parameters must be selected and saved in the portal before the queries can run.
 9. **Test End-to-End**:
    - **Create a test certificate** using the utility scripts in the `Utilities` folder:
      - `testnewcert.ps1` - Request a new certificate enrollment

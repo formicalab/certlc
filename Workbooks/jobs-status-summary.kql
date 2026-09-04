@@ -1,0 +1,6 @@
+AzureDiagnostics
+| where Category == "JobLogs"
+| where Resource =~ "{AutomationAccount:name}"
+| where RunbookName_s =~ tostring(split("{Runbook:name}", "/")[-1])
+| summarize arg_max(TimeGenerated, ResultType) by JobId_g
+| summarize JobCount = count() by ResultType

@@ -195,6 +195,10 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2026-04-01' = {
   resource blobServices 'blobServices' = {
     name: 'default'
     properties: {}
+    resource deploymentContainer 'containers' = {
+      name: 'azure-webjobs-hosts'
+      properties: {}
+    }
     resource deadLetterContainer 'containers' = {
       name: 'eventgrid-deadletter'
       properties: {}
@@ -408,7 +412,7 @@ resource functionApp 'Microsoft.Web/sites@2025-03-01' = {
       deployment: {
         storage: {
           type: 'blobContainer'
-          value: '${storageAccount.properties.primaryEndpoints.blob}azure-webjobs-hosts'
+          value: '${storageAccount.properties.primaryEndpoints.blob}${storageAccount::blobServices::deploymentContainer.name}'
           authentication: {
             type: 'SystemAssignedIdentity'
           }
@@ -420,7 +424,7 @@ resource functionApp 'Microsoft.Web/sites@2025-03-01' = {
       }
       runtime: {
         name: 'powerShell'
-        version: '7.4'
+        version: '7.6'
       }
     }
   }
@@ -538,8 +542,8 @@ resource automationAccount 'Microsoft.Automation/automationAccounts@2024-10-23' 
   // }
 }
 
-// Automation Account variables (loop). Values are JSON-string-encoded:
-// wrapped in double-quotes and with any backslashes escaped (replace is a no-op for values without backslashes).
+// Automation Account variables (loop). Values are JSON-string-encoded by serializing a single-item array
+// and removing its brackets, which preserves the quotes and escapes required by the Automation API.
 // Note: the [for] iteratee must be calculable at the start of deployment (BCP178), so it lists only literal
 // variable names; the actual values (some of which reference runtime resource properties) are looked up via
 // the automationAccountVariableValues map inside the loop body.
@@ -572,7 +576,7 @@ resource automationAccountVariables 'Microsoft.Automation/automationAccounts/var
   parent: automationAccount
   name: n
   properties: {
-    value: '"${replace(automationAccountVariableValues[n], '\\', '\\\\')}"'
+    value: substring(string([automationAccountVariableValues[n]]), 1, max(0, length(string([automationAccountVariableValues[n]])) - 2))
     isEncrypted: true
   }
 }]
@@ -767,6 +771,14 @@ resource keyVaultEventGridSubscription 'Microsoft.EventGrid/systemTopics/eventSu
   ]
 }
 
+// Resolve environment-specific workbook defaults during template compilation/deployment.
+var workbookTemplate = loadTextContent('../Workbooks/certlcstats.workbook')
+var workbookWithWorkspace = replace(workbookTemplate, '__LOG_ANALYTICS_WORKSPACE_ID__', logAnalyticsWorkspace.id)
+var workbookWithAutomation = replace(workbookWithWorkspace, '__AUTOMATION_ACCOUNT_ID__', automationAccount.id)
+var workbookWithMainRunbook = replace(workbookWithAutomation, '__MAIN_RUNBOOK_ID__', '${automationAccount.id}/runbooks/${runbookName}')
+var workbookWithStatsRunbook = replace(workbookWithMainRunbook, '__STATS_RUNBOOK_ID__', '${automationAccount.id}/runbooks/certlcstats')
+var workbookContent = replace(workbookWithStatsRunbook, '__FUNCTION_APP_ID__', functionApp.id)
+
 // Azure Monitor Workbook for Certificate Statistics
 resource workbookCertLCStats 'Microsoft.Insights/workbooks@2023-06-01' = {
   name: guid(resourceGroup().id, 'certlcstats')
@@ -774,14 +786,16 @@ resource workbookCertLCStats 'Microsoft.Insights/workbooks@2023-06-01' = {
   kind: 'shared'
   properties: {
     displayName: 'certlcstats'
-    serializedData: '{"version":"Notebook/1.0","items":[],"styleSettings":{},"$schema":"https://github.com/Microsoft/Application-Insights-Workbooks/blob/master/schema/workbook.json"}'
+    serializedData: workbookContent
     category: 'workbook'
     sourceId: logAnalyticsWorkspace.id
   }
   dependsOn: [
     applicationInsights  // Wait for App Insights to ensure workspace is fully active
   ]
-  tags: commonTags
+  tags: union(commonTags, {
+    'hidden-title': 'certlcstats'
+  })
 }
 
 // Role Assignments (grouped by scope so each loop has a constant scope, as required by Bicep)

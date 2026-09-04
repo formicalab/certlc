@@ -1,0 +1,3 @@
+where type =~ 'Microsoft.Automation/AutomationAccounts'
+| project id, name
+| order by name desc

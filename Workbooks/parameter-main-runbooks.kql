@@ -1,0 +1,4 @@
+where type =~ 'microsoft.automation/automationaccounts/runbooks'
+| where id startswith "{AutomationAccount}"
+| project id, name
+| order by name desc

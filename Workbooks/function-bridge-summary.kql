@@ -1,0 +1,29 @@
+let TraceSummary = AppTraces
+| where AppRoleName =~ "{FunctionApp:name}"
+| where Message has_any ("CERTLC:", "Runbook started with job id:", "Runbook job id:")
+| summarize
+    Started = minif(TimeGenerated, Message has "CERTLC: full message received"),
+    Completed = countif(Message has "status: Completed") > 0,
+    LastTrace = max(TimeGenerated)
+  by OperationId
+| where isnotnull(Started);
+let ExceptionSummary = AppExceptions
+| where AppRoleName =~ "{FunctionApp:name}"
+| summarize ExceptionCount = count() by OperationId;
+let Operations = TraceSummary
+| join kind=leftouter ExceptionSummary on OperationId
+| extend Status = case(ExceptionCount > 0, "Failed", Completed, "Completed", "In progress or unknown"),
+         DurationSeconds = (LastTrace - Started) / 1s;
+let Summary = materialize(Operations
+| summarize
+    Total = count(),
+    Completed = countif(Status == "Completed"),
+    Failed = countif(Status == "Failed"),
+    FailureRatePct = round(100.0 * countif(Status == "Failed") / count(), 1),
+    P95DurationSeconds = round(percentile(DurationSeconds, 95), 1));
+union
+(Summary | project Metric = "Invocations", Value = tostring(Total)),
+(Summary | project Metric = "Completed", Value = tostring(Completed)),
+(Summary | project Metric = "Failed", Value = tostring(Failed)),
+(Summary | project Metric = "Failure rate", Value = strcat(FailureRatePct, "%")),
+(Summary | project Metric = "P95 duration", Value = strcat(P95DurationSeconds, " s"))

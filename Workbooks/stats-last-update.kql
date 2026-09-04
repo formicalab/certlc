@@ -1,0 +1,7 @@
+AzureDiagnostics
+| where Category == "JobLogs"
+| where Resource =~ "{AutomationAccount:name}"
+| where RunbookName_s =~ split("{StatsRunbook}","/")[-1]  // The stats collection runbook
+| where ResultType =~ "Completed"       // Only successful completions
+| summarize arg_max(TimeGenerated, *)   // Get the most recent completed job
+| project LastUpdateFormatted = format_datetime(TimeGenerated, 'yyyy-MM-dd HH:mm:ss')
