@@ -152,7 +152,7 @@ CertLC/
 ├── LogAnalytics/               # Custom table configuration
 │   └── customTable/            # Schema and transformation for certlcstats_CL table
 ├── Workbooks/                  # Azure Monitor workbooks
-│   ├── certlc.workbook         # Certificate statistics dashboard
+│   ├── certlcstats.workbook    # Tokenized certificate statistics dashboard deployed by Bicep
 │   └── *.kql                   # KQL queries for visualizations
 ├── Utilities/                  # Helper scripts
 │   ├── Export-PfxWithGroupProtection.ps1 # Export a Key Vault certificate as a SID-protected PFX

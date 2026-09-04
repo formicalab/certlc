@@ -25,7 +25,7 @@
             },
             "queryType": 1,
             "resourceType": "microsoft.resourcegraph/resources",
-            "value": "/subscriptions/9068a229-f092-400e-8093-87e8e7d26ae1/resourceGroups/rg-certlc-itn-001/providers/Microsoft.OperationalInsights/workspaces/log-certlc-itn-001"
+            "value": "__LOG_ANALYTICS_WORKSPACE_ID__"
           },
           {
             "id": "c4ac2502-0074-4ee6-ac9c-58d49516cfff",
@@ -47,7 +47,7 @@
             },
             "queryType": 1,
             "resourceType": "microsoft.resourcegraph/resources",
-            "value": "/subscriptions/9068a229-f092-400e-8093-87e8e7d26ae1/resourceGroups/rg-certlc-itn-001/providers/Microsoft.Automation/automationAccounts/aa-certlc-itn-001"
+            "value": "__AUTOMATION_ACCOUNT_ID__"
           },
           {
             "id": "e75fbcd5-8b96-4b46-a2b1-87d92b2036ec",
@@ -65,7 +65,7 @@
             },
             "queryType": 1,
             "resourceType": "microsoft.resourcegraph/resources",
-            "value": "/subscriptions/9068a229-f092-400e-8093-87e8e7d26ae1/resourceGroups/rg-certlc-itn-001/providers/Microsoft.Automation/automationAccounts/aa-certlc-itn-001/runbooks/certlc",
+            "value": "__MAIN_RUNBOOK_ID__",
             "label": "Main Runbook"
           },
           {
@@ -84,7 +84,7 @@
             },
             "queryType": 1,
             "resourceType": "microsoft.resourcegraph/resources",
-            "value": "/subscriptions/9068a229-f092-400e-8093-87e8e7d26ae1/resourceGroups/rg-certlc-itn-001/providers/Microsoft.Automation/automationAccounts/aa-certlc-itn-001/runbooks/certlcstats"
+            "value": "__STATS_RUNBOOK_ID__"
           },
           {
             "id": "b360539c-8d3a-48bc-90cf-5c67acf768f6",
@@ -102,7 +102,7 @@
             },
             "queryType": 1,
             "resourceType": "microsoft.resourcegraph/resources",
-            "value": "/subscriptions/9068a229-f092-400e-8093-87e8e7d26ae1/resourceGroups/rg-certlc-itn-001/providers/Microsoft.Web/sites/flazfn-certlc-itn-001"
+            "value": "__FUNCTION_APP_ID__"
           },
           {
             "id": "a46ac1ec-5965-4af4-8750-49ace0d90f8d",

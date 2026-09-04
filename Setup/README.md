@@ -224,7 +224,8 @@ The Bicep template creates and configures the following Azure resources:
 - **Purpose**: Provides a dashboard for monitoring certificate lifecycle and statistics
 - **Configuration**:
   - Name: `certlcstats`
-  - Initially empty (queries and visualizations can be added post-deployment)
+  - Complete workbook definition loaded from `Workbooks/certlcstats.workbook` and published by Bicep
+  - Deployment replaces the workbook's resource-ID tokens with the resources created by the template
   - Linked to Log Analytics Workspace as data source
   - Depends on Application Insights to ensure workspace stability
 
@@ -419,7 +420,7 @@ After deploying the infrastructure, complete these additional steps:
     - Verify that DNS can resolve the required public Azure endpoints and that Application Insights telemetry is received after the function starts
   - These firewall rules and SNAT configuration are not created by this template and must be configured in the customer network containing `fnSubnetId`. For details, see [Azure service tags](https://learn.microsoft.com/azure/virtual-network/service-tags-overview)
 7. **Grant CA Permissions**: Assign the hybrid worker's computer account Enroll permissions on the CA templates
-8. **Customize Workbook** (Optional): Add queries and visualizations to the `certlcstats` workbook for certificate monitoring
+8. **Review the Workbook**: Open the deployed `certlcstats` workbook and verify that its resource selectors reference the deployed Log Analytics workspace, Automation Account, runbooks, and Function App. The repository file `Workbooks/certlcstats.workbook` is authoritative; later Bicep deployments overwrite workbook changes made only in the portal. If the tokenized file is imported manually instead, the workbook still opens, but its five resource parameters must be selected and saved in the portal before the queries can run.
 9. **Test End-to-End**:
    - **Create a test certificate** using the utility scripts in the `Utilities` folder:
      - `testnewcert.ps1` - Request a new certificate enrollment

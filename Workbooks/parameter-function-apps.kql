@@ -1,0 +1,4 @@
+where type =~ 'microsoft.web/sites'
+| where kind contains 'functionapp'
+| project id, name
+| order by name desc

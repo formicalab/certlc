@@ -1,0 +1,64 @@
+let JobStreamEvents = AzureDiagnostics
+| where Category == "JobStreams"
+| where Resource =~ "{AutomationAccount:name}"
+| where RunbookName_s =~ tostring(split("{Runbook:name}", "/")[-1])
+| where StreamType_s in ("Output", "Error", "Warning")
+| extend JobIdStr = tostring(JobId_g), RawMessage = replace_regex(tostring(ResultDescription), @"\x1B\[[0-9;]*[A-Za-z]", "")
+| extend ParsedMessage = parse_json(extract(@"(\{.*\})", 1, RawMessage))
+| extend StructuredMessage = tostring(ParsedMessage.message),
+         StructuredSection = tostring(ParsedMessage.section),
+         StructuredLevel = tostring(ParsedMessage.level)
+| extend ChildMessage = iff(isnotempty(StructuredMessage), StructuredMessage, RawMessage),
+         ChildSection = iff(isnotempty(StructuredSection), StructuredSection, StreamType_s),
+         EffectiveLevel = tolower(iff(isnotempty(StructuredLevel), StructuredLevel, StreamType_s))
+| project
+    JobIdStr,
+    Time = TimeGenerated,
+    ChildMessage,
+    ChildSection,
+    Id = strcat(JobIdStr, "-", format_datetime(TimeGenerated, 'yyyyMMddHHmmssfff')),
+    ParentId = JobIdStr,
+    Name = strcat(case(
+        EffectiveLevel == "error", "Error at ",
+        EffectiveLevel == "warning", "Warning at ",
+        "Output at "), format_datetime(TimeGenerated, 'HH:mm:ss')),
+    Kind = StreamType_s,
+    FinalResult = case(
+        EffectiveLevel == "error", "failed",
+        EffectiveLevel == "warning", "warning",
+        "info");
+
+let LastEventPerJob = JobStreamEvents
+| summarize arg_max(Time, ChildMessage, ChildSection) by JobIdStr
+| project JobIdStr, LastMessage = ChildMessage, LastSection = ChildSection;
+
+let JobLogSummary = AzureDiagnostics
+| where Category == "JobLogs"
+| where Resource =~ "{AutomationAccount:name}"
+| where RunbookName_s =~ tostring(split("{Runbook:name}", "/")[-1])
+| summarize arg_max(TimeGenerated, ResultType) by JobId_g
+| extend JobIdStr = tostring(JobId_g), CompletionTime = TimeGenerated
+| join kind=leftouter LastEventPerJob on JobIdStr
+| project
+    Id = JobIdStr,
+    ParentId = "",
+    Name = strcat("Job ", JobIdStr),
+    Kind = "Job",
+    FinalResult = case(
+        tolower(ResultType) == "completed", "success",
+        tolower(ResultType) == "failed", "failed",
+        ResultType),
+    Time = CompletionTime,
+    Message = LastMessage,
+    Section = LastSection;
+
+union
+(
+    JobLogSummary
+    | project Id, ParentId, Name, Kind, FinalResult, Time, Section, Message
+),
+(
+    JobStreamEvents
+    | project Id, ParentId, Name, Kind, FinalResult, Time, Section = ChildSection, Message = ChildMessage
+)
+| order by Time desc, ParentId asc

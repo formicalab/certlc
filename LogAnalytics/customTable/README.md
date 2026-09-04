@@ -38,7 +38,7 @@ certlcstats_CL
 | project TimeGenerated, Name, Thumbprint, Subject, Template, Expires
 ```
 
-The Azure Monitor workbook in [`Workbooks/certlc.workbook`](../../Workbooks/certlc.workbook) consumes this table to render the certificate inventory dashboard.
+The Azure Monitor workbook in [`Workbooks/certlcstats.workbook`](../../Workbooks/certlcstats.workbook) consumes this table to render the certificate inventory dashboard. The Bicep deployment resolves its resource-ID tokens and publishes the complete workbook.
 
 ## Modifying schema or transformation
 

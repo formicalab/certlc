@@ -767,6 +767,14 @@ resource keyVaultEventGridSubscription 'Microsoft.EventGrid/systemTopics/eventSu
   ]
 }
 
+// Resolve environment-specific workbook defaults during template compilation/deployment.
+var workbookTemplate = loadTextContent('../Workbooks/certlcstats.workbook')
+var workbookWithWorkspace = replace(workbookTemplate, '__LOG_ANALYTICS_WORKSPACE_ID__', logAnalyticsWorkspace.id)
+var workbookWithAutomation = replace(workbookWithWorkspace, '__AUTOMATION_ACCOUNT_ID__', automationAccount.id)
+var workbookWithMainRunbook = replace(workbookWithAutomation, '__MAIN_RUNBOOK_ID__', '${automationAccount.id}/runbooks/${runbookName}')
+var workbookWithStatsRunbook = replace(workbookWithMainRunbook, '__STATS_RUNBOOK_ID__', '${automationAccount.id}/runbooks/certlcstats')
+var workbookContent = replace(workbookWithStatsRunbook, '__FUNCTION_APP_ID__', functionApp.id)
+
 // Azure Monitor Workbook for Certificate Statistics
 resource workbookCertLCStats 'Microsoft.Insights/workbooks@2023-06-01' = {
   name: guid(resourceGroup().id, 'certlcstats')
@@ -774,14 +782,16 @@ resource workbookCertLCStats 'Microsoft.Insights/workbooks@2023-06-01' = {
   kind: 'shared'
   properties: {
     displayName: 'certlcstats'
-    serializedData: '{"version":"Notebook/1.0","items":[],"styleSettings":{},"$schema":"https://github.com/Microsoft/Application-Insights-Workbooks/blob/master/schema/workbook.json"}'
+    serializedData: workbookContent
     category: 'workbook'
     sourceId: logAnalyticsWorkspace.id
   }
   dependsOn: [
     applicationInsights  // Wait for App Insights to ensure workspace is fully active
   ]
-  tags: commonTags
+  tags: union(commonTags, {
+    'hidden-title': 'certlcstats'
+  })
 }
 
 // Role Assignments (grouped by scope so each loop has a constant scope, as required by Bicep)

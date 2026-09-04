@@ -1,0 +1,20 @@
+let TraceSummary = AppTraces
+| where AppRoleName =~ "{FunctionApp:name}"
+| where Message has_any ("CERTLC:", "Runbook started with job id:", "Runbook job id:")
+| summarize
+    Started = minif(TimeGenerated, Message has "CERTLC: full message received"),
+    EventType = take_anyif(extract(@"CERTLC: event type:\s*(.+)$", 1, Message), Message has "CERTLC: event type:"),
+    RunbookJobId = take_anyif(extract(@"job id:\s*([0-9a-fA-F-]{36})", 1, Message), Message has "job id:"),
+    Completed = countif(Message has "status: Completed") > 0,
+    LastTrace = max(TimeGenerated)
+  by OperationId
+| where isnotnull(Started);
+let ExceptionSummary = AppExceptions
+| where AppRoleName =~ "{FunctionApp:name}"
+| summarize ExceptionCount = count() by OperationId;
+TraceSummary
+| join kind=leftouter ExceptionSummary on OperationId
+| extend Status = case(ExceptionCount > 0, "Failed", Completed, "Completed", "In progress or unknown"),
+         Duration = LastTrace - Started
+| top 10 by Duration desc
+| project Started, Status, EventType, RunbookJobId, Duration
