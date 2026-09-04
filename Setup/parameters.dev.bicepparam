@@ -20,6 +20,17 @@ param runtimeEnvironmentName = 'certlc-PowerShell-7-6'
 param keyVaultName = 'flazkv-certlc-itn-001'
 param dataCollectionEndpointName = 'dce-certlc-itn-001'
 param dataCollectionRuleName = 'dcr-certlcstats-itn-001'
+param actionGroupName = 'ag-certlc-itn-001'
+
+// Alerting Configuration
+param enableAlerts = true
+param alertEmailReceivers = [
+	{
+		name: 'Marcello Formica'
+		emailAddress: 'mformica@microsoft.com'
+		useCommonAlertSchema: true
+	}
+]
 
 // Automation account variables
 param automationAccountVarCA = 'flazdc03.lab.formicalab.casa\\SubCA' // Name of the CA to use (for the automation account variable)

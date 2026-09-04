@@ -9,6 +9,7 @@ CertLC is an event-driven certificate lifecycle management solution that integra
 - **Certificate Chain Preservation**: Store the complete CA chain in Key Vault and export the private-key leaf with its intermediate certificates in the protected PFX
 - **Certificate Revocation**: Revoke certificates on demand using the certificate thumbprint
 - **Statistics Collection**: Gather and store certificate metadata in Log Analytics for monitoring and reporting
+- **Proactive Alerting**: Optionally deploy a dedicated Action Group with alerts for poison messages, Event Grid delivery failures, failed Automation jobs, and stale statistics
 
 ## Architecture
 
@@ -54,6 +55,7 @@ CertLC is an event-driven certificate lifecycle management solution that integra
 | Enterprise CA | Issue complete certificate chains and process enrollment and revocation requests through AD CS RPC/DCOM interfaces |
 | Key Vault | Hold versioned certificates, private keys, complete certificate chains, and lifecycle tags |
 | Log Analytics and Application Insights | Store latest-version certificate inventory and operational telemetry; the workbook shows expiration status/details, runbook job status, and per-job logs |
+| Azure Monitor Alerts and Action Group | Notify operators about poison messages, Event Grid dead-lettering or delivery failures, failed runbooks, and missing statistics snapshots when alerting is enabled |
 
 Azure-to-Azure calls use managed identities. Storage, Function App, Automation Account, and Key Vault data-plane access is private; the Hybrid Worker provides the boundary between Azure automation and the on-premises CA. Azure Monitor ingestion endpoints remain public and require controlled outbound access.
 
@@ -123,6 +125,18 @@ CertLC stores the following tags on individual Key Vault certificate versions. C
 3. Certificate data is published to a custom Log Analytics table via Data Collection Rule
 4. The Azure Monitor workbook shows certificate expiration status and details, runbook job status, and logs for selected jobs
 
+### Proactive Alerting
+
+Alerting is controlled by the Bicep `enableAlerts` parameter, which defaults to `false`. When enabled, the deployment creates a dedicated CertLC Action Group, Queue Storage write diagnostics, and six Azure Monitor alert rules:
+
+- Event Grid dead-lettered and dropped events (severity 1)
+- Repeated Event Grid delivery failures (severity 3)
+- Messages written to the `certlc-poison` queue (severity 1)
+- Failed, stopped, or suspended `certlc` and `certlcstats` Automation jobs (severity 2)
+- No successful `certlcstats` completion within two hours (severity 2)
+
+Action Group email receivers are configured per environment and use the common alert schema. The stale-statistics rule intentionally reports an unhealthy state while the hourly statistics schedule is not linked or successful.
+
 ### Resilience
 
 The runbook's Key Vault REST reads for thumbprint discovery and exact secret retrieval, plus its LDAP template lookup, use a retry helper with up to four total attempts. It retries HTTP 408, 429, 500, 502, 503, and 504 responses and selected network, timeout, I/O, web, and COM exceptions. `Retry-After` takes precedence over exponential backoff with jitter, and delays are capped at 30 seconds. State-changing certificate creation/merge/update calls and CA enrollment/revocation calls are not passed through this retry helper, avoiding automatic duplicate side effects.
@@ -138,6 +152,7 @@ CertLC/
 ├── README.md                    # This file - Solution overview
 ├── Setup/                       # Infrastructure deployment
 │   ├── certlc.bicep            # Main Bicep template
+│   ├── modules/                 # Service modules, workbook, and optional alerts
 │   ├── parameters.dev.bicepparam
 │   └── README.md               # Deployment instructions
 ├── Functions/                   # Azure Function App code
@@ -252,7 +267,7 @@ Consumed `data` fields: `VaultName`, `CertificateThumbprint`, and `RevocationRea
 - **Private Endpoints**: Storage, Function App, Automation Account, and Key Vault data-plane access uses private endpoints; Azure Monitor ingestion remains public
 - **RBAC Authorization**: Key Vault uses Azure RBAC (not access policies) with least-privilege assignments
 - **Encrypted Variables**: Non-Azure secrets required by the runbooks, such as SMTP credentials, are stored as encrypted Automation variables
-- **Audit Logging**: Diagnostic settings enabled on Key Vault and Automation Account
+- **Audit Logging**: Diagnostic settings enabled on Key Vault and Automation Account; enabling alerts also sends Queue Storage writes to Log Analytics for poison-message detection
 
 ## Getting Started
 

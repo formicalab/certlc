@@ -137,6 +137,39 @@ The deployment requires the following parameters (configured in `parameters.dev.
 | `automationAccountVarSmtpUser` | SMTP username for authentication |
 | `automationAccountVarSmtpPassword` | SMTP password (encrypted in Automation Account) |
 | `scheduleStartTime` | Start time for certlcstats schedule (defaults to 15 minutes after deployment) |
+| `enableAlerts` | Deploy the dedicated CertLC Action Group and proactive alerts (default `false`) |
+| `actionGroupName` | Name of the dedicated Action Group (defaults to `ag-<logAnalyticsWorkspaceName>`) |
+| `alertEmailReceivers` | Optional Action Group email receiver objects with `name`, `emailAddress`, and `useCommonAlertSchema` properties |
+
+Alerts are opt-in at the template level, so existing deployments remain unchanged unless `enableAlerts` is set to `true`. The checked-in development parameter file enables them for the current environment. For another environment, add values like these to its parameter file:
+
+```bicep
+param enableAlerts = true
+param actionGroupName = 'ag-certlc-itn-001'
+param alertEmailReceivers = [
+  {
+    name: 'CertLC operators'
+    emailAddress: 'certlc-operations@contoso.com'
+    useCommonAlertSchema: true
+  }
+]
+```
+
+An empty `alertEmailReceivers` array is valid and leaves alerts visible in Azure Monitor without sending email notifications.
+
+### Enabling Alerts on an Existing Deployment
+
+The alert feature is additive. A normal root-template deployment can enable it when every environment parameter, including secure values, is current. Do not deploy a checked-in placeholder such as `automationAccountVarSmtpPassword` to a live environment because the root deployment manages the encrypted Automation variable.
+
+To add only the monitoring feature without replaying unrelated or sensitive parameters, deploy `modules/alerts.bicep` directly with a temporary environment-specific `.bicepparam` file. Supply the existing Storage Account name, Automation Account ID, Event Grid system topic ID and subscription name, Log Analytics workspace ID, Action Group settings, and tags. Always run the standalone deployment in this order:
+
+```powershell
+az deployment group validate --resource-group <resource-group> --parameters .\parameters.alerts.<environment>.bicepparam
+az deployment group what-if --resource-group <resource-group> --parameters .\parameters.alerts.<environment>.bicepparam
+az deployment group create --resource-group <resource-group> --parameters .\parameters.alerts.<environment>.bicepparam
+```
+
+Remove the temporary parameter file after verification, especially when it contains environment-specific notification addresses.
 
 ## Deployment
 
@@ -228,6 +261,19 @@ The Bicep template creates and configures the following Azure resources:
   - Deployment replaces the workbook's resource-ID tokens with the resources created by the template
   - Linked to Log Analytics Workspace as data source
   - Depends on Application Insights to ensure workspace stability
+
+#### Optional **Azure Monitor Alerts**
+- **Deployment**: Created only when `enableAlerts` is `true`
+- **Action Group**: Dedicated to CertLC, with environment-specific email receivers
+- **Event Grid alerts**:
+  - Dead-lettered events and dropped events (severity 1)
+  - More than five failed delivery attempts in 15 minutes (severity 3)
+- **Log alerts**:
+  - A message written to the `certlc-poison` queue (severity 1)
+  - A `certlc` or `certlcstats` Automation job entering Failed, Stopped, or Suspended state (severity 2)
+  - No successful `certlcstats` completion within two hours (severity 2)
+- **Queue diagnostics**: Enabling alerts also sends Queue Storage `StorageWrite` logs to the existing Log Analytics workspace
+- **Statistics schedule**: The stale-statistics alert intentionally fires while the `certlcstats` schedule remains unlinked or otherwise fails to produce successful runs
 
 ### Application and Automation
 
@@ -421,7 +467,8 @@ After deploying the infrastructure, complete these additional steps:
   - These firewall rules and SNAT configuration are not created by this template and must be configured in the customer network containing `fnSubnetId`. For details, see [Azure service tags](https://learn.microsoft.com/azure/virtual-network/service-tags-overview)
 7. **Grant CA Permissions**: Assign the hybrid worker's computer account Enroll permissions on the CA templates
 8. **Review the Workbook**: Open the deployed `certlcstats` workbook and verify that its resource selectors reference the deployed Log Analytics workspace, Automation Account, runbooks, and Function App. The repository file `Workbooks/certlcstats.workbook` is authoritative; later Bicep deployments overwrite workbook changes made only in the portal. If the tokenized file is imported manually instead, the workbook still opens, but its five resource parameters must be selected and saved in the portal before the queries can run.
-9. **Test End-to-End**:
+9. **Review Alerts** (when enabled): Verify the dedicated Action Group receiver is enabled, all six alert rules target that Action Group, and the Storage Queue service has the `StorageWrite` diagnostic setting. The receiver may get an initial stale-statistics notification while the `certlcstats` schedule remains unlinked.
+10. **Test End-to-End**:
    - **Create a test certificate** using the utility scripts in the `Utilities` folder:
      - `testnewcert.ps1` - Request a new certificate enrollment
      - `testrenewcert.ps1` - Request certificate renewal
@@ -451,11 +498,11 @@ The solution follows a secure-by-default architecture:
 - Automation Account variables for sensitive data are encrypted
 - Key Vault uses RBAC authorization and soft delete protection
 - The runbook never deletes certificates from Key Vault: revocations are recorded by disabling the specific version and tagging it (`Revoked=true`, `RevokedAt`, `RevocationReason`, `RevokedJobId`). Renewed versions are likewise tagged with `RenewedJobId` for traceability. A duplicate revocation against an already-revoked version logs `ALREADY REVOKED`, preserves the previous audit tags, and completes successfully without calling the CA or sending another notification. Genuine revocation failures use the configured SMTP transport when the matched certificate version has `NotifyTo` recipients. Vault soft-delete / purge-protection settings still apply to operator actions performed outside the runbook
-- Diagnostic settings enabled on critical resources (Automation Account, Key Vault) for audit logging
+- Diagnostic settings enabled on critical resources (Automation Account and Key Vault), plus Queue Storage write diagnostics when alerts are enabled
 
 ## Files
 
 - `certlc.bicep` - Main Bicep orchestration template and public parameter/output contract
-- `modules/` - Bicep modules for storage, observability, Automation, Function App, Key Vault, integrations, and the workbook; each service module owns its private endpoints
+- `modules/` - Bicep modules for storage, core observability, Automation, Function App, Key Vault, integrations, the workbook, and optional alerts; each service module owns its private endpoints
 - `parameters.dev.bicepparam` - Bicep parameter file
 - `README.md` - This file

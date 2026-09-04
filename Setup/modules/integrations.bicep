@@ -190,3 +190,7 @@ resource eventGridSubscription 'Microsoft.EventGrid/systemTopics/eventSubscripti
     storageRoleAssignments
   ]
 }
+
+// The final alerting stage consumes these outputs to target the exact Event Grid resources.
+output eventGridSystemTopicId string = eventGridSystemTopic.id
+output eventGridSubscriptionName string = eventGridSubscription.name

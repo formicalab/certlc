@@ -13,7 +13,7 @@ This folder contains an example payload and the **KQL transformation** applied t
 
 ## What the Bicep deployment creates
 
-- **Custom table** `certlcstats_CL` in the Log Analytics workspace, with its schema declared in `Setup/certlc.bicep`
+- **Custom table** `certlcstats_CL` in the Log Analytics workspace, with its schema declared in `Setup/modules/observability.bicep`
 - **Data Collection Endpoint** (DCE) for log ingestion
 - **Data Collection Rule** (DCR) with:
   - Stream declaration `Custom-certlcstats_CL` *(case-sensitive)*
