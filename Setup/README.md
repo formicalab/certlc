@@ -137,6 +137,25 @@ The deployment requires the following parameters (configured in `parameters.dev.
 | `automationAccountVarSmtpUser` | SMTP username for authentication |
 | `automationAccountVarSmtpPassword` | SMTP password (encrypted in Automation Account) |
 | `scheduleStartTime` | Start time for certlcstats schedule (defaults to 15 minutes after deployment) |
+| `enableAlerts` | Deploy the dedicated CertLC Action Group and proactive alerts (default `false`) |
+| `actionGroupName` | Name of the dedicated Action Group (defaults to `ag-<logAnalyticsWorkspaceName>`) |
+| `alertEmailReceivers` | Optional Action Group email receiver objects with `name`, `emailAddress`, and `useCommonAlertSchema` properties |
+
+Alerts are opt-in so existing deployments remain unchanged. To create the dedicated Action Group and alert rules, add values like these to the environment parameter file:
+
+```bicep
+param enableAlerts = true
+param actionGroupName = 'ag-certlc-itn-001'
+param alertEmailReceivers = [
+  {
+    name: 'CertLC operators'
+    emailAddress: 'certlc-operations@contoso.com'
+    useCommonAlertSchema: true
+  }
+]
+```
+
+An empty `alertEmailReceivers` array is valid and leaves alerts visible in Azure Monitor without sending email notifications.
 
 ## Deployment
 
@@ -228,6 +247,19 @@ The Bicep template creates and configures the following Azure resources:
   - Deployment replaces the workbook's resource-ID tokens with the resources created by the template
   - Linked to Log Analytics Workspace as data source
   - Depends on Application Insights to ensure workspace stability
+
+#### Optional **Azure Monitor Alerts**
+- **Deployment**: Created only when `enableAlerts` is `true`
+- **Action Group**: Dedicated to CertLC, with environment-specific email receivers
+- **Event Grid alerts**:
+  - Dead-lettered events and dropped events (severity 1)
+  - More than five failed delivery attempts in 15 minutes (severity 3)
+- **Log alerts**:
+  - A message written to the `certlc-poison` queue (severity 1)
+  - A `certlc` or `certlcstats` Automation job entering Failed, Stopped, or Suspended state (severity 2)
+  - No successful `certlcstats` completion within two hours (severity 2)
+- **Queue diagnostics**: Enabling alerts also sends Queue Storage `StorageWrite` logs to the existing Log Analytics workspace
+- **Statistics schedule**: The stale-statistics alert intentionally fires while the `certlcstats` schedule remains unlinked or otherwise fails to produce successful runs
 
 ### Application and Automation
 
@@ -451,11 +483,11 @@ The solution follows a secure-by-default architecture:
 - Automation Account variables for sensitive data are encrypted
 - Key Vault uses RBAC authorization and soft delete protection
 - The runbook never deletes certificates from Key Vault: revocations are recorded by disabling the specific version and tagging it (`Revoked=true`, `RevokedAt`, `RevocationReason`, `RevokedJobId`). Renewed versions are likewise tagged with `RenewedJobId` for traceability. A duplicate revocation against an already-revoked version logs `ALREADY REVOKED`, preserves the previous audit tags, and completes successfully without calling the CA or sending another notification. Genuine revocation failures use the configured SMTP transport when the matched certificate version has `NotifyTo` recipients. Vault soft-delete / purge-protection settings still apply to operator actions performed outside the runbook
-- Diagnostic settings enabled on critical resources (Automation Account, Key Vault) for audit logging
+- Diagnostic settings enabled on critical resources (Automation Account and Key Vault), plus Queue Storage write diagnostics when alerts are enabled
 
 ## Files
 
 - `certlc.bicep` - Main Bicep orchestration template and public parameter/output contract
-- `modules/` - Bicep modules for storage, observability, Automation, Function App, Key Vault, integrations, and the workbook; each service module owns its private endpoints
+- `modules/` - Bicep modules for storage, core observability, Automation, Function App, Key Vault, integrations, the workbook, and optional alerts; each service module owns its private endpoints
 - `parameters.dev.bicepparam` - Bicep parameter file
 - `README.md` - This file

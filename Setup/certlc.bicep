@@ -101,6 +101,15 @@ param automationAccountVarSmtpPassword string
 @description('The start time for the certlcstats schedule. Defaults to 15 minutes from deployment time.')
 param scheduleStartTime string = dateTimeAdd(utcNow('u'), 'PT15M')
 
+@description('Deploy the dedicated CertLC Action Group and proactive operational alerts. Defaults to false.')
+param enableAlerts bool = false
+
+@description('The name of the dedicated CertLC Azure Monitor Action Group.')
+param actionGroupName string = 'ag-${logAnalyticsWorkspaceName}'
+
+@description('Email receivers for the CertLC Action Group. Each object requires name and emailAddress; useCommonAlertSchema defaults to true when specified.')
+param alertEmailReceivers array = []
+
 /*************/
 /* VARIABLES */
 /*************/
@@ -222,6 +231,23 @@ module workbook './modules/workbook.bicep' = {
     automationAccountId: automation.outputs.id
     runbookName: runbookName
     functionAppId: functionApp.outputs.id
+    tags: commonTags
+  }
+}
+
+// Alerts deploy last because they target resources owned by several upstream modules.
+module alerts './modules/alerts.bicep' = if (enableAlerts) {
+  name: 'certlc-alerts'
+  params: {
+    location: location
+    actionGroupName: actionGroupName
+    alertEmailReceivers: alertEmailReceivers
+    storageAccountName: storageAccountName
+    automationAccountId: automation.outputs.id
+    runbookName: runbookName
+    eventGridSystemTopicId: integrations.outputs.eventGridSystemTopicId
+    eventGridSubscriptionName: integrations.outputs.eventGridSubscriptionName
+    logAnalyticsWorkspaceId: observability.outputs.logAnalyticsWorkspaceId
     tags: commonTags
   }
 }
