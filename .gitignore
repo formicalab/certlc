@@ -3,5 +3,6 @@ Tests/
 !Tests/
 Tests/*
 !Tests/notification-template-test.ps1
+!Tests/certificate-operation-recovery-test.ps1
 # Ignore all .vscode folders and their contents
 .vscode/

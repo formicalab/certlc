@@ -1828,6 +1828,42 @@ function Get-CaRequestDiagnostic {
 # FUNCTIONS - New-CertificateCreationRequest #
 ##############################################
 
+function Get-RecoverableKeyVaultCertificateOperation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$VaultName,
+        [Parameter(Mandatory)][string]$CertificateName,
+        [Parameter()][ValidateRange(1, 10)][int]$AttemptCount = 3,
+        [Parameter()][ValidateRange(0, 30)][int]$DelaySeconds = 1
+    )
+
+    for ($attempt = 1; $attempt -le $AttemptCount; $attempt++) {
+        try {
+            $operation = Get-AzKeyVaultCertificateOperation `
+                -VaultName $VaultName `
+                -Name $CertificateName `
+                -ErrorAction Stop
+            if ($null -ne $operation -and
+                $operation.Status -eq 'inProgress' -and
+                $operation.CertificateSigningRequest) {
+                return $operation
+            }
+        }
+        catch {
+            Write-CertLCLog `
+                -Section 'Get-RecoverableKeyVaultCertificateOperation' `
+                -Level 'Warning' `
+                -Message "KeyVault: Reconciliation attempt $attempt could not read certificate operation for $CertificateName in vault ${VaultName}: $($_.Exception.Message)"
+        }
+
+        if ($attempt -lt $AttemptCount -and $DelaySeconds -gt 0) {
+            Start-Sleep -Seconds $DelaySeconds
+        }
+    }
+
+    return $null
+}
+
 <#
 .SYNOPSIS
     Create a Key Vault certificate request, merge the complete CA chain, and export a root-excluded PFX protected to specified users/groups.
@@ -1954,12 +1990,24 @@ function New-CertificateCreationRequest {
 
         # create the request in the key vault
         try {
-            $result = Add-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -CertificatePolicy $Policy -Tag $tags
+            $certificateOperation = Add-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -CertificatePolicy $Policy -Tag $tags
+            $csr = $certificateOperation.CertificateSigningRequest
         }
         catch {
-            throw [System.Exception]::new('New-CertificateCreationRequest, KeyVault: Error generating CSR in Key Vault', $_.Exception)
+            $addException = $_.Exception
+            $op = Get-RecoverableKeyVaultCertificateOperation `
+                -VaultName $VaultName `
+                -CertificateName $CertificateName
+            if ($null -eq $op) {
+                throw [System.Exception]::new('New-CertificateCreationRequest, KeyVault: Error generating CSR in Key Vault and no recoverable pending operation was found', $addException)
+            }
+
+            $csr = $op.CertificateSigningRequest
+            Write-CertLCLog `
+                -Section 'New-CertificateCreationRequest' `
+                -Level 'Warning' `
+                -Message "KeyVault: CSR creation reported an error after the pending operation was accepted for certificate $CertificateName in vault $VaultName; continuing with the recovered request. Original error: $($addException.Message)"
         }
-        $csr = $result.CertificateSigningRequest
     }
 
     # see https://www.sysadmins.lv/blog-en/introducing-to-certificate-enrollment-apis-part-3-certificate-request-submission-and-response-installation.aspx
