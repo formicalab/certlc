@@ -736,11 +736,11 @@ function Invoke-WithRetry {
         }
         catch {
             $err = $_
-            $ex  = $err.Exception
+            $ex = $err.Exception
             $isLastAttempt = ($attempt -ge $MaxAttempts)
 
             # Try to read an HTTP status code if this is an Invoke-RestMethod / Invoke-WebRequest failure.
-            $statusCode  = $null
+            $statusCode = $null
             $retryAfterMs = $null
             $respProp = $ex.PSObject.Properties['Response']
             if ($null -ne $respProp -and $null -ne $respProp.Value) {
@@ -760,10 +760,10 @@ function Invoke-WithRetry {
                 $shouldRetry = $true
             }
             elseif ($ex -is [System.Net.Http.HttpRequestException] -or
-                    $ex -is [System.TimeoutException] -or
-                    $ex -is [System.IO.IOException] -or
-                    $ex -is [System.Net.WebException] -or
-                    $ex -is [System.Runtime.InteropServices.COMException]) {
+                $ex -is [System.TimeoutException] -or
+                $ex -is [System.IO.IOException] -or
+                $ex -is [System.Net.WebException] -or
+                $ex -is [System.Runtime.InteropServices.COMException]) {
                 $shouldRetry = $true
             }
 
@@ -1010,7 +1010,7 @@ function Initialize-PfxExportTarget {
         $workerIdentityName = $currentIdentity.Name
         $currentPrincipal = [System.Security.Principal.WindowsPrincipal]::new($currentIdentity)
         $workerCanApplyAcl = $currentIdentity.IsSystem -or
-            $currentPrincipal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+        $currentPrincipal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
     }
     finally {
         # WindowsIdentity owns a native token handle; release it before filesystem work begins.
@@ -1259,16 +1259,16 @@ function Get-OrderedCertificateChain {
     # Wrap the complete conditional expression. Wrapping only each branch still permits
     # PowerShell to unwrap a one-item result before assignment under strict mode.
     $leafCandidates = @(if ($Source -eq 'KeyVaultSecret') {
-        $Certificates | Where-Object HasPrivateKey
-    }
-    else {
-        $Certificates | Where-Object {
-            $basicConstraints = $_.Extensions |
+            $Certificates | Where-Object HasPrivateKey
+        }
+        else {
+            $Certificates | Where-Object {
+                $basicConstraints = $_.Extensions |
                 Where-Object { $_ -is [System.Security.Cryptography.X509Certificates.X509BasicConstraintsExtension] } |
                 Select-Object -First 1
-            $null -eq $basicConstraints -or -not $basicConstraints.CertificateAuthority
-        }
-    })
+                $null -eq $basicConstraints -or -not $basicConstraints.CertificateAuthority
+            }
+        })
     if ($leafCandidates.Count -ne 1) {
         throw [System.Exception]::new("Get-OrderedCertificateChain: Expected exactly one leaf certificate in $Source; found $($leafCandidates.Count).")
     }
@@ -1295,8 +1295,8 @@ function Get-OrderedCertificateChain {
         # Exactly one match is required: zero means the chain is incomplete, while multiple
         # matches make it ambiguous.
         $issuers = @($remaining | Where-Object {
-            Test-DistinguishedNameEqual -Left $_.SubjectName -Right $current.IssuerName
-        })
+                Test-DistinguishedNameEqual -Left $_.SubjectName -Right $current.IssuerName
+            })
         if ($issuers.Count -ne 1) {
             throw [System.Exception]::new("Get-OrderedCertificateChain: Expected one issuer for '$($current.Subject)' in $Source; found $($issuers.Count).")
         }
@@ -1470,8 +1470,8 @@ function Merge-KeyVaultCertificateChain {
     # Preserve the supplied leaf-to-root order because the pending merge API consumes the
     # array as the certificate chain associated with the Key Vault-generated private key.
     $x5c = @($Certificates | ForEach-Object {
-        [Convert]::ToBase64String($_.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
-    })
+            [Convert]::ToBase64String($_.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
+        })
     $body = @{ x5c = $x5c } | ConvertTo-Json -Depth 3 -Compress
     $escapedCertificateName = [Uri]::EscapeDataString($CertificateName)
     $uri = "https://$VaultName.vault.azure.net/certificates/$escapedCertificateName/pending/merge?api-version=2025-07-01"
@@ -1856,10 +1856,10 @@ function Find-TemplateName {
     # if the input ever becomes user-controlled. Escapes: \ * ( ) NUL -> \5c \2a \28 \29 \00.
     $escaped = $cnOrDisplayNameOrOid `
         -replace '\\', '\5c' `
-        -replace '\*',  '\2a' `
-        -replace '\(',  '\28' `
-        -replace '\)',  '\29' `
-        -replace "`0",  '\00'
+        -replace '\*', '\2a' `
+        -replace '\(', '\28' `
+        -replace '\)', '\29' `
+        -replace "`0", '\00'
     $searcher.Filter = "(&(objectClass=pKICertificateTemplate)(|(cn=$escaped)(displayName=$escaped)(msPKI-Cert-Template-OID=$escaped)))"
     $searcher.PropertiesToLoad.Add('name') | Out-Null
     # AD reads are idempotent; retry transient DC unavailability (COMException etc.).
@@ -2083,7 +2083,7 @@ function New-CertificateCreationRequest {
 
     # create certificate CSR - if a previous request is in progress, reuse it
     $csr = $null
-    $op  = $null
+    $op = $null
     $operationResult = $null
     try {
         # Retrieve existing operation (may return $null if none). Then evaluate Status separately.
@@ -2109,8 +2109,8 @@ function New-CertificateCreationRequest {
         if ($CertificateDnsNames) {
             # Filter out null/empty/whitespace and de-duplicate
             $effectiveDns = $CertificateDnsNames |
-                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-                Select-Object -Unique
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Select-Object -Unique
         }
         if ($effectiveDns) {
             $Policy = New-AzKeyVaultCertificatePolicy -SecretContentType 'application/x-pkcs12' -SubjectName $CertificateSubject -IssuerName 'Unknown' -DnsName $effectiveDns
@@ -2164,9 +2164,9 @@ function New-CertificateCreationRequest {
         $CertRequestStatus = $CertRequest.Submit(0x1, $csr, "CertificateTemplate:$CertificateTemplateName", $CA)
 
         # ICertRequest::Submit disposition codes (see wincrypt.h)
-        $CR_DISP_DENIED            = 2
-        $CR_DISP_ISSUED            = 3
-        $CR_DISP_UNDER_SUBMISSION  = 5
+        $CR_DISP_DENIED = 2
+        $CR_DISP_ISSUED = 3
+        $CR_DISP_UNDER_SUBMISSION = 5
 
         switch ($CertRequestStatus) {
             $CR_DISP_DENIED {
@@ -2345,7 +2345,7 @@ function New-CertificateCreationRequest {
                 $secretBase64 = $null
                 $keyVaultCertificates = [System.Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
                 $importFlags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable -bor
-                    [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
+                [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
 
                 # EphemeralKeySet keeps the Key Vault private key out of the Hybrid Worker's
                 # persistent user and machine key stores while it is prepared for PFX export.
@@ -2807,7 +2807,7 @@ function New-CertificateRevocationRequest {
         $certBase64 = $null
         $certificates = [System.Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
         $importFlags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable -bor
-            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
+        [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
 
         # Import every PKCS#12 bag because new certificate versions contain the physical chain.
         # EphemeralKeySet prevents the leaf private key from persisting in a worker key store.
@@ -2892,9 +2892,9 @@ function New-CertificateRevocationRequest {
             $mergedTags[$k] = [string]$sourceTags[$k]
         }
     }
-    $mergedTags['Revoked']          = 'true'
+    $mergedTags['Revoked'] = 'true'
     $revokedAt = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
-    $mergedTags['RevokedAt']        = $revokedAt
+    $mergedTags['RevokedAt'] = $revokedAt
     $mergedTags['RevocationReason'] = [string]$RevocationReason
     if (-not [string]::IsNullOrEmpty($JobId)) {
         $mergedTags['RevokedJobId'] = $JobId
@@ -2939,6 +2939,8 @@ function New-CertificateRevocationRequest {
 }
 
 #endregion
+
+#region ### Dispatcher ###
 
 ###############
 # DISPATCHER  #
@@ -3024,8 +3026,8 @@ if ([string]::IsNullOrEmpty($PfxRootFolder)) {
 # - If SmtpServer is set, FromAddress is required; SmtpUser and SmtpPassword must be both set or both empty.
 if ([string]::IsNullOrEmpty($SmtpServer)) {
     foreach ($pair in @(
-            @{ Name = 'certlc-smtpfrom';     Value = $FromAddress },
-            @{ Name = 'certlc-smtpuser';     Value = $SmtpUser },
+            @{ Name = 'certlc-smtpfrom'; Value = $FromAddress },
+            @{ Name = 'certlc-smtpuser'; Value = $SmtpUser },
             @{ Name = 'certlc-smtppassword'; Value = $SmtpPassword }
         )) {
         if (-not [string]::IsNullOrEmpty($pair.Value)) {
@@ -3190,10 +3192,10 @@ switch ($requestBody.type) {
         # Seed error-notification context from the event immediately, then enrich it only after
         # Key Vault and Active Directory values have been retrieved and validated.
         $script:CertificateNotificationContext = [ordered]@{
-            Operation        = 'Renewal'
-            'Event ID'       = $requestBody.id
-            'Request ID'     = $requestBody.data.Id
-            'Key Vault'      = $VaultName
+            Operation          = 'Renewal'
+            'Event ID'         = $requestBody.id
+            'Request ID'       = $requestBody.data.Id
+            'Key Vault'        = $VaultName
             'Certificate name' = $CertificateName
         }
 
@@ -3551,11 +3553,11 @@ switch ($requestBody.type) {
         # Begin with request fields available before certificate lookup so early validation and
         # lookup failures retain enough context for an actionable error notification.
         $script:CertificateNotificationContext = [ordered]@{
-            Operation          = 'Revocation'
-            'Event ID'         = $requestBody.id
-            'Request ID'       = $requestBody.data.Id
-            'Key Vault'        = $VaultName
-            Thumbprint         = $CertificateThumbprint
+            Operation                = 'Revocation'
+            'Event ID'               = $requestBody.id
+            'Request ID'             = $requestBody.data.Id
+            'Key Vault'              = $VaultName
+            Thumbprint               = $CertificateThumbprint
             'Revocation reason code' = $RevocationReasonString
         }
 
@@ -3605,9 +3607,9 @@ switch ($requestBody.type) {
         if ($null -eq $match) {
             Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "No certificate version found with thumbprint $CertificateThumbprint in vault $VaultName."
         }
-        $CertificateName    = $match.Name
+        $CertificateName = $match.Name
         $CertificateVersion = $match.Version
-        $IsLatestVersion    = [bool]$match.IsLatest
+        $IsLatestVersion = [bool]$match.IsLatest
         # Enrich the same context only after the thumbprint has resolved to a specific version.
         $script:CertificateNotificationContext['Certificate name'] = $CertificateName
         $script:CertificateNotificationContext['Key Vault version'] = $CertificateVersion
@@ -3647,9 +3649,9 @@ switch ($requestBody.type) {
         # log line. Mirrors the renewal-side check that skips auto-renewal of revoked versions.
         $revokedTag = if ($cert.Tags -and $cert.Tags.ContainsKey('Revoked')) { [string]$cert.Tags['Revoked'] } else { $null }
         if ($revokedTag -and $revokedTag.Trim().ToLowerInvariant() -eq 'true') {
-            $revokedAt     = if ($cert.Tags.ContainsKey('RevokedAt'))        { [string]$cert.Tags['RevokedAt'] }        else { '<unknown>' }
+            $revokedAt = if ($cert.Tags.ContainsKey('RevokedAt')) { [string]$cert.Tags['RevokedAt'] }        else { '<unknown>' }
             $revokedReason = if ($cert.Tags.ContainsKey('RevocationReason')) { [string]$cert.Tags['RevocationReason'] } else { '<unknown>' }
-            $revokedJobId  = if ($cert.Tags.ContainsKey('RevokedJobId'))     { [string]$cert.Tags['RevokedJobId'] }     else { '<unknown>' }
+            $revokedJobId = if ($cert.Tags.ContainsKey('RevokedJobId')) { [string]$cert.Tags['RevokedJobId'] }     else { '<unknown>' }
             # The requested end state already exists, so complete successfully and let the
             # Function acknowledge the queue message instead of scheduling another retry.
             Write-CertLCLog -Section 'Dispatcher.Revocation' -Level 'Warning' `
@@ -3692,21 +3694,21 @@ switch ($requestBody.type) {
         # Use the post-revocation result for committed certificate and audit values; retain the
         # dispatcher lookup result only for whether the affected version was latest.
         $notificationDetails = [ordered]@{
-            Operation               = 'Revocation'
-            'Certificate name'      = $revocationResult.CertificateName
-            Subject                 = $revocationResult.Subject
-            Thumbprint              = $revocationResult.Thumbprint
-            'Serial number'         = $revocationResult.SerialNumber
-            Issuer                  = $revocationResult.Issuer
-            'Valid from (UTC)'      = $revocationResult.NotBeforeUtc.ToString('yyyy-MM-dd HH:mm:ss')
-            'Valid until (UTC)'     = $revocationResult.NotAfterUtc.ToString('yyyy-MM-dd HH:mm:ss')
-            'Key Vault'             = $revocationResult.VaultName
-            'Key Vault version'     = $revocationResult.CertificateVersion
-            'Latest version'        = $IsLatestVersion
-            'Revocation reason'     = "$revocationReasonName ($RevocationReason)"
-            'Revoked at (UTC)'      = $revocationResult.RevokedAt
-            'Event ID'              = $requestBody.id
-            'Request ID'            = $requestBody.data.Id
+            Operation           = 'Revocation'
+            'Certificate name'  = $revocationResult.CertificateName
+            Subject             = $revocationResult.Subject
+            Thumbprint          = $revocationResult.Thumbprint
+            'Serial number'     = $revocationResult.SerialNumber
+            Issuer              = $revocationResult.Issuer
+            'Valid from (UTC)'  = $revocationResult.NotBeforeUtc.ToString('yyyy-MM-dd HH:mm:ss')
+            'Valid until (UTC)' = $revocationResult.NotAfterUtc.ToString('yyyy-MM-dd HH:mm:ss')
+            'Key Vault'         = $revocationResult.VaultName
+            'Key Vault version' = $revocationResult.CertificateVersion
+            'Latest version'    = $IsLatestVersion
+            'Revocation reason' = "$revocationReasonName ($RevocationReason)"
+            'Revoked at (UTC)'  = $revocationResult.RevokedAt
+            'Event ID'          = $requestBody.id
+            'Request ID'        = $requestBody.data.Id
         }
         # send notification email if requested and SMTP is configured
         Send-SuccessNotification -Section 'Dispatcher.Revocation' `
@@ -3726,3 +3728,5 @@ switch ($requestBody.type) {
         Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "Unknown request type: $($requestBody.type). Supported values: Microsoft.KeyVault.CertificateNearExpiry, CertLC.NewCertificateRequest, CertLC.CertificateRevocationRequest."
     }
 }
+
+#endregion
