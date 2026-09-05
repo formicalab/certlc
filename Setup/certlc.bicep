@@ -101,8 +101,11 @@ param automationAccountVarSmtpPassword string
 @description('The start time for the certlcstats schedule. Defaults to 15 minutes from deployment time.')
 param scheduleStartTime string = dateTimeAdd(utcNow('u'), 'PT15M')
 
-@description('Deploy the dedicated CertLC Action Group and proactive operational alerts. Defaults to false.')
-param enableAlerts bool = false
+@description('Deploy the dedicated CertLC Action Group and proactive operational alerts. Defaults to true.')
+param enableAlerts bool = true
+
+@description('Link the hourly certlcstats schedule to the statistics runbook on the Hybrid Worker Group. Defaults to true.')
+param enableStatsSchedule bool = true
 
 @description('The name of the dedicated CertLC Azure Monitor Action Group.')
 param actionGroupName string = 'ag-${logAnalyticsWorkspaceName}'
@@ -177,6 +180,7 @@ module automation './modules/automation.bicep' = {
     runbookName: runbookName
     runtimeEnvironmentName: runtimeEnvironmentName
     scheduleStartTime: scheduleStartTime
+    enableStatsSchedule: enableStatsSchedule
     ca: automationAccountVarCA
     pfxRootFolder: automationAccountVarPfxRootFolder
     smtpFrom: automationAccountVarSmtpFrom

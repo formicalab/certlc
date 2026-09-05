@@ -50,7 +50,7 @@ CertLC is an event-driven certificate lifecycle management solution that integra
 |-----------|----------------|
 | Event Grid and Storage Queue | Event Grid sends Key Vault near-expiry events to the queue; external callers place custom creation and revocation requests on the same queue |
 | Function App (`CertLCBridge`) | Serialize each queue message and start the configured Automation runbook directly with `Start-AzAutomationRunbook`; includes `OutboundTester` for connectivity checks |
-| Automation Account | Host `certlc.ps1` for creation, renewal, and revocation, `certlcstats.ps1` for inventory collection, and an hourly statistics schedule that is created but not linked by default |
+| Automation Account | Host `certlc.ps1` for creation, renewal, and revocation, `certlcstats.ps1` for inventory collection, and its linked hourly statistics schedule |
 | Hybrid Worker | Run the PowerShell 7.6 runbooks with network access to Azure private endpoints, Active Directory, the Enterprise CA, and the PFX file location |
 | Enterprise CA | Issue complete certificate chains and process enrollment and revocation requests through AD CS RPC/DCOM interfaces |
 | Key Vault | Hold versioned certificates, private keys, complete certificate chains, and lifecycle tags |
@@ -120,14 +120,14 @@ CertLC stores the following tags on individual Key Vault certificate versions. C
 
 ### Statistics Collection
 
-1. The `certlcstats` runbook runs on a schedule (hourly by default, disabled until manually linked)
+1. The `certlcstats` runbook runs hourly on the configured Hybrid Worker Group by default
 2. It enumerates certificate names in Key Vault and collects metadata from the latest version of each name
 3. Certificate data is published to a custom Log Analytics table via Data Collection Rule
 4. The Azure Monitor workbook shows certificate expiration status and details, runbook job status, and logs for selected jobs
 
 ### Proactive Alerting
 
-Alerting is controlled by the Bicep `enableAlerts` parameter, which defaults to `false`. When enabled, the deployment creates a dedicated CertLC Action Group, Queue Storage write diagnostics, and six Azure Monitor alert rules:
+Alerting is controlled by the Bicep `enableAlerts` parameter, which defaults to `true`. When enabled, the deployment creates a dedicated CertLC Action Group, Queue Storage write diagnostics, and six Azure Monitor alert rules:
 
 - Event Grid dead-lettered and dropped events (severity 1)
 - Repeated Event Grid delivery failures (severity 3)
@@ -135,7 +135,7 @@ Alerting is controlled by the Bicep `enableAlerts` parameter, which defaults to 
 - Failed, stopped, or suspended `certlc` and `certlcstats` Automation jobs (severity 2)
 - No successful `certlcstats` completion within two hours (severity 2)
 
-Action Group email receivers are configured per environment and use the common alert schema. The stale-statistics rule intentionally reports an unhealthy state while the hourly statistics schedule is not linked or successful.
+Action Group email receivers are configured per environment and use the common alert schema. The stale-statistics rule reports an unhealthy state when the hourly statistics schedule is disabled or has not completed successfully.
 
 ### Resilience
 

@@ -24,6 +24,7 @@ param actionGroupName = 'ag-certlc-itn-001'
 
 // Alerting Configuration
 param enableAlerts = true
+param enableStatsSchedule = true
 param alertEmailReceivers = [
 	{
 		name: 'Marcello Formica'

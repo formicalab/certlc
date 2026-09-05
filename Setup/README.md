@@ -137,14 +137,14 @@ The deployment requires the following parameters (configured in `parameters.dev.
 | `automationAccountVarSmtpUser` | SMTP username for authentication |
 | `automationAccountVarSmtpPassword` | SMTP password (encrypted in Automation Account) |
 | `scheduleStartTime` | Start time for certlcstats schedule (defaults to 15 minutes after deployment) |
-| `enableAlerts` | Deploy the dedicated CertLC Action Group and proactive alerts (default `false`) |
+| `enableAlerts` | Deploy the dedicated CertLC Action Group and proactive alerts (default `true`) |
+| `enableStatsSchedule` | Link the hourly `certlcstats` schedule to the runbook on the Hybrid Worker Group (default `true`) |
 | `actionGroupName` | Name of the dedicated Action Group (defaults to `ag-<logAnalyticsWorkspaceName>`) |
 | `alertEmailReceivers` | Optional Action Group email receiver objects with `name`, `emailAddress`, and `useCommonAlertSchema` properties |
 
-Alerts are opt-in at the template level, so existing deployments remain unchanged unless `enableAlerts` is set to `true`. The checked-in development parameter file enables them for the current environment. For another environment, add values like these to its parameter file:
+Alerts and scheduled statistics collection are enabled at the template level. Configure the Action Group receivers for each environment:
 
 ```bicep
-param enableAlerts = true
 param actionGroupName = 'ag-certlc-itn-001'
 param alertEmailReceivers = [
   {
@@ -156,6 +156,7 @@ param alertEmailReceivers = [
 ```
 
 An empty `alertEmailReceivers` array is valid and leaves alerts visible in Azure Monitor without sending email notifications.
+To disable alerts or scheduled collection for a development environment, set `enableAlerts` or `enableStatsSchedule` to `false` explicitly.
 
 ### Enabling Alerts on an Existing Deployment
 
@@ -297,7 +298,7 @@ The Bicep template creates and configures the following Azure resources:
   - Includes encrypted variables used by the runbooks (CA name, PFX root folder, SMTP settings, Key Vault name, DCR details)
   - Two placeholder runbooks created: the primary runbook named by `runbookName` and `certlcstats` (code must be uploaded post-deployment)
   - Hybrid Worker Group for on-premises CA communication
-  - Hourly schedule prepared for `certlcstats` runbook (disabled by default, requires manual activation)
+  - Hourly schedule linked to the `certlcstats` runbook on the configured Hybrid Worker Group by default
   - Diagnostic settings enabled: JobLogs, JobStreams, AllMetrics sent to Log Analytics
 - **Private Endpoints**:
   - Webhook endpoint (for Function App to trigger runbooks)
@@ -432,13 +433,10 @@ After deploying the infrastructure, complete these additional steps:
   - Distribute the URL only to authorized external clients. Those clients must have routed HTTPS access on TCP 443 and private DNS resolution to the Automation Account webhook private endpoint, and must use TLS 1.2 or later
   - Track the webhook expiration date and rotate it before expiry. Create and distribute a replacement webhook URL before removing the old webhook
   - For webhook behavior and security guidance, see [start a runbook from a webhook](https://learn.microsoft.com/azure/automation/automation-webhooks)
-4. **Enable Certificate Statistics Collection** (Optional):
-   - The hourly schedule for `certlcstats` runbook is created but NOT linked
-   - To enable automatic statistics collection:
-    - Option A: Uncomment the `jobScheduleCertLCStats` resource in `modules/automation.bicep` and redeploy
-     - Option B: Manually link the schedule `schedule-certlcstats-hourly` to the `certlcstats` runbook in Azure Portal
-     - Option C: Use Azure CLI: `az automation job-schedule create`
-   - The schedule will run the runbook every hour on the hybrid worker group
+4. **Verify Certificate Statistics Collection**:
+  - By default, `schedule-certlcstats-hourly` is linked to `certlcstats` on the configured Hybrid Worker Group
+  - Set `enableStatsSchedule` to `false` only when scheduled statistics collection is intentionally disabled
+  - After uploading and publishing `certlcstats.ps1`, confirm the next scheduled job completes successfully
 5. **Deploy Function App Code**:
   - After deployment, identify the Function App private endpoint and its private IP address. This information is available only after the endpoint has been created
   - Complete the deployment VM's publishing connectivity by configuring routing and firewall rules so it can reach the private endpoint over HTTPS on TCP 443, either from the same or a peered VNet, or through VPN/ExpressRoute
