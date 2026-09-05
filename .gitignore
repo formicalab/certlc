@@ -1,4 +1,7 @@
 # Ignore all Tests folders and their contents
 Tests/
+!Tests/
+Tests/*
+!Tests/notification-template-test.ps1
 # Ignore all .vscode folders and their contents
 .vscode/
