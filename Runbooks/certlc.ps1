@@ -299,7 +299,8 @@ function Write-CertLCLog {
     $effectiveCorrelationId = $CorrelationId
     if ([string]::IsNullOrWhiteSpace($effectiveCorrelationId)) {
         $correlationVariable = Get-Variable -Name CertLCCorrelationId -Scope Script -ErrorAction Ignore
-        $effectiveCorrelationId = if ($null -ne $correlationVariable) { [string]$correlationVariable.Value } else { '' }
+        # PSVariable always exposes Value; default only null and retain the whitespace checks.
+        $effectiveCorrelationId = [string](${correlationVariable}?.Value ?? '')
     }
     if (-not [string]::IsNullOrWhiteSpace($effectiveCorrelationId)) {
         $entry.correlationId = $effectiveCorrelationId
@@ -308,7 +309,8 @@ function Write-CertLCLog {
     # Discovery can fail before jobId exists. Keep early/isolated logging StrictMode-safe
     # and never substitute execution identity for an absent event identity.
     $jobVariable = Get-Variable -Name jobId -Scope Script -ErrorAction Ignore
-    $executionJobId = if ($null -ne $jobVariable) { [string]$jobVariable.Value } else { '' }
+    # PSVariable.Value is defined even when its value is null; keep the result string-typed.
+    $executionJobId = [string](${jobVariable}?.Value ?? '')
     if (-not [string]::IsNullOrWhiteSpace($executionJobId)) {
         $entry.jobId = $executionJobId
     }
@@ -555,7 +557,8 @@ function New-CertLCNotificationBody {
     # This email-only fallback does not alter the stricter input-path rule used by log records.
     if ([string]::IsNullOrWhiteSpace($CorrelationId)) {
         $correlationVariable = Get-Variable -Name CertLCCorrelationId -Scope Script -ErrorAction Ignore
-        $CorrelationId = if ($null -ne $correlationVariable) { [string]$correlationVariable.Value } else { '' }
+        # Null defaults do not replace the blank-value checks or the event fallback below.
+        $CorrelationId = [string](${correlationVariable}?.Value ?? '')
     }
     if ([string]::IsNullOrWhiteSpace($CorrelationId)) {
         $eventVariable = Get-Variable -Name requestEventId -Scope Script -ErrorAction Ignore
@@ -733,7 +736,8 @@ function Write-CertLCLogAndThrow {
         # This function can run before the dispatcher discovers the Automation job id. Resolve it
         # dynamically so StrictMode does not turn error notification into a second error.
         $jobVariable = Get-Variable -Name jobId -Scope Script -ErrorAction Ignore
-        $notificationJobId = if ($null -ne $jobVariable) { [string]$jobVariable.Value } else { '' }
+        # Get-Variable returns PSVariable or null, so Value access remains StrictMode-safe.
+        $notificationJobId = [string](${jobVariable}?.Value ?? '')
         # Match the error log's explicit event override, or inherit parsed invocation correlation.
         $body = New-CertLCNotificationBody `
             -Title 'Certificate operation failed' `
@@ -1273,11 +1277,14 @@ function ConvertFrom-Base64Pkcs7 {
 
     $collection = [System.Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
     try {
-        $collection.Import($bytes)
+        # AD CS returns a PKCS#7 SignedData certificate bundle, possibly without signers.
+        # Decode only: the existing chain checks validate the certificates, not a CMS signature.
+        $signedCms = [System.Security.Cryptography.Pkcs.SignedCms]::new()
+        $signedCms.Decode($bytes)
+        $collection = $signedCms.Certificates
     }
     catch {
-        # Import can partially populate the collection before failing. Dispose any certificate
-        # objects already created because this helper owns the collection until it returns.
+        # This helper owns extracted certificates until it returns; callers dispose them later.
         foreach ($certificate in $collection) {
             $certificate.Dispose()
         }
@@ -1848,7 +1855,7 @@ function Export-PfxWithGroupProtection {
                     }
                     Write-CertLCLog -Section 'Export-PfxWithGroupProtection' 'Export to memory store successful.'
 
-                    $password = $null  # clear the password variable to avoid keeping it in memory
+                    $password = $null  # Release this reference; the managed string is not erased.
 
                     # save the file
                     $bytes = New-Object byte[] $blob.cbData
@@ -1872,8 +1879,8 @@ function Export-PfxWithGroupProtection {
         }
     }
     finally {
-        # Release resources in reverse ownership order. The imported PKCS#12 bytes and random
-        # password are transient private-key material and are cleared as soon as export ends.
+        # Release resources in reverse ownership order and clear the managed PKCS#12 byte array.
+        # Dropping the password reference does not erase the immutable managed string.
         $password = $null
         if ($sourcePfxBuffer -ne [IntPtr]::Zero) {
             [Runtime.InteropServices.Marshal]::FreeHGlobal($sourcePfxBuffer)
@@ -1920,31 +1927,42 @@ function Find-TemplateName {
         [string]$cnOrDisplayNameOrOid
     )
 
-    $rootDse = [ADSI]'LDAP://RootDSE'
-    $configDN = $rootDse.configurationNamingContext
-    $searchRoot = "LDAP://CN=Certificate Templates,CN=Public Key Services,CN=Services,$configDN"
-    $entry = [ADSI]$searchRoot
-    $searcher = New-Object DirectoryServices.DirectorySearcher $entry
+    # Initialize before acquisition so partial failures remain safe under StrictMode.
+    $rootDse = $null
+    $entry = $null
+    $searcher = $null
+    try {
+        $rootDse = [ADSI]'LDAP://RootDSE'
+        $configDN = $rootDse.configurationNamingContext
+        $searchRoot = "LDAP://CN=Certificate Templates,CN=Public Key Services,CN=Services,$configDN"
+        $entry = [ADSI]$searchRoot
+        $searcher = New-Object DirectoryServices.DirectorySearcher $entry
 
-    # S2: escape the search value per RFC 4515 before interpolation into the LDAP filter.
-    # Defence-in-depth: today $cnOrDisplayNameOrOid comes from trusted sources (Event Grid
-    # payload or CertEnroll OID), but escaping costs nothing and prevents future regressions
-    # if the input ever becomes user-controlled. Escapes: \ * ( ) NUL -> \5c \2a \28 \29 \00.
-    $escaped = $cnOrDisplayNameOrOid `
-        -replace '\\', '\5c' `
-        -replace '\*', '\2a' `
-        -replace '\(', '\28' `
-        -replace '\)', '\29' `
-        -replace "`0", '\00'
-    $searcher.Filter = "(&(objectClass=pKICertificateTemplate)(|(cn=$escaped)(displayName=$escaped)(msPKI-Cert-Template-OID=$escaped)))"
-    $searcher.PropertiesToLoad.Add('name') | Out-Null
-    # AD reads are idempotent; retry transient DC unavailability (COMException etc.).
-    $findOne = { $searcher.FindOne() }.GetNewClosure()
-    $result = Invoke-WithRetry -ScriptBlock $findOne -OperationName "AD template lookup '$cnOrDisplayNameOrOid'" -Section 'Find-TemplateName'
-    if ($null -eq $result) {
-        return [string]::Empty
+        # Escape the search value per RFC 4515 before interpolation into the LDAP filter.
+        # Values may originate in request payloads or certificate metadata; neither is trusted
+        # as LDAP filter syntax. Escapes: \ * ( ) NUL -> \5c \2a \28 \29 \00.
+        $escaped = $cnOrDisplayNameOrOid `
+            -replace '\\', '\5c' `
+            -replace '\*', '\2a' `
+            -replace '\(', '\28' `
+            -replace '\)', '\29' `
+            -replace "`0", '\00'
+        $searcher.Filter = "(&(objectClass=pKICertificateTemplate)(|(cn=$escaped)(displayName=$escaped)(msPKI-Cert-Template-OID=$escaped)))"
+        $searcher.PropertiesToLoad.Add('name') | Out-Null
+        # AD reads are idempotent; retry transient DC unavailability (COMException etc.).
+        $findOne = { $searcher.FindOne() }.GetNewClosure()
+        $result = Invoke-WithRetry -ScriptBlock $findOne -OperationName "AD template lookup '$cnOrDisplayNameOrOid'" -Section 'Find-TemplateName'
+        if ($null -eq $result) {
+            return [string]::Empty
+        }
+        return $result.Properties['name'][0]
     }
-    return $result.Properties['name'][0]
+    finally {
+        # This scope owns all three objects; release the searcher before its directory roots.
+        if ($null -ne $searcher) { $searcher.Dispose() }
+        if ($null -ne $entry) { $entry.Dispose() }
+        if ($null -ne $rootDse) { $rootDse.Dispose() }
+    }
 }
 
 #endregion
@@ -2101,11 +2119,14 @@ function Get-RecoverableKeyVaultCertificateOperation {
 .PARAMETER PfxProtectTo
         An array of users or groups (in domain\user or UPN format) to protect the exported PFX file to.
 
+.PARAMETER PfxRootFolder
+    The export root supplied by the caller, containing the per-host PFX folders.
+
 .PARAMETER NotifyTo
     An optional array of email addresses to notify about the certificate request status.
 
 .EXAMPLE
-    $result = New-CertificateCreationRequest -VaultName "MyKeyVault" -CertificateName "MyCertificate" -CertificateTemplateName "WebServer" -CertificateSubject "CN=www.example.com" -CertificateDnsNames @("www.example.com","example.com") -CA "MyCA\MyInstance" -Hostname "webserver01" -PfxProtectTo @("DOMAIN\User1", "DOMAIN\Group1") -NotifyTo @("admin@example.com")
+    $result = New-CertificateCreationRequest -VaultName "MyKeyVault" -CertificateName "MyCertificate" -CertificateTemplateName "WebServer" -CertificateSubject "CN=www.example.com" -CertificateDnsNames @("www.example.com","example.com") -CA "MyCA\MyInstance" -Hostname "webserver01" -PfxProtectTo @("DOMAIN\User1", "DOMAIN\Group1") -NotifyTo @("admin@example.com") -PfxRootFolder 'C:\CertificateExports'
 #>
 
 function New-CertificateCreationRequest {
@@ -2120,7 +2141,7 @@ function New-CertificateCreationRequest {
         [Parameter(Mandatory = $true)][string]$Hostname,
         [Parameter(Mandatory = $true)][string[]]$PfxProtectTo,
         [Parameter()][string[]]$NotifyTo,
-        # R3: when this request is the second leg of an auto-renewal, the dispatcher
+        # When this request is the second leg of an auto-renewal, the dispatcher
         # passes the current Automation job id; it is stamped on the new version's tags
         # for audit symmetry with RevokedJobId.
         [Parameter()][string]$RenewedJobId,
@@ -2128,7 +2149,9 @@ function New-CertificateCreationRequest {
         # returns metadata without forcing callers to capture and suppress those log records.
         # PowerShell variable names are case-insensitive: local variables must never be named
         # $result because that would overwrite this typed $Result parameter after side effects.
-        [Parameter()][ref]$Result
+        [Parameter()][ref]$Result,
+        # Require the export root explicitly instead of resolving dispatcher scope.
+        [Parameter(Mandatory = $true)][string]$PfxRootFolder
     )
 
     # Validate every local export dependency before creating a Key Vault CSR or contacting the
@@ -2419,13 +2442,16 @@ function New-CertificateCreationRequest {
             try {
                 $certificateBytes = [Convert]::FromBase64String($secretBase64)
                 $secretBase64 = $null
-                $keyVaultCertificates = [System.Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
                 $importFlags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable -bor
                 [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
 
                 # EphemeralKeySet keeps the Key Vault private key out of the Hybrid Worker's
                 # persistent user and machine key stores while it is prepared for PFX export.
-                $keyVaultCertificates.Import($certificateBytes, [string]::Empty, $importFlags)
+                # Preserve the legacy explicit-password Import behavior for this exact Key Vault
+                # secret: default loader limits would filter attributes and add new rejection limits.
+                $keyVaultCertificates = [System.Security.Cryptography.X509Certificates.X509CertificateLoader]::LoadPkcs12Collection(
+                    $certificateBytes, [string]::Empty, $importFlags,
+                    [System.Security.Cryptography.X509Certificates.Pkcs12LoaderLimits]::DangerousNoLimits)
 
                 # The final PFX must be built only from material physically returned by Key Vault.
                 # Comparing against the CA response proves that the merge persisted every member.
@@ -2441,8 +2467,8 @@ function New-CertificateCreationRequest {
                 }
             }
             catch {
-                # Import can partially populate a collection. Dispose it here on failure because
-                # the later PFX cleanup block is reached only after this preparation succeeds.
+                # The loader owns failed loads; after it returns, this scope owns the collection.
+                # Dispose it if validation fails before the later PFX cleanup block is reached.
                 if ($null -ne $keyVaultCertificates) {
                     foreach ($certificate in $keyVaultCertificates) {
                         $certificate.Dispose()
@@ -2669,7 +2695,8 @@ function Get-CertificateByThumbprint {
             3 { $base64 += '=' }
         }
         $bytes = [Convert]::FromBase64String($base64)
-        return ($bytes | ForEach-Object { $_.ToString('X2') }) -join ''
+        # Match X2 formatting exactly: uppercase, two hex digits per byte, no separators.
+        return [Convert]::ToHexString($bytes)
     }
 
     # Helper: Extract the last URL segment (certificate name or version) from a KV resource id
@@ -2679,108 +2706,112 @@ function Get-CertificateByThumbprint {
     }
 
     # Helper: Invoke Key Vault REST API
-    # S1 fix: fetch the access token ONCE at function entry (not per page) and pass it to
-    # Invoke-RestMethod as a SecureString via -Authentication Bearer -Token. PowerShell 7 then
-    # builds the Authorization header internally without ever materializing the token into a
-    # managed (immutable, GC-bound) plaintext String. The previous implementation called
-    # PtrToStringBSTR(SecureStringToBSTR(...)) on every page, both materializing the token and
-    # leaking the BSTR buffer (no ZeroFreeBSTR).
-    $tokenResult = Get-AzAccessToken -ResourceTypeName KeyVault -AsSecureString
-    $secureToken = $tokenResult.Token
-    $invokeApi = {
-        param([string]$uri)
-        # $secureToken lives in the enclosing function scope. GetNewClosure() only captures
-        # variables that are LOCAL to the script block where it is invoked, so we first pull
-        # the token into this scope before creating the closure.
-        $tok = $secureToken
-        $op = {
-            Invoke-RestMethod -Uri $uri -Method GET -Authentication Bearer -Token $tok -ContentType 'application/json'
-        }.GetNewClosure()
-        return Invoke-WithRetry -ScriptBlock $op -OperationName "KV GET $uri" -Section 'Get-CertificateByThumbprint'
-    }
-
-    $vaultBaseUrl = "https://$VaultName.vault.azure.net"
-    $apiVersion = '2025-07-01'
-
-    # Step 1: enumerate certificates (one entry per cert name; x5t is the LATEST version's thumbprint)
-    # While iterating we also collect the certificate names so step 2 can fall back to per-cert version listings.
-    $certificateNames = New-Object 'System.Collections.Generic.List[string]'
-    $uri = "$vaultBaseUrl/certificates?api-version=$apiVersion"
-
+    # Fetch the access token once per lookup, not per page. Pass the SecureString directly
+    # through -Authentication Bearer -Token so this code does not convert it to plaintext
+    # or allocate an unmanaged BSTR; Invoke-RestMethod constructs the Authorization header.
+    $secureToken = $null
     try {
-        do {
-            $response = & $invokeApi $uri
+        $tokenResult = Get-AzAccessToken -ResourceTypeName KeyVault -AsSecureString
+        $secureToken = $tokenResult.Token
+        $invokeApi = {
+            param([string]$uri)
+            # $secureToken lives in the enclosing function scope. GetNewClosure() only captures
+            # variables that are LOCAL to the script block where it is invoked, so we first pull
+            # the token into this scope before creating the closure.
+            $tok = $secureToken
+            $op = {
+                Invoke-RestMethod -Uri $uri -Method GET -Authentication Bearer -Token $tok -ContentType 'application/json'
+            }.GetNewClosure()
+            return Invoke-WithRetry -ScriptBlock $op -OperationName "KV GET $uri" -Section 'Get-CertificateByThumbprint'
+        }
 
-            if ($response.value) {
-                foreach ($cert in $response.value) {
-                    # Capture the certificate name for the possible step-2 pass
-                    if ($cert.id) {
-                        # /certificates listing ids have the shape: <vaultBaseUrl>/certificates/<name>
-                        $name = & $lastSegment $cert.id
-                        if (-not [string]::IsNullOrEmpty($name)) {
-                            [void]$certificateNames.Add($name)
-                        }
-                    }
+        $vaultBaseUrl = "https://$VaultName.vault.azure.net"
+        $apiVersion = '2025-07-01'
 
-                    if ($cert.x5t) {
-                        $certThumbprint = & $convertToHex $cert.x5t
-                        if ($certThumbprint -eq $normalizedThumbprint) {
-                            # We matched against the latest-version thumbprint. The id of the listing
-                            # entry does NOT contain a version segment, so we resolve the latest version
-                            # id explicitly via /certificates/{name}.
-                            $certName = & $lastSegment $cert.id
-                            $bundleUri = "$vaultBaseUrl/certificates/$certName" + "?api-version=$apiVersion"
-                            $bundle = & $invokeApi $bundleUri
-                            $version = & $lastSegment $bundle.id
-                            return [pscustomobject]@{
-                                Name     = $certName
-                                Version  = $version
-                                IsLatest = $true
-                            }
-                        }
-                    }
-                }
-            }
+        # Step 1: enumerate certificates (one entry per cert name; x5t is the LATEST version's thumbprint)
+        # While iterating we also collect the certificate names so step 2 can fall back to per-cert version listings.
+        $certificateNames = New-Object 'System.Collections.Generic.List[string]'
+        $uri = "$vaultBaseUrl/certificates?api-version=$apiVersion"
 
-            $uri = $response.nextLink
-        } while ($uri)
-    }
-    catch {
-        throw [System.Exception]::new("Get-CertificateByThumbprint: Failed to enumerate certificates in vault '$VaultName'.", $_.Exception)
-    }
-
-    # Step 2: no match against any latest version. Enumerate every cert's versions and compare x5t.
-    try {
-        foreach ($name in $certificateNames) {
-            $uri = "$vaultBaseUrl/certificates/$name/versions?api-version=$apiVersion"
+        try {
             do {
                 $response = & $invokeApi $uri
+
                 if ($response.value) {
-                    foreach ($ver in $response.value) {
-                        if ($ver.x5t) {
-                            $certThumbprint = & $convertToHex $ver.x5t
+                    foreach ($cert in $response.value) {
+                        # Capture the certificate name for the possible step-2 pass
+                        if ($cert.id) {
+                            # /certificates listing ids have the shape: <vaultBaseUrl>/certificates/<name>
+                            $name = & $lastSegment $cert.id
+                            if (-not [string]::IsNullOrEmpty($name)) {
+                                [void]$certificateNames.Add($name)
+                            }
+                        }
+
+                        if ($cert.x5t) {
+                            $certThumbprint = & $convertToHex $cert.x5t
                             if ($certThumbprint -eq $normalizedThumbprint) {
-                                # /certificates/{name}/versions listing ids have the shape:
-                                #   <vaultBaseUrl>/certificates/<name>/<version>
-                                $version = & $lastSegment $ver.id
+                                # We matched against the latest-version thumbprint. The id of the listing
+                                # entry does NOT contain a version segment, so we resolve the latest version
+                                # id explicitly via /certificates/{name}.
+                                $certName = & $lastSegment $cert.id
+                                $bundleUri = "$vaultBaseUrl/certificates/$certName" + "?api-version=$apiVersion"
+                                $bundle = & $invokeApi $bundleUri
+                                $version = & $lastSegment $bundle.id
                                 return [pscustomobject]@{
-                                    Name     = $name
+                                    Name     = $certName
                                     Version  = $version
-                                    IsLatest = $false
+                                    IsLatest = $true
                                 }
                             }
                         }
                     }
                 }
+
                 $uri = $response.nextLink
             } while ($uri)
         }
-    }
-    catch {
-        throw [System.Exception]::new("Get-CertificateByThumbprint: Failed to enumerate certificate versions in vault '$VaultName'.", $_.Exception)
-    }
+        catch {
+            throw [System.Exception]::new("Get-CertificateByThumbprint: Failed to enumerate certificates in vault '$VaultName'.", $_.Exception)
+        }
 
-    return $null
+        # Step 2: no match against any latest version. Enumerate every cert's versions and compare x5t.
+        try {
+            foreach ($name in $certificateNames) {
+                $uri = "$vaultBaseUrl/certificates/$name/versions?api-version=$apiVersion"
+                do {
+                    $response = & $invokeApi $uri
+                    if ($response.value) {
+                        foreach ($ver in $response.value) {
+                            if ($ver.x5t) {
+                                $certThumbprint = & $convertToHex $ver.x5t
+                                if ($certThumbprint -eq $normalizedThumbprint) {
+                                    # /certificates/{name}/versions listing ids have the shape:
+                                    #   <vaultBaseUrl>/certificates/<name>/<version>
+                                    $version = & $lastSegment $ver.id
+                                    return [pscustomobject]@{
+                                        Name     = $name
+                                        Version  = $version
+                                        IsLatest = $false
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    $uri = $response.nextLink
+                } while ($uri)
+            }
+        }
+        catch {
+            throw [System.Exception]::new("Get-CertificateByThumbprint: Failed to enumerate certificate versions in vault '$VaultName'.", $_.Exception)
+        }
+
+        return $null
+    }
+    finally {
+        # Both search passes share this token; dispose it after every return or failure.
+        if ($null -ne $secureToken) { $secureToken.Dispose() }
+    }
 }
 
 #endregion
@@ -2817,6 +2848,9 @@ function Get-CertificateByThumbprint {
 .PARAMETER CertificateVersion
     The version identifier of the certificate version to revoke.
 
+.PARAMETER CA
+    The CA configuration supplied by the caller for the revocation request.
+
 .PARAMETER RevocationReason
     The reason for revocation, specified as an integer value (0-6) according to the CRLReason codes:
         0 - Unspecified
@@ -2839,7 +2873,7 @@ function Get-CertificateByThumbprint {
     When supplied, must match the public certificate before any CA or Key Vault mutation.
 
 .EXAMPLE
-    New-CertificateRevocationRequest -VaultName 'MyKeyVault' -CertificateName 'MyCertificate' -CertificateVersion 'abc123...' -RevocationReason 1 -JobId $jobId
+    New-CertificateRevocationRequest -VaultName 'MyKeyVault' -CertificateName 'MyCertificate' -CertificateVersion 'abc123...' -RevocationReason 1 -JobId $jobId -CA 'MyCA\MyInstance'
 
 #>
 function New-CertificateRevocationRequest {
@@ -2877,7 +2911,11 @@ function New-CertificateRevocationRequest {
 
         [Parameter(Mandatory = $false)]
         [ValidateNotNullOrEmpty()]
-        [string]$ExpectedThumbprint
+        [string]$ExpectedThumbprint,
+
+        # Require the target CA explicitly instead of resolving dispatcher scope.
+        [Parameter(Mandatory = $true)]
+        [string]$CA
     )
 
     $existingVersion = $null
@@ -3011,8 +3049,8 @@ function New-CertificateRevocationRequest {
 ###############
 
 # Reject unsupported hosts before Azure authentication. Automation captures runbook streams
-# without Connect-AzAccount; supplied correlation is already available to the logger.
-# Resolve the actual job ID locally even when an external correlation ID was supplied.
+# without Connect-AzAccount; event correlation is not available until request parsing below.
+# Resolve the actual job ID locally, independently of any later event correlation ID.
 # https://rakhesh.com/azure/psprivatemetadata-is-system-collections-hashtabl/
 
 if ($env:AZUREPS_HOST_ENVIRONMENT -eq 'AzureAutomation') {
@@ -3403,11 +3441,13 @@ switch ($requestBody.type) {
 
         # The DNS names from the certificate
         $CertificateDnsNames = $null
-        $san = $cert.Certificate.Extensions | Where-Object { $_.Oid.FriendlyName -eq 'Subject Alternative Name' }
+        $san = $cert.Certificate.Extensions['2.5.29.17']
         if ($null -ne $san) {
-            # $DNS.Format(0) returns a string like: DNS Name=server01.contoso.com, DNS Name=server01.litware.com.
-            # Transform it into an array of DNS names using regex; remove the "DNS Name=" prefix and split by comma
-            $CertificateDnsNames = @(($san.Format(0) -replace 'DNS Name=', '').Split(',').Trim() | Where-Object { $_ -ne '' })
+            # Decode by OID and ASN.1 type, independent of localized display names or formatting.
+            # CopyFrom also supports generic X509Extension instances; only DNS entries are renewed.
+            $sanExtension = [System.Security.Cryptography.X509Certificates.X509SubjectAlternativeNameExtension]::new()
+            $sanExtension.CopyFrom($san)
+            $CertificateDnsNames = @($sanExtension.EnumerateDnsNames())
         }
 
         # get the OID of the Certificate Template
@@ -3478,7 +3518,7 @@ switch ($requestBody.type) {
 
         $creationResult = $null
         try {
-            New-CertificateCreationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplateName $certificateTemplateName -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -Hostname $Hostname -PfxProtectTo $PfxProtectTo -NotifyTo $NotifyTo -RenewedJobId $jobId -Result ([ref]$creationResult)
+            New-CertificateCreationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplateName $certificateTemplateName -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -Hostname $Hostname -PfxProtectTo $PfxProtectTo -NotifyTo $NotifyTo -RenewedJobId $jobId -Result ([ref]$creationResult) -PfxRootFolder $PfxRootFolder
         }
         catch {
             Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message 'Error processing certificate creation request' -Inner $_.Exception -NotifyTo $NotifyTo @smtpArgs
@@ -3640,7 +3680,7 @@ switch ($requestBody.type) {
 
         $creationResult = $null
         try {
-            New-CertificateCreationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplateName $CertificateTemplateName -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -Hostname $Hostname -PfxProtectTo $PfxProtectTo -NotifyTo $NotifyTo -Result ([ref]$creationResult)
+            New-CertificateCreationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplateName $CertificateTemplateName -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -Hostname $Hostname -PfxProtectTo $PfxProtectTo -NotifyTo $NotifyTo -Result ([ref]$creationResult) -PfxRootFolder $PfxRootFolder
         }
         catch {
             Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message 'Error processing new certificate request' -Inner $_.Exception -NotifyTo $NotifyTo @smtpArgs
@@ -3803,7 +3843,7 @@ switch ($requestBody.type) {
 
         Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Performing certificate revocation for certificate $CertificateName version $CertificateVersion in vault $VaultName with reason $RevocationReason..."
         try {
-            New-CertificateRevocationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateVersion $CertificateVersion -RevocationReason $RevocationReason -JobId $jobId -ExistingTags $cert.Tags -Certificate $cert.Certificate -ExpectedThumbprint $CertificateThumbprint -Result ([ref]$revocationResult)
+            New-CertificateRevocationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateVersion $CertificateVersion -RevocationReason $RevocationReason -JobId $jobId -ExistingTags $cert.Tags -Certificate $cert.Certificate -ExpectedThumbprint $CertificateThumbprint -Result ([ref]$revocationResult) -CA $CA
         }
         catch {
             # Include the configured SMTP transport so a genuine CA or Key Vault revocation
