@@ -36,3 +36,15 @@ ID for identity, retaining separate invocation/job branches for repeated deliver
 supports event IDs, certificates, jobs, invocations, event types and sources. Event lists are
 limited to 500 results; the selected tree includes up to 2000 log records plus parent nodes.
 Missing telemetry means not observed within the selected time range, not necessarily failure.
+
+Journey requires ingested `BridgeCorrelation` receipt records from the Function. Events predating
+that instrumentation and direct-webhook-only jobs do not appear in the event list; Job logs
+remains available for runbook history. Platform job state, logged operation outcome and
+notification result are separate signals: a Completed job may legitimately report Skipped.
+Full diagnostics and IDs remain available in exports, while the grid uses native horizontal
+scrolling and cell truncation. Workbook readers need query access to the selected workspace.
+
+The workbook substitutes its shared parameters when executing these files. Standalone execution
+must also supply `JourneySearch` or `SelectedEvent` using the query's base64 parameter syntax;
+`SelectedEvent` is the complete key exported by the event-list query, not just a correlation ID.
+No temporary TEST workbook, generator or test scripts are required to deploy this workbook.
