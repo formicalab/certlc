@@ -2723,8 +2723,8 @@ function Get-CertificateByThumbprint {
 
 .DESCRIPTION
     This function revokes the specified version of a certificate stored in Azure Key Vault:
-      1. Loads the version-specific PKCS#12 collection and selects its private-key leaf to
-         extract the X.509 serial number.
+        1. Uses the supplied version-specific public certificate, or reads it from Key Vault,
+            to extract the X.509 serial number without retrieving private-key material.
       2. Submits a revocation request to the Certificate Authority (CA) for that serial.
       3. Disables that Key Vault version (attributes.enabled=false) and tags it with
          Revoked=true, RevokedAt, RevocationReason, RevokedJobId. Existing tags on the
@@ -2753,6 +2753,14 @@ function Get-CertificateByThumbprint {
 
 .PARAMETER JobId
     The Automation runbook job id; written into the RevokedJobId tag for traceability.
+
+.PARAMETER Certificate
+    The public X.509 certificate from the exact Key Vault version being revoked.
+    If omitted, the function reads that version's public certificate from Key Vault.
+    The supplied certificate remains owned by the caller and is not disposed here.
+
+.PARAMETER ExpectedThumbprint
+    When supplied, must match the public certificate before any CA or Key Vault mutation.
 
 .EXAMPLE
     New-CertificateRevocationRequest -VaultName 'MyKeyVault' -CertificateName 'MyCertificate' -CertificateVersion 'abc123...' -RevocationReason 1 -JobId $jobId
@@ -2785,63 +2793,43 @@ function New-CertificateRevocationRequest {
         # As in the creation function, the reference return keeps structured log output visible
         # while delivering notification metadata separately to the dispatcher.
         [Parameter(Mandatory = $false)]
-        [ref]$Result
+        [ref]$Result,
+
+        [Parameter(Mandatory = $false)]
+        [ValidateNotNull()]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+
+        [Parameter(Mandatory = $false)]
+        [ValidateNotNullOrEmpty()]
+        [string]$ExpectedThumbprint
     )
 
-    # get the specific version of the certificate from the key vault, to extract its serial number
-    Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "KeyVault: Certificate $($CertificateName) version $($CertificateVersion): getting the version secret from key vault $VaultName to obtain details..."
-    try {
-        $certBase64 = Get-AzKeyVaultSecret -VaultName $VaultName -Name $CertificateName -Version $CertificateVersion -AsPlainText
-    }
-    catch {
-        throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Error getting certificate $CertificateName version $CertificateVersion from key vault $VaultName", $_.Exception)
-    }
-    if ([string]::IsNullOrEmpty($certBase64)) {
-        throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Certificate $CertificateName version $CertificateVersion secret is empty in key vault $VaultName")
-    }
-
-    $certBytes = $null
-    $certificates = $null
-    try {
-        $certBytes = [Convert]::FromBase64String($certBase64)
-        $certBase64 = $null
-        $certificates = [System.Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
-        $importFlags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable -bor
-        [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet
-
-        # Import every PKCS#12 bag because new certificate versions contain the physical chain.
-        # EphemeralKeySet prevents the leaf private key from persisting in a worker key store.
-        $certificates.Import($certBytes, [string]::Empty, $importFlags)
-
-        # The private key identifies the issued leaf independently of PKCS#12 bag ordering.
-        # Wrap the complete pipeline so one result remains an array under strict mode.
-        $leafCertificates = @($certificates | Where-Object HasPrivateKey)
-        if ($leafCertificates.Count -ne 1) {
-            throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Expected exactly one private-key leaf in certificate $CertificateName version $CertificateVersion; found $($leafCertificates.Count).")
+    $existingVersion = $null
+    if (-not $PSBoundParameters.ContainsKey('Certificate')) {
+        Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "KeyVault: Reading public certificate $CertificateName version $CertificateVersion from vault $VaultName..."
+        try {
+            $existingVersion = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -Version $CertificateVersion
         }
-
-        # Capture notification-safe leaf metadata before disposing the imported collection.
-        $leafCertificate = $leafCertificates[0]
-        $serialNumber = $leafCertificate.SerialNumber
-        $certificateSubject = $leafCertificate.Subject
-        $certificateIssuer = $leafCertificate.Issuer
-        $certificateThumbprint = $leafCertificate.Thumbprint
-        $certificateNotBeforeUtc = $leafCertificate.NotBefore.ToUniversalTime()
-        $certificateNotAfterUtc = $leafCertificate.NotAfter.ToUniversalTime()
-    }
-    finally {
-        # The decoded PKCS#12 carries private-key material. Clear its byte buffer and dispose
-        # every imported certificate, including partial imports from a failing collection load.
-        $certBase64 = $null
-        if ($null -ne $certBytes) {
-            [Array]::Clear($certBytes, 0, $certBytes.Length)
+        catch {
+            throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Error getting public certificate $CertificateName version $CertificateVersion from key vault $VaultName", $_.Exception)
         }
-        if ($null -ne $certificates) {
-            foreach ($certificate in $certificates) {
-                $certificate.Dispose()
-            }
+        if ($null -ne $existingVersion -and $null -ne $existingVersion.Certificate) {
+            $Certificate = $existingVersion.Certificate
         }
     }
+    if ($null -eq $Certificate -or [string]::IsNullOrWhiteSpace($Certificate.SerialNumber)) {
+        throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Public certificate $CertificateName version $CertificateVersion is missing or has no serial number.")
+    }
+    if ($PSBoundParameters.ContainsKey('ExpectedThumbprint') -and $Certificate.Thumbprint -ine $ExpectedThumbprint) {
+        throw [System.Exception]::new("New-CertificateRevocationRequest: Public certificate thumbprint does not match the requested thumbprint for $CertificateName version $CertificateVersion.")
+    }
+
+    $serialNumber = $Certificate.SerialNumber
+    $certificateSubject = $Certificate.Subject
+    $certificateIssuer = $Certificate.Issuer
+    $certificateThumbprint = $Certificate.Thumbprint
+    $certificateNotBeforeUtc = $Certificate.NotBefore.ToUniversalTime()
+    $certificateNotAfterUtc = $Certificate.NotAfter.ToUniversalTime()
 
     Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "CA: Sending revocation request for certificate $CertificateName version $CertificateVersion (serial $serialNumber) to the CA $CA using reason $($RevocationReason)..."
 
@@ -2874,6 +2862,9 @@ function New-CertificateRevocationRequest {
     $sourceTags = $null
     if ($PSBoundParameters.ContainsKey('ExistingTags') -and $null -ne $ExistingTags) {
         $sourceTags = $ExistingTags
+    }
+    elseif ($null -ne $existingVersion) {
+        $sourceTags = $existingVersion.Tags
     }
     else {
         try {
@@ -2910,9 +2901,6 @@ function New-CertificateRevocationRequest {
     }
     Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "KeyVault: Certificate $CertificateName version $CertificateVersion in key vault $($VaultName) has been disabled and tagged as revoked. The certificate object and other versions (if any) are left untouched."
 
-    # The imported PKCS#12 collection has already been disposed. Build the result exclusively
-    # from notification-safe leaf fields captured before disposal and the committed audit values
-    # written to Key Vault.
     $operationResult = [pscustomobject]@{
         PSTypeName         = 'CertLC.CertificateRevocationResult'
         CertificateName    = $CertificateName
@@ -2960,35 +2948,11 @@ catch {
 # set context
 Set-AzContext -SubscriptionId $AzureConnection.Subscription.Id -DefaultProfile $AzureConnection | Out-Null
 
-# Check if the script is running on Azure or on hybrid worker; assign jobId accordingly.
-# https://rakhesh.com/azure/azure-automation-powershell-variables/
-# TODO: decide if we want to use $jobId as correlation id in the logs
+# Require a Hybrid Runbook Worker and resolve its current Automation job ID.
+# https://rakhesh.com/azure/psprivatemetadata-is-system-collections-hashtabl/
 
 if ($env:AZUREPS_HOST_ENVIRONMENT -eq 'AzureAutomation/') {
-    # Hybrid Runbook Worker. Collect every place the job id might live, then pick the first
-    # candidate that parses as a real GUID. This bypasses all the per-worker quirks
-    # (env var holding "System.Collections.Hashtable", $PSPrivateMetadata exposing the JobId
-    # as a nested @{Guid='...'} hashtable, $PSCommandPath sometimes not being the <jobId>.ps1
-    # script, etc.). We log every candidate so the diagnostic is always visible.
-    $candidates = [System.Collections.Generic.List[string]]::new()
-    if (-not [string]::IsNullOrEmpty($PSCommandPath)) {
-        $candidates.Add([System.IO.Path]::GetFileNameWithoutExtension($PSCommandPath))
-    }
-    $meta = Get-Variable -Name 'PSPrivateMetadata' -ErrorAction Ignore
-    if ($null -ne $meta -and $meta.Value -is [System.Collections.IDictionary] -and $meta.Value.Contains('JobId')) {
-        $j = $meta.Value['JobId']
-        $candidates.Add("$j")
-        if ($j -is [System.Collections.IDictionary] -and $j.Contains('Guid')) { $candidates.Add("$($j['Guid'])") }
-    }
-    if (-not [string]::IsNullOrEmpty($env:PSPrivateMetadata)) {
-        $candidates.Add($env:PSPrivateMetadata)
-    }
-    $jobId = ''
-    foreach ($c in $candidates) {
-        $g = [Guid]::Empty
-        if ([Guid]::TryParse($c, [ref]$g)) { $jobId = $g.Guid; break }
-    }
-    Write-CertLCLog -Section 'Dispatcher' -Message "Runbook running with job id '$jobId' on hybrid worker $($env:COMPUTERNAME). JobId candidates: [$($candidates -join ' | ')]."
+    Write-CertLCLog -Section 'Dispatcher' -Message "Hybrid Runbook Worker confirmed: $($env:COMPUTERNAME)."
 }
 elseif ($env:AZUREPS_HOST_ENVIRONMENT -eq 'AzureAutomation') {
     # Azure Automation sandbox: not supported (we require the hybrid worker for CA access).
@@ -2998,6 +2962,61 @@ else {
     # We are in a local environment - not supported anymore because we cannot get the encrypted variables from the automation account in this case
     Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'Runbook running in a local environment. This runbook must be executed by a hybrid worker instead!'
 }
+
+# Keep the supported runtime aligned with the PowerShell 7.6+ Hybrid Worker diagnostic.
+if ($PSVersionTable.PSVersion -lt [version]'7.6') {
+    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'This runbook requires PowerShell 7.6 or later.'
+}
+
+# Prefer the worker-provided metadata when it contains a usable GUID. Some worker versions
+# expose the literal string "System.Collections.Hashtable" instead; TryParse rejects it.
+# Guid.Empty is also rejected because it cannot identify an actual Automation execution.
+$parsedJobId = [guid]::Empty
+$jobIdSource = 'EnvironmentMetadata'
+if (-not [guid]::TryParse($env:PSPrivateMetadata, [ref]$parsedJobId) -or $parsedJobId -eq [guid]::Empty) {
+    # Read only this execution's sandbox trace, using the runbook's own directory as the anchor.
+    # This worker-internal path is a tested workaround, not a stable public Azure contract.
+    # The script filename can also be a GUID, but it is not the Automation job ID.
+    $tracePath = Join-Path (Split-Path -Parent $PSScriptRoot) 'diags\trace.log'
+
+    # Match the explicit jobId= label, not unrelated GUIDs such as sandboxId. Require the
+    # complete GUID format and reject matches that are merely prefixes of longer identifiers.
+    $jobIdPattern = '(?i)\bjobId\s*=\s*(?<JobId>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?![0-9a-f-])'
+
+    # Stop if the trace cannot be read. Scan all matches and normalize them to GUID values
+    # before deduplication, since repeated entries for the same job are not ambiguous.
+    # The array wrapper preserves Count/index access for zero, one, or multiple distinct IDs.
+    $traceJobIds = @(Get-Content -LiteralPath $tracePath -ErrorAction Stop | ForEach-Object {
+        foreach ($jobMatch in [regex]::Matches($_, $jobIdPattern)) {
+            [guid]$jobMatch.Groups['JobId'].Value
+        }
+    } | Sort-Object -Unique)
+
+    # Fail before certificate operations if identity is missing, empty, or ambiguous rather
+    # than recording a guessed ID in certificate audit tags or notification details.
+    # Short-circuit evaluation avoids indexing an empty array under StrictMode.
+    if ($traceJobIds.Count -ne 1 -or $traceJobIds[0] -eq [guid]::Empty) {
+        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "Cannot determine the Automation job ID: expected one distinct non-empty jobId in the current sandbox trace; found $($traceJobIds.Count)."
+    }
+
+    # Adopt the sole validated trace ID and record which discovery method succeeded.
+    $parsedJobId = $traceJobIds[0]
+    $jobIdSource = 'SandboxTrace'
+}
+
+# Preserve the canonical GUID string expected by existing tag and notification callers.
+$jobId = $parsedJobId.ToString('D')
+
+# Emit a readable ID followed by structured diagnostic details through the existing logger.
+# The source, worker, runtime, and host marker help diagnose future worker behavior changes.
+Write-CertLCLog -Section 'Dispatcher' -Message "Automation Job ID: $jobId"
+Write-CertLCLog -Section 'Dispatcher' -Message ([ordered]@{
+    JobId = $jobId
+    JobIdSource = $jobIdSource
+    Worker = $env:COMPUTERNAME
+    PowerShellVersion = $PSVersionTable.PSVersion.ToString()
+    HostEnvironment = $env:AZUREPS_HOST_ENVIRONMENT
+} | ConvertTo-Json -Compress)
 
 # Get the runbook variables from the Automation Account
 # Since they are encrypted, we must use the internal cmdlet Get-AutomationVariable to retrieve them, not Get-AzAutomationVariable
@@ -3641,12 +3660,6 @@ switch ($requestBody.type) {
             $notifyTo = @($rawNotifyTo.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
         }
 
-        # Idempotency guard: if this version is already marked as revoked, exit cleanly with a
-        # clear message instead of attempting the revocation again. Without this check the flow
-        # would proceed and fail later inside New-CertificateRevocationRequest at the
-        # Get-AzKeyVaultSecret call (Key Vault refuses to release the secret material of a
-        # disabled version), producing a misleading "Error getting certificate from key vault"
-        # log line. Mirrors the renewal-side check that skips auto-renewal of revoked versions.
         $revokedTag = if ($cert.Tags -and $cert.Tags.ContainsKey('Revoked')) { [string]$cert.Tags['Revoked'] } else { $null }
         if ($revokedTag -and $revokedTag.Trim().ToLowerInvariant() -eq 'true') {
             $revokedAt = if ($cert.Tags.ContainsKey('RevokedAt')) { [string]$cert.Tags['RevokedAt'] }        else { '<unknown>' }
@@ -3663,9 +3676,7 @@ switch ($requestBody.type) {
 
         Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Performing certificate revocation for certificate $CertificateName version $CertificateVersion in vault $VaultName with reason $RevocationReason..."
         try {
-            # Pass the already-fetched version tags so New-CertificateRevocationRequest does not
-            # need a second Get-AzKeyVaultCertificate round-trip just to merge them.
-            New-CertificateRevocationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateVersion $CertificateVersion -RevocationReason $RevocationReason -JobId $jobId -ExistingTags $cert.Tags -Result ([ref]$revocationResult)
+            New-CertificateRevocationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateVersion $CertificateVersion -RevocationReason $RevocationReason -JobId $jobId -ExistingTags $cert.Tags -Certificate $cert.Certificate -ExpectedThumbprint $CertificateThumbprint -Result ([ref]$revocationResult)
         }
         catch {
             # Include the configured SMTP transport so a genuine CA or Key Vault revocation
