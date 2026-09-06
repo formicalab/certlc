@@ -1,0 +1,94 @@
+// Test workbook only. Scope every scan to the selected time and existing resources.
+// Reuse certlcstats resource selectors instead of pinning Journey to one deployment.
+// Match Job History: nested resource names may include the Automation account prefix.
+let SelectedRunbookName = tostring(split('{Runbook:name}', '/')[-1]);
+let Traces = materialize(AppTraces
+| where TimeGenerated {TimeRange}
+| where AppRoleName =~ '{FunctionApp:name}'
+| extend AttemptId = coalesce(tostring(Properties.InvocationId), OperationId)
+| where isnotempty(AttemptId));
+let Bridge = Traces
+| where Message has 'BridgeCorrelation'
+| extend Entry = parse_json(extract(@'(\{.*\})', 1, Message))
+| where tostring(Entry.recordType) == 'BridgeCorrelation';
+// Only receipt records establish event identity. Older Started records used job fallback.
+let Receipts = Bridge
+| where tostring(Entry.stage) == 'Received'
+| summarize arg_min(TimeGenerated, *) by AttemptId
+| project AttemptId, OperationId, Received = TimeGenerated,
+    CorrelationId = tostring(Entry.correlationId), EventSource = tostring(Entry.eventSource);
+// Keep each invocation/job association: repeated delivery must not erase earlier attempts.
+let Links = Bridge
+| where tostring(Entry.stage) == 'Started' and isnotempty(tostring(Entry.jobId))
+| summarize Submitted = min(TimeGenerated) by AttemptId, JobId = tolower(tostring(Entry.jobId));
+let Payloads = Traces
+| where Message contains 'CERTLC: full message received is:'
+| extend Payload = parse_json(extract(@'CERTLC: full message received is:\s*(.*)$', 1, Message))
+| summarize arg_min(TimeGenerated, *) by AttemptId
+// Bracket notation preserves the CloudEvent field whose name is a KQL keyword.
+| project AttemptId, Certificate = coalesce(tostring(Payload.data.ObjectName), tostring(Payload.subject)),
+    EventType = tostring(Payload.type), EventTime = todatetime(Payload['time']);
+let Streams = materialize(AzureDiagnostics
+| where TimeGenerated {TimeRange}
+| where Category == 'JobStreams' and Resource =~ '{AutomationAccount:name}' and RunbookName_s =~ SelectedRunbookName
+| extend JobId = tolower(tostring(JobId_g)), Raw = replace_regex(tostring(ResultDescription), @'\x1B\[[0-9;]*[A-Za-z]', '')
+| extend Entry = parse_json(extract(@'(\{.*\})', 1, Raw))
+| extend Message = coalesce(tostring(Entry.message), Raw), Section = coalesce(tostring(Entry.section), StreamType_s),
+    Level = coalesce(tostring(Entry.level), StreamType_s), LogTime = coalesce(todatetime(Entry.timestamp), TimeGenerated));
+let Jobs = AzureDiagnostics
+| where TimeGenerated {TimeRange}
+| where Category == 'JobLogs' and Resource =~ '{AutomationAccount:name}' and RunbookName_s =~ SelectedRunbookName
+| summarize arg_max(TimeGenerated, ResultType) by JobId = tolower(tostring(JobId_g))
+| project JobId, JobStatus = ResultType, StatusObserved = TimeGenerated;
+// Operation outcome is not the same as Automation completion or SMTP delivery.
+let Outcomes = Streams
+| summarize Warnings = countif(Level =~ 'Warning'), Errors = countif(Level =~ 'Error'),
+    Succeeded = countif(Section startswith 'Dispatcher.' and Message contains 'successfully'),
+    // Missing SMTP is not a skipped certificate operation.
+    Skipped = countif(Section == 'Dispatcher.Renewal' and Message startswith 'Skipping auto-renewal of certificate'),
+    EmailSent = countif(Section == 'Send-NotificationEmail' and Message startswith 'Notification email sent'),
+    EmailFailed = countif(Section == 'Send-NotificationEmail' and Level =~ 'Warning') by JobId;
+let Exceptions = AppExceptions
+| where TimeGenerated {TimeRange}
+| where AppRoleName =~ '{FunctionApp:name}'
+| extend AttemptId = coalesce(tostring(Properties.InvocationId), OperationId)
+| summarize FunctionErrors = count() by AttemptId;
+let Attempts = Receipts
+| join kind=leftouter Links on AttemptId
+| join kind=leftouter Payloads on AttemptId
+| join kind=leftouter Jobs on JobId
+| join kind=leftouter Outcomes on JobId
+| join kind=leftouter Exceptions on AttemptId
+// JSON tuple prevents ambiguous concatenation; unidentified receipts remain separate.
+| extend EventKey = tostring(pack_array(EventSource, CorrelationId, iff(isempty(CorrelationId), AttemptId, ''))),
+    JobStatus = coalesce(JobStatus, 'Not observed'),
+    OperationOutcome = case(Errors > 0, 'Error logged', Skipped > 0, 'Skipped', Succeeded > 0, 'Success logged', 'Not observed'),
+    Notification = case(EmailFailed > 0, 'Delivery warning', EmailSent > 0, 'Sent', 'Not observed'),
+    Warnings = coalesce(Warnings, 0), Errors = coalesce(Errors, 0), FunctionErrors = coalesce(FunctionErrors, 0);
+// Workbook formatting encodes user input before KQL substitution, including quotes/newlines.
+let SearchText = trim(@'\s+', base64_decode_tostring('{JourneySearch:base64}'));
+// A matching job selects its whole event so search does not hide sibling retry attempts.
+let MatchingEvents = Attempts
+| where isempty(SearchText) or CorrelationId contains SearchText or Certificate contains SearchText
+    or JobId contains SearchText or AttemptId contains SearchText or EventType contains SearchText or EventSource contains SearchText
+| distinct EventKey;
+Attempts
+| join kind=leftsemi MatchingEvents on EventKey
+// Group by the full event identity, while retaining counts and all observed outcomes.
+| summarize FirstReceipt = min(Received), LastObserved = max(StatusObserved),
+    // Empty join results do not represent an observed Automation job.
+    AttemptIds = make_set(AttemptId), Jobs = make_set_if(JobId, isnotempty(JobId)), Certificates = make_set(Certificate), EventTypes = make_set(EventType),
+    JobStates = make_set(JobStatus), Outcomes = make_set(OperationOutcome), Notifications = make_set(Notification),
+    Warnings = sum(Warnings), Errors = sum(Errors), FunctionErrors = sum(FunctionErrors)
+    by EventKey, CorrelationId, EventSource
+| extend Attempts = array_length(AttemptIds), JobCount = array_length(Jobs),
+    ObservedDuration = LastObserved - FirstReceipt
+// Compact display values avoid raw JSON arrays; retain all diagnostics for selection and export.
+| extend Certificate = strcat_array(Certificates, ', '),
+    EventType = replace_regex(strcat_array(EventTypes, ', '), @'(CertLC\.|Microsoft\.KeyVault\.)', ''),
+    Outcome = strcat_array(Outcomes, ', '), JobStatus = strcat_array(JobStates, ', ')
+| project FirstReceipt, Certificate, EventType, Outcome, JobStatus, Attempts, JobCount,
+    CorrelationId, Certificates, EventTypes, JobStates, Outcomes, Notifications,
+    Warnings, Errors, FunctionErrors, ObservedDuration, EventSource, EventKey
+| order by FirstReceipt desc
+| take 500

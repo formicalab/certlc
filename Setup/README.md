@@ -260,8 +260,24 @@ The Bicep template creates and configures the following Azure resources:
   - Name: `certlcstats`
   - Complete workbook definition loaded from `Workbooks/certlcstats.workbook` and published by Bicep
   - Deployment replaces the workbook's resource-ID tokens with the resources created by the template
+  - Tabs: Statistics, Event Journey, Job logs, Function bridge; all share the original resource and time selectors
+  - Event Journey searches events/certificates and expands an event into attempts, Function activity, Automation jobs and logs
   - Linked to Log Analytics Workspace as data source
   - Depends on Application Insights to ensure workspace stability
+
+The production source is `Workbooks/certlcstats.workbook`; preserve its five resource-ID
+placeholders and tokenized fallback workspace. All 18 embedded queries have matching standalone
+KQL files directly under `Workbooks/`, including the three self-contained `event-journey-*.kql`
+queries. See the [query index](../Workbooks/README.md). When changing a query, update both its
+standalone file and the embedded workbook query. Temporary prototype sources and tests are not
+required for deployment.
+
+For a workbook-only upgrade, deploy `modules/workbook.bicep` at resource-group scope in
+Incremental mode using the existing location, resource IDs, runbook name and tags. Run
+validation and what-if first; require only a Modify of the existing `certlcstats` workbook.
+The deterministic resource name retains its portal identity. The full setup template is not
+needed for this upgrade. Back up the existing workbook content and verify both content and
+metadata after deployment; do not replace tokens in the repository file with environment IDs.
 
 #### Optional **Azure Monitor Alerts**
 - **Deployment**: Created only when `enableAlerts` is `true`

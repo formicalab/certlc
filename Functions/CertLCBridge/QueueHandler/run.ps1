@@ -36,6 +36,58 @@ Set-StrictMode -Version 1.0
 # Ensure the script stops on errors
 $ErrorActionPreference = "Stop"
 
+# Read only top-level event identity, never data.Id. Keep nonblank string values unchanged;
+# malformed/missing identity does not change payload validation or generate a replacement GUID.
+$correlationId = ''
+$eventSource = ''
+if ($null -ne $QueueItem -and $QueueItem -isnot [string]) {
+  if ($QueueItem -is [System.Collections.IDictionary]) {
+    $eventIdValue = $QueueItem['id']
+    $eventSourceValue = $QueueItem['source']
+  }
+  else {
+    $eventIdValue = $QueueItem.PSObject.Properties['id'].Value
+    $eventSourceValue = $QueueItem.PSObject.Properties['source'].Value
+  }
+  if ($eventIdValue -is [string] -and -not [string]::IsNullOrWhiteSpace($eventIdValue)) {
+    $correlationId = $eventIdValue
+  }
+  if ($eventSourceValue -is [string]) {
+    $eventSource = $eventSourceValue
+  }
+}
+
+<#
+.SYNOPSIS
+    Associate event identity with this invocation and, once available, its Automation job.
+.DESCRIPTION
+    Keep existing workbook-sensitive plain-text logs unchanged. JSON is written to Message,
+    not assumed to become Application Insights custom properties. Escape reserved filter
+    terms even inside arbitrary event IDs/sources; JSON parsing restores their exact values.
+    Native Application Insights OperationId remains the invocation identity.
+#>
+function Write-BridgeCorrelation {
+  param([string]$Stage, [string]$CorrelationId, [string]$EventSource, [string]$JobId)
+
+  # Omit unknown identifiers; prelaunch records cannot use a job ID that does not yet exist.
+  $entry = [ordered]@{ recordType = 'BridgeCorrelation'; stage = $Stage }
+  if (-not [string]::IsNullOrWhiteSpace($CorrelationId)) { $entry.correlationId = $CorrelationId }
+  if (-not [string]::IsNullOrWhiteSpace($EventSource)) { $entry.eventSource = $EventSource }
+  if (-not [string]::IsNullOrWhiteSpace($JobId)) { $entry.jobId = $JobId }
+
+  # KQL filters search Message text before parsing JSON. Escaping the first character of
+  # these terms prevents added records from changing event extraction, durations, or counts.
+  $json = $entry | ConvertTo-Json -Compress
+  $json = [regex]::Replace($json, '(?i)certlc|runbook', {
+    param($match)
+    ('\u{0:x4}' -f [int][char]$match.Value[0]) + $match.Value.Substring(1)
+  })
+  Write-Information $json
+}
+
+# Emit request association before login so authentication failures can still be investigated.
+Write-BridgeCorrelation -Stage Received -CorrelationId $correlationId -EventSource $eventSource
+
 # Explicitly load Az.Automation module (it seems that the function runtime does not load it automatically)
 # Import-Module Az.Automation
 
@@ -113,8 +165,12 @@ if (-not [string]::IsNullOrWhiteSpace($configuredPollingTimeout)) {
 
 Write-Information "Starting runbook $RunbookName in Automation Account $AutomationAccountName in Resource Group $ResourceGroupName on Hybrid Worker Group $HybridWorkerGroupName ..."
 
+# The payload is the sole source of request identity; do not duplicate it as a parameter.
+# Deploy this caller before removing the optional input from the published runbook.
+$runbookParameters = @{ 'jsonRequestBody' = $jsonQueueItem }
+
 try {
-  $res = Start-AzAutomationRunbook -Name $RunbookName -Parameters @{ 'jsonRequestBody' = $jsonQueueItem } -RunOn $HybridWorkerGroupName -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName
+  $res = Start-AzAutomationRunbook -Name $RunbookName -Parameters $runbookParameters -RunOn $HybridWorkerGroupName -ResourceGroupName $ResourceGroupName -AutomationAccountName $AutomationAccountName
 }
 catch {
   throw "An error occurred while starting the runbook: $_"
@@ -125,6 +181,9 @@ if (-not $res -or -not $res.JobId) {
 }
 
 $jobId = $res.JobId
+
+# Record execution separately; missing event identity stays omitted, never replaced by jobId.
+Write-BridgeCorrelation -Stage Started -CorrelationId $correlationId -EventSource $eventSource -JobId $jobId
 
 Write-Information "Runbook started with job id: $($res.JobId)"
 

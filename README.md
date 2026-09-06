@@ -123,7 +123,7 @@ CertLC stores the following tags on individual Key Vault certificate versions. C
 1. The `certlcstats` runbook runs hourly on the configured Hybrid Worker Group by default
 2. It enumerates certificate names in Key Vault and collects metadata from the latest version of each name
 3. Certificate data is published to a custom Log Analytics table via Data Collection Rule
-4. The Azure Monitor workbook shows certificate expiration status and details, runbook job status, and logs for selected jobs
+4. The Azure Monitor workbook shows certificate expiration status and details, an Event Journey from event/certificate search through Function attempts and Automation jobs to logs, plus the existing job and Function bridge views
 
 ### Proactive Alerting
 
@@ -268,6 +268,20 @@ Consumed `data` fields: `VaultName`, `CertificateThumbprint`, and `RevocationRea
 - **RBAC Authorization**: Key Vault uses Azure RBAC (not access policies) with least-privilege assignments
 - **Encrypted Variables**: Non-Azure secrets required by the runbooks, such as SMTP credentials, are stored as encrypted Automation variables
 - **Audit Logging**: Diagnostic settings enabled on Key Vault and Automation Account; enabling alerts also sends Queue Storage writes to Log Analytics for poison-message detection
+
+## Request Correlation
+
+`correlationId` represents only the top-level nonblank string event `id`, never `data.Id` or a job-ID fallback. The Function forwards only the unchanged `jsonRequestBody`; there is no separate runbook `CorrelationId` input. The runbook populates correlation after parsing this explicit JSON input path. Direct `WebhookData` calls omit correlation, including native, JSON, and legacy PowerShell webhook envelopes. This distinguishes input paths, not authenticated caller identity: any caller supplying `jsonRequestBody` receives the same behavior as the Function. Custom IDs need not be GUIDs; missing, null, empty, whitespace-only, or non-string IDs leave correlation omitted.
+
+The runbook checks Hybrid Worker execution, PowerShell 7.6+, and job identity before Azure authentication. Every custom log includes a separate `jobId` once discovered, including warnings, errors, verbose records, and serialization-failure records. Startup and payload-parsing failures omit `correlationId`. After explicit JSON parsing, validation and operation logs inherit the event ID when valid. `correlationIdSource` is no longer needed because the field never switches to execution identity. Nonblank logging-helper overrides are event IDs, not job IDs; they are not runbook inputs. Context cannot overwrite the reserved `jobId` or `correlationId` fields. These stream logs do not require Azure login, but module-loading failures and native cmdlet output are outside the custom logger contract. Early startup failures do not send SMTP notifications before notification configuration is available.
+
+Event correlation is diagnostic metadata, not authorization or duplicate suppression. A retried event retains its correlation ID but receives a separate Function invocation and Automation job. `RenewedJobId`, `RevokedJobId`, and notification job references always use the actual Automation job ID. Event `source` is logged separately because IDs are unique within a producer's source, not necessarily across producers.
+
+Every success and error email includes **Correlation ID** as the first row in its main details table. Emails can use the parsed top-level event ID from either input path, including direct `WebhookData`, without changing the stricter log correlation rules above. When no valid event ID is available, the row explicitly shows **Unavailable (no valid event ID)**; it never substitutes a job ID. The footer separately shows **Automation Job ID** when known. There is no duplicate **Event ID** row; the distinct **Request ID** (`data.Id`) remains. Values are HTML-encoded. Email delivery remains non-fatal and requires configured SMTP and recipients.
+
+The Function preserves its workbook-sensitive plain-text messages and emits separate JSON `BridgeCorrelation` receipt/start association records in Application Insights trace messages. Missing event IDs remain omitted in both records; the started record independently includes the returned `jobId`. These can be joined to other traces using the platform `OperationId`; they are not automatic distributed tracing or custom properties. Reserved workbook-filter terms within association values are JSON-escaped and restored by JSON parsing. The runbook's JSON fields and streams remain compatible with Job History, which still groups by platform `JobId_g`. The independent stats runbook, its `SnapshotId`, ingestion schema, and existing workbook queries remain unchanged.
+
+When upgrading from the separate-input version, publish and verify the Function first so it stops forwarding `CorrelationId`, then publish the runbook that removes the parameter. Update any other callers that explicitly pass it. During this transition the old runbook may use job-ID correlation; certificate behavior is unchanged. Verify actual telemetry ingestion after deployment. The retained [event sample](Tests/sample-eventgrideventschema.json) documents the input shape; temporary development tests are not distributed.
 
 ## Getting Started
 

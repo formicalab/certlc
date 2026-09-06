@@ -1,0 +1,132 @@
+// Test workbook only. Scope every scan to the selected time and existing resources.
+// Reuse certlcstats resource selectors instead of pinning Journey to one deployment.
+// Match Job History: nested resource names may include the Automation account prefix.
+let SelectedRunbookName = tostring(split('{Runbook:name}', '/')[-1]);
+let Traces = materialize(AppTraces
+| where TimeGenerated {TimeRange}
+| where AppRoleName =~ '{FunctionApp:name}'
+| extend AttemptId = coalesce(tostring(Properties.InvocationId), OperationId)
+| where isnotempty(AttemptId));
+let Bridge = Traces
+| where Message has 'BridgeCorrelation'
+| extend Entry = parse_json(extract(@'(\{.*\})', 1, Message))
+| where tostring(Entry.recordType) == 'BridgeCorrelation';
+// Only receipt records establish event identity. Older Started records used job fallback.
+let Receipts = Bridge
+| where tostring(Entry.stage) == 'Received'
+| summarize arg_min(TimeGenerated, *) by AttemptId
+| project AttemptId, OperationId, Received = TimeGenerated,
+    CorrelationId = tostring(Entry.correlationId), EventSource = tostring(Entry.eventSource);
+// Keep each invocation/job association: repeated delivery must not erase earlier attempts.
+let Links = Bridge
+| where tostring(Entry.stage) == 'Started' and isnotempty(tostring(Entry.jobId))
+| summarize Submitted = min(TimeGenerated) by AttemptId, JobId = tolower(tostring(Entry.jobId));
+let Payloads = Traces
+| where Message contains 'CERTLC: full message received is:'
+| extend Payload = parse_json(extract(@'CERTLC: full message received is:\s*(.*)$', 1, Message))
+| summarize arg_min(TimeGenerated, *) by AttemptId
+// Bracket notation preserves the CloudEvent field whose name is a KQL keyword.
+| project AttemptId, Certificate = coalesce(tostring(Payload.data.ObjectName), tostring(Payload.subject)),
+    EventType = tostring(Payload.type), EventTime = todatetime(Payload['time']);
+let Streams = materialize(AzureDiagnostics
+| where TimeGenerated {TimeRange}
+| where Category == 'JobStreams' and Resource =~ '{AutomationAccount:name}' and RunbookName_s =~ SelectedRunbookName
+| extend JobId = tolower(tostring(JobId_g)), Raw = replace_regex(tostring(ResultDescription), @'\x1B\[[0-9;]*[A-Za-z]', '')
+| extend Entry = parse_json(extract(@'(\{.*\})', 1, Raw))
+| extend Message = coalesce(tostring(Entry.message), Raw), Section = coalesce(tostring(Entry.section), StreamType_s),
+    Level = coalesce(tostring(Entry.level), StreamType_s), LogTime = coalesce(todatetime(Entry.timestamp), TimeGenerated));
+let Jobs = AzureDiagnostics
+| where TimeGenerated {TimeRange}
+| where Category == 'JobLogs' and Resource =~ '{AutomationAccount:name}' and RunbookName_s =~ SelectedRunbookName
+| summarize arg_max(TimeGenerated, ResultType) by JobId = tolower(tostring(JobId_g))
+| project JobId, JobStatus = ResultType, StatusObserved = TimeGenerated;
+// Operation outcome is not the same as Automation completion or SMTP delivery.
+let Outcomes = Streams
+| summarize Warnings = countif(Level =~ 'Warning'), Errors = countif(Level =~ 'Error'),
+    Succeeded = countif(Section startswith 'Dispatcher.' and Message contains 'successfully'),
+    // Missing SMTP is not a skipped certificate operation.
+    Skipped = countif(Section == 'Dispatcher.Renewal' and Message startswith 'Skipping auto-renewal of certificate'),
+    EmailSent = countif(Section == 'Send-NotificationEmail' and Message startswith 'Notification email sent'),
+    EmailFailed = countif(Section == 'Send-NotificationEmail' and Level =~ 'Warning') by JobId;
+let Exceptions = AppExceptions
+| where TimeGenerated {TimeRange}
+| where AppRoleName =~ '{FunctionApp:name}'
+| extend AttemptId = coalesce(tostring(Properties.InvocationId), OperationId)
+| summarize FunctionErrors = count() by AttemptId;
+let Attempts = Receipts
+| join kind=leftouter Links on AttemptId
+| join kind=leftouter Payloads on AttemptId
+| join kind=leftouter Jobs on JobId
+| join kind=leftouter Outcomes on JobId
+| join kind=leftouter Exceptions on AttemptId
+// JSON tuple prevents ambiguous concatenation; unidentified receipts remain separate.
+| extend EventKey = tostring(pack_array(EventSource, CorrelationId, iff(isempty(CorrelationId), AttemptId, ''))),
+    JobStatus = coalesce(JobStatus, 'Not observed'),
+    OperationOutcome = case(Errors > 0, 'Error logged', Skipped > 0, 'Skipped', Succeeded > 0, 'Success logged', 'Not observed'),
+    Notification = case(EmailFailed > 0, 'Delivery warning', EmailSent > 0, 'Sent', 'Not observed'),
+    Warnings = coalesce(Warnings, 0), Errors = coalesce(Errors, 0), FunctionErrors = coalesce(FunctionErrors, 0);
+// Selection is an encoded source/id tuple, so equal IDs from different producers stay separate.
+let SelectedKey = base64_decode_tostring('{SelectedEvent:base64}');
+let Selected = materialize(Attempts | where isnotempty(SelectedKey) and EventKey == SelectedKey);
+// One parent per invocation, even if several job associations are observed for that invocation.
+let SelectedInvocations = materialize(Selected
+| summarize Received = min(Received), FunctionErrors = max(FunctionErrors) by AttemptId, OperationId
+| order by Received asc, AttemptId asc
+| serialize AttemptNumber = row_number());
+let SelectedJobs = materialize(Selected | where isnotempty(JobId)
+| distinct AttemptId, JobId, Submitted, JobStatus, OperationOutcome, Notification);
+// Explicit parents mirror the native Id/ParentId tree used by the production Job History.
+let Parents = union
+    // Keep identity in the context view; parent details retain source, notifications and diagnostics.
+    (Selected | summarize Time = min(Received), Notifications = make_set(Notification), Warnings = sum(Warnings), Errors = sum(Errors), FunctionErrors = sum(FunctionErrors) by CorrelationId, EventSource
+        | project Id = 'event', ParentId = '', Name = 'Event',
+            Time, Component = 'Event', Stage = 'Correlation', FinalResult = 'info',
+            Message = strcat('Source: ', EventSource, '\nNotifications: ', strcat_array(Notifications, ', '), '\nWarnings: ', Warnings, '; Runbook errors: ', Errors, '; Function errors: ', FunctionErrors), AttemptId = '', JobId = ''),
+    (SelectedInvocations
+        | project Id = strcat('attempt:', AttemptId), ParentId = 'event', Name = strcat('Attempt ', AttemptNumber),
+            Time = Received, Component = 'Attempt', Stage = 'Receipt', FinalResult = iff(FunctionErrors > 0, 'failed', 'info'),
+            Message = strcat('Function invocation: ', AttemptId), AttemptId, JobId = ''),
+    (SelectedInvocations
+        | project Id = strcat('function:', AttemptId), ParentId = strcat('attempt:', AttemptId), Name = 'Function activity',
+            Time = Received, Component = 'Function', Stage = 'Invocation', FinalResult = iff(FunctionErrors > 0, 'failed', 'info'),
+            Message = strcat('Operation ID: ', OperationId), AttemptId, JobId = ''),
+    (SelectedJobs
+        // Show the full job ID once in parent details instead of repeating it across every leaf.
+        | project Id = strcat('job:', AttemptId, ':', JobId), ParentId = strcat('attempt:', AttemptId), Name = 'Automation job',
+            Time = Submitted, Component = 'Automation', Stage = 'Job',
+            FinalResult = case(JobStatus =~ 'Failed', 'failed', JobStatus in~ ('Stopped', 'Suspended'), 'warning', JobStatus =~ 'Completed', 'success', 'info'),
+            Message = strcat('Job ID: ', JobId, '\nState: ', JobStatus, '; Operation: ', OperationOutcome, '; Notification: ', Notification), AttemptId, JobId);
+// Cap only leaf records. Parents remain present even when the detail stream is truncated.
+let Records = union
+    (Selected | where isnotnull(EventTime) | distinct EventTime, EventType
+        | project ParentId = 'event', Time = EventTime, Component = 'Event payload', Stage = 'Producer timestamp (not delivery)',
+            Level = 'Information', Message = EventType, AttemptId = '', JobId = ''),
+    (Traces | join kind=inner SelectedInvocations on AttemptId, OperationId
+        | project ParentId = strcat('function:', AttemptId), Time = TimeGenerated, Component = 'Function', Stage = tostring(Properties.Category),
+            Level = coalesce(tostring(Properties.LogLevel), 'Information'), Message, AttemptId, JobId = ''),
+    // Detail scans use the same shared resource parameters as the summary.
+    (AppExceptions | where TimeGenerated {TimeRange} | where AppRoleName =~ '{FunctionApp:name}'
+        | extend AttemptId = coalesce(tostring(Properties.InvocationId), OperationId)
+        | join kind=inner SelectedInvocations on AttemptId, OperationId
+        | project ParentId = strcat('function:', AttemptId), Time = TimeGenerated, Component = 'Function', Stage = 'Exception', Level = 'Error', Message = OuterMessage, AttemptId, JobId = ''),
+    (Streams | join kind=inner SelectedJobs on JobId
+        | project ParentId = strcat('job:', AttemptId, ':', JobId), Time = LogTime, Component = 'Runbook', Stage = Section, Level, Message, AttemptId, JobId),
+    (AzureDiagnostics | where TimeGenerated {TimeRange}
+        // Reuse the normalized leaf name so portal resource formatting cannot hide job children.
+        | where Category == 'JobLogs' and Resource =~ '{AutomationAccount:name}' and RunbookName_s =~ SelectedRunbookName
+        | extend JobId = tolower(tostring(JobId_g)) | join kind=inner SelectedJobs on JobId
+        | project ParentId = strcat('job:', AttemptId, ':', JobId), Time = TimeGenerated, Component = 'Automation', Stage = 'Job status',
+            Level = iff(ResultType in~ ('Failed', 'Stopped', 'Suspended'), 'Warning', 'Information'),
+            Message = ResultType, AttemptId, JobId)
+| order by Time asc, ParentId asc, Stage asc, Message asc
+| take 2000
+// Row numbers keep identical timestamps/messages distinct rather than colliding as tree IDs.
+| serialize RecordNumber = row_number()
+| project Id = strcat('record:', RecordNumber), ParentId,
+    // Time already has a dedicated column; use the node label for log origin instead.
+    Name = case(Component == 'Runbook', Stage, Component == 'Function', strcat('Function / ', Level), Stage),
+    Time, Component, Stage, FinalResult = case(Level =~ 'Error', 'failed', Level =~ 'Warning', 'warning', 'info'), Message, AttemptId, JobId;
+union Parents, Records
+| order by Time asc, Id asc
+// Lead with the expandable result icon, keeping the node name beside it and IDs hidden.
+| project FinalResult, Name, Time, Component, Stage, Message, AttemptId, JobId, Id, ParentId

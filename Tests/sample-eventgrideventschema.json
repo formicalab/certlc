@@ -1,0 +1,20 @@
+[
+  {
+    "id": "1af41fa2-54b2-4b03-ba46-f5088ba709c7",
+    "topic": "/subscriptions/4a570962-701a-475e-bf5b-8dc76ec748ff/resourceGroups/rg-shared-neu-001/providers/Microsoft.KeyVault/vaults/flazkv-shared-neu-001",
+    "subject": "mycert13",
+    "eventType": "Microsoft.KeyVault.CertificateNearExpiry",
+    "data": {
+      "Id": "https://flazkv-shared-neu-001.vault.azure.net/certificates/mycert13/89e4274cf92540479770a1178cce17ff",
+      "VaultName": "flazkv-shared-neu-001",
+      "ObjectType": "Certificate",
+      "ObjectName": "mycert13",
+      "Version": "89e4274cf92540479770a1178cce17ff",
+      "NBF": 1745695048,
+      "EXP": 1745702248
+    },
+    "dataVersion": "1",
+    "metadataVersion": "1",
+    "eventTime": "2025-04-26T19:29:34.4197223Z"
+  }
+]

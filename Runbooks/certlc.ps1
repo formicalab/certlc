@@ -113,12 +113,19 @@ Revocation semantics:
   any subsequent CertificateNearExpiry event for the same certificate is ignored by the
   renewal flow (it checks the latest version's Revoked tag and exits without renewing).
 
-You can also pass the RequestBody parameter explicitly, which must be a JSON string with the same structure as above.
+You can also pass the jsonRequestBody parameter explicitly, which must be a JSON string with the same structure as above.
 In this case, use the Start-AzAutomationRunbook cmdlet to start the runbook, passing the jsonRequestBody parameter:
 
 Start-AzAutomationRunbook -Name "certlc" -Parameters @{ 'jsonRequestBody'=$jsonRequestBody }
 
 Where $jsonRequestBody is a JSON string containing the RequestBody (the same as WebhookData.RequestBody when the webhook is used).
+
+Correlation comes only from the parsed jsonRequestBody's top-level nonblank string id,
+never data.Id or the Automation job ID. This is the Function's input path, not proof of
+caller identity: other callers supplying jsonRequestBody have the same behavior.
+Direct WebhookData calls, startup, and missing/invalid event IDs omit correlationId.
+Logs include the separate jobId field once the actual Automation job ID is discovered.
+Correlation is diagnostic only: audit tags and notification job references always use the actual job ID.
 
 #>
 
@@ -140,6 +147,10 @@ $ErrorActionPreference = 'Stop'
 ###################################
 
 $Version = '1.0'    # version of the script - must match specversion in the webhook body
+
+# Correlation stays unknown until the Function-path payload supplies a valid event id.
+# Keep invocation state distinct from the logging helpers' optional override parameters.
+$script:CertLCCorrelationId = ''
 
 <# Unified SMTP / Email templates
  There are two templates with placeholders populated by New-CertLCNotificationBody.
@@ -229,7 +240,8 @@ $script:CertificateNotificationContext = [ordered]@{}
     The section or context of the log entry (e.g., function name).
 
 .PARAMETER CorrelationId
-    An optional correlation ID to include in the log entry.
+    An optional nonblank event-ID override for logging helpers, never a job-ID fallback.
+    Blank values inherit the runbook's event correlation, including error-helper forwarding.
 
 .PARAMETER Context
     An optional hashtable of additional context to include in the log entry.
@@ -246,10 +258,11 @@ $script:CertificateNotificationContext = [ordered]@{}
     - level: log level
     - section: section or context of the log entry
     - message: log message
-    - correlationId: optional correlation ID
+    - correlationId: optional event ID
+    - jobId: actual Automation execution ID, when discovered
     - additional fields from the Context hashtable, with keys prefixed with "ctx_" if they conflict with reserved keys
 
-    Reserved keys that cannot be used in Context without prefixing: timestamp, level, message, section, correlationId
+    Reserved keys that cannot be used in Context without prefixing: timestamp, level, message, section, correlationId, jobId
 
     If JSON serialization fails, an error log entry is emitted instead.
 
@@ -273,15 +286,31 @@ function Write-CertLCLog {
         [Parameter()][int]$JsonDepth = 5
     )
 
-    $reservedKeys = 'timestamp', 'level', 'message', 'section', 'correlationId'
+    # Execution identity is owned by the runbook, not caller-supplied log context.
+    $reservedKeys = 'timestamp', 'level', 'message', 'section', 'correlationId', 'jobId'
     $entry = [ordered]@{
         timestamp = (Get-Date).ToString('o')
         level     = $Level
         section   = $Section
         message   = $Message
     }
-    if ($CorrelationId) {
-        $entry.correlationId = $CorrelationId
+    # Resolve blank forwarded arguments as defaults, not overrides. Get-Variable also lets
+    # this helper log early failures or run in isolation without uninitialized-variable errors.
+    $effectiveCorrelationId = $CorrelationId
+    if ([string]::IsNullOrWhiteSpace($effectiveCorrelationId)) {
+        $correlationVariable = Get-Variable -Name CertLCCorrelationId -Scope Script -ErrorAction Ignore
+        $effectiveCorrelationId = if ($null -ne $correlationVariable) { [string]$correlationVariable.Value } else { '' }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($effectiveCorrelationId)) {
+        $entry.correlationId = $effectiveCorrelationId
+    }
+
+    # Discovery can fail before jobId exists. Keep early/isolated logging StrictMode-safe
+    # and never substitute execution identity for an absent event identity.
+    $jobVariable = Get-Variable -Name jobId -Scope Script -ErrorAction Ignore
+    $executionJobId = if ($null -ne $jobVariable) { [string]$jobVariable.Value } else { '' }
+    if (-not [string]::IsNullOrWhiteSpace($executionJobId)) {
+        $entry.jobId = $executionJobId
     }
 
     if ($Context) {
@@ -295,7 +324,24 @@ function Write-CertLCLog {
 
     try { $json = $entry | ConvertTo-Json -Compress -Depth $JsonDepth }
     catch {
-        $json = ([ordered]@{ timestamp = (Get-Date).ToString('o'); level = 'Error'; message = 'Failed to serialize log entry'; originalMessage = $Message; serializationError = $_.Exception.Message }) | ConvertTo-Json -Compress
+        # Drop the problematic context but preserve workbook fields and known correlation.
+        # Serialize only scalar strings here, independently of the caller's requested depth.
+        $fallbackEntry = [ordered]@{
+            timestamp = (Get-Date).ToString('o')
+            level = 'Error'
+            section = $Section
+            message = 'Failed to serialize log entry'
+            originalMessage = $Message
+            serializationError = $_.Exception.Message
+        }
+        if (-not [string]::IsNullOrWhiteSpace($effectiveCorrelationId)) {
+            $fallbackEntry.correlationId = $effectiveCorrelationId
+        }
+        # Preserve the independently discovered job even if custom context cannot serialize.
+        if (-not [string]::IsNullOrWhiteSpace($executionJobId)) {
+            $fallbackEntry.jobId = $executionJobId
+        }
+        $json = $fallbackEntry | ConvertTo-Json -Compress
     }
 
     switch ($Level) {
@@ -474,7 +520,11 @@ function New-CertLCNotificationDetailsHtml {
     Optional exception text. Supplying a nonblank value selects the error template.
 
 .PARAMETER JobId
-    Optional Automation job identifier added to the footer for correlation.
+    Optional actual Automation execution identifier, labelled separately in the footer.
+
+.PARAMETER CorrelationId
+    Optional event ID. Emails fall back to parsed event identity from either input path,
+    independently of log routing; absent identity is displayed as Unavailable, never a job ID.
 
 .OUTPUTS
     A complete HTML document suitable for Send-NotificationEmail.
@@ -486,7 +536,8 @@ function New-CertLCNotificationBody {
         [Parameter(Mandatory)][string]$Summary,
         [Parameter()][System.Collections.IDictionary]$Details,
         [Parameter()][string]$ErrorDetails,
-        [Parameter()][string]$JobId
+        [Parameter()][string]$JobId,
+        [Parameter()][string]$CorrelationId
     )
 
     $template = if ([string]::IsNullOrWhiteSpace($ErrorDetails)) {
@@ -496,13 +547,36 @@ function New-CertLCNotificationBody {
         $CertificateErrorEmailBodyHtml
     }
     $footer = 'Automated message &bull; CERTLC'
+    # Keep the execution identifier separate from the correlation row in the main details.
     if (-not [string]::IsNullOrWhiteSpace($JobId)) {
-        $footer += ' &bull; Job ' + (ConvertTo-CertLCHtmlText -Value $JobId)
+        $footer += '<br />Automation Job ID: <span style="word-break:break-all;">' + (ConvertTo-CertLCHtmlText -Value $JobId) + '</span>'
+    }
+    # Resolve logging correlation first, then the parsed event ID for direct webhook emails.
+    # This email-only fallback does not alter the stricter input-path rule used by log records.
+    if ([string]::IsNullOrWhiteSpace($CorrelationId)) {
+        $correlationVariable = Get-Variable -Name CertLCCorrelationId -Scope Script -ErrorAction Ignore
+        $CorrelationId = if ($null -ne $correlationVariable) { [string]$correlationVariable.Value } else { '' }
+    }
+    if ([string]::IsNullOrWhiteSpace($CorrelationId)) {
+        $eventVariable = Get-Variable -Name requestEventId -Scope Script -ErrorAction Ignore
+        if ($null -ne $eventVariable -and $eventVariable.Value -is [string]) {
+            $CorrelationId = $eventVariable.Value
+        }
+    }
+    # Always display correlation prominently in both templates, even for early error emails.
+    # Copy details without mutating the caller or allowing custom details to replace identity.
+    $emailDetails = [ordered]@{
+        'Correlation ID' = if ([string]::IsNullOrWhiteSpace($CorrelationId)) { 'Unavailable (no valid event ID)' } else { $CorrelationId }
+    }
+    if ($Details) {
+        foreach ($detail in $Details.GetEnumerator()) {
+            if ($detail.Key -ine 'Correlation ID') { $emailDetails[$detail.Key] = $detail.Value }
+        }
     }
 
     $body = $template.Replace('__TITLE__', (ConvertTo-CertLCHtmlText -Value $Title))
     $body = $body.Replace('__SUMMARY__', (ConvertTo-CertLCHtmlText -Value $Summary))
-    $body = $body.Replace('__DETAILS__', (New-CertLCNotificationDetailsHtml -Details $Details))
+    $body = $body.Replace('__DETAILS__', (New-CertLCNotificationDetailsHtml -Details $emailDetails))
     $body = $body.Replace('__ERROR_DETAILS__', (ConvertTo-CertLCHtmlText -Value $ErrorDetails))
     return $body.Replace('__FOOTER__', $footer)
 }
@@ -575,7 +649,7 @@ function Send-SuccessNotification {
         The section or context of the error (e.g., function name).
 
     .PARAMETER CorrelationId
-        An optional correlation ID to include in the log.
+        An optional nonblank override; blank values inherit the runbook's effective correlation.
 
     .PARAMETER InnerException
         An optional inner exception to include in the log and wrap in the thrown exception.
@@ -660,12 +734,14 @@ function Write-CertLCLogAndThrow {
         # dynamically so StrictMode does not turn error notification into a second error.
         $jobVariable = Get-Variable -Name jobId -Scope Script -ErrorAction Ignore
         $notificationJobId = if ($null -ne $jobVariable) { [string]$jobVariable.Value } else { '' }
+        # Match the error log's explicit event override, or inherit parsed invocation correlation.
         $body = New-CertLCNotificationBody `
             -Title 'Certificate operation failed' `
             -Summary 'CERTLC could not complete the requested certificate operation.' `
             -Details $notificationDetails `
             -ErrorDetails $errorDetails `
-            -JobId $notificationJobId
+            -JobId $notificationJobId `
+            -CorrelationId $CorrelationId
         Send-NotificationEmail -SmtpServer $SmtpServer -FromAddress $FromAddress -To $NotifyTo -Subject $subject -Body $body -SmtpCredential $SmtpCredential
     }
     elseif ($NotifyTo -and [string]::IsNullOrEmpty($SmtpServer)) {
@@ -2934,31 +3010,16 @@ function New-CertificateRevocationRequest {
 # DISPATCHER  #
 ###############
 
-# Connect to Azure using the Automation Account's identity.
-# Ensures we do not inherit an AzContext, since we are using a system-assigned identity for login
-$null = Disable-AzContextAutosave -Scope Process
-Write-CertLCLog -Section 'Dispatcher' -Message 'Connecting to Azure using default identity...'
-try {
-    $AzureConnection = (Connect-AzAccount -Identity).context
-}
-catch {
-    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'There is no system-assigned user identity.' -Inner $_.Exception
-}
-
-# set context
-Set-AzContext -SubscriptionId $AzureConnection.Subscription.Id -DefaultProfile $AzureConnection | Out-Null
-
-# Require a Hybrid Runbook Worker and resolve its current Automation job ID.
+# Reject unsupported hosts before Azure authentication. Automation captures runbook streams
+# without Connect-AzAccount; supplied correlation is already available to the logger.
+# Resolve the actual job ID locally even when an external correlation ID was supplied.
 # https://rakhesh.com/azure/psprivatemetadata-is-system-collections-hashtabl/
 
-if ($env:AZUREPS_HOST_ENVIRONMENT -eq 'AzureAutomation/') {
-    Write-CertLCLog -Section 'Dispatcher' -Message "Hybrid Runbook Worker confirmed: $($env:COMPUTERNAME)."
-}
-elseif ($env:AZUREPS_HOST_ENVIRONMENT -eq 'AzureAutomation') {
+if ($env:AZUREPS_HOST_ENVIRONMENT -eq 'AzureAutomation') {
     # Azure Automation sandbox: not supported (we require the hybrid worker for CA access).
     Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'Runbook running in Azure Automation sandbox. This runbook must be executed by a hybrid worker instead!'
 }
-else {
+elseif ($env:AZUREPS_HOST_ENVIRONMENT -ne 'AzureAutomation/') {
     # We are in a local environment - not supported anymore because we cannot get the encrypted variables from the automation account in this case
     Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'Runbook running in a local environment. This runbook must be executed by a hybrid worker instead!'
 }
@@ -2983,14 +3044,19 @@ if (-not [guid]::TryParse($env:PSPrivateMetadata, [ref]$parsedJobId) -or $parsed
     # complete GUID format and reject matches that are merely prefixes of longer identifiers.
     $jobIdPattern = '(?i)\bjobId\s*=\s*(?<JobId>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?![0-9a-f-])'
 
-    # Stop if the trace cannot be read. Scan all matches and normalize them to GUID values
+    # Log and stop if the trace cannot be read. Scan all matches and normalize GUID values
     # before deduplication, since repeated entries for the same job are not ambiguous.
     # The array wrapper preserves Count/index access for zero, one, or multiple distinct IDs.
-    $traceJobIds = @(Get-Content -LiteralPath $tracePath -ErrorAction Stop | ForEach-Object {
-        foreach ($jobMatch in [regex]::Matches($_, $jobIdPattern)) {
-            [guid]$jobMatch.Groups['JobId'].Value
-        }
-    } | Sort-Object -Unique)
+    try {
+        $traceJobIds = @(Get-Content -LiteralPath $tracePath -ErrorAction Stop | ForEach-Object {
+            foreach ($jobMatch in [regex]::Matches($_, $jobIdPattern)) {
+                [guid]$jobMatch.Groups['JobId'].Value
+            }
+        } | Sort-Object -Unique)
+    }
+    catch {
+        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'Cannot determine the Automation job ID: unable to read the current sandbox trace.' -InnerException $_.Exception
+    }
 
     # Fail before certificate operations if identity is missing, empty, or ambiguous rather
     # than recording a guessed ID in certificate audit tags or notification details.
@@ -3007,6 +3073,11 @@ if (-not [guid]::TryParse($env:PSPrivateMetadata, [ref]$parsedJobId) -or $parsed
 # Preserve the canonical GUID string expected by existing tag and notification callers.
 $jobId = $parsedJobId.ToString('D')
 
+# The logger now includes jobId independently; correlation remains absent until event parsing.
+# Delay the positive host message until execution identity is available for all normal
+# startup records. Rejections above still log immediately without inventing an identifier.
+Write-CertLCLog -Section 'Dispatcher' -Message "Hybrid Runbook Worker confirmed: $($env:COMPUTERNAME)."
+
 # Emit a readable ID followed by structured diagnostic details through the existing logger.
 # The source, worker, runtime, and host marker help diagnose future worker behavior changes.
 Write-CertLCLog -Section 'Dispatcher' -Message "Automation Job ID: $jobId"
@@ -3017,6 +3088,25 @@ Write-CertLCLog -Section 'Dispatcher' -Message ([ordered]@{
     PowerShellVersion = $PSVersionTable.PSVersion.ToString()
     HostEnvironment = $env:AZUREPS_HOST_ENVIRONMENT
 } | ConvertTo-Json -Compress)
+
+# Authenticate only after local identity discovery. Existing log consumers retain their
+# fields/streams, while authentication failures carry jobId without event correlation.
+$null = Disable-AzContextAutosave -Scope Process
+Write-CertLCLog -Section 'Dispatcher' -Message 'Connecting to Azure using default identity...'
+try {
+    $AzureConnection = (Connect-AzAccount -Identity).context
+}
+catch {
+    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'There is no system-assigned user identity.' -Inner $_.Exception
+}
+
+# Context selection can fail independently of login; preserve structured failure logging.
+try {
+    Set-AzContext -SubscriptionId $AzureConnection.Subscription.Id -DefaultProfile $AzureConnection | Out-Null
+}
+catch {
+    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'Unable to select the Azure subscription context.' -InnerException $_.Exception
+}
 
 # Get the runbook variables from the Automation Account
 # Since they are encrypted, we must use the internal cmdlet Get-AutomationVariable to retrieve them, not Get-AzAutomationVariable
@@ -3089,7 +3179,10 @@ $smtpArgs = @{
 }
 
 # Check if we have the jsonRequestBody parameter
-if ([string]::IsNullOrEmpty($jsonRequestBody)) {
+# Capture the original input path before the legacy webhook parser reuses jsonRequestBody.
+# This is a routing distinction, not an authenticated assertion of the caller's identity.
+$usesJsonRequestBody = -not [string]::IsNullOrEmpty($jsonRequestBody)
+if (-not $usesJsonRequestBody) {
 
     # No explicit jsonRequestBody parameter, so we will use WebhookData
 
@@ -3111,9 +3204,10 @@ if ([string]::IsNullOrEmpty($jsonRequestBody)) {
 
     #>
 
-    # Try to parse WebhookData as JSON first
+    # Accept a native webhook envelope or its JSON representation. Keep the existing
+    # malformed PowerShell webhook fallback below for envelopes that are not valid JSON.
     try {
-        $request = ConvertFrom-Json -InputObject $WebhookData
+        $request = if ($WebhookData -is [string]) { ConvertFrom-Json -InputObject $WebhookData -Depth 10 } else { $WebhookData }
         $requestBody = $request.RequestBody
     }
     catch {
@@ -3166,7 +3260,39 @@ else {
     }
 }
 
-# now that we have a valid requestBody object, check some fields and detect request type
+# Valid webhook envelopes commonly contain RequestBody as a JSON string. Normalize it
+# before reading identity so native, JSON, and legacy webhook paths share one contract.
+if ($requestBody -is [string]) {
+    try {
+        $requestBody = ConvertFrom-Json -InputObject $requestBody -Depth 10
+    }
+    catch {
+        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'Failed to parse request body as JSON' -Inner $_.Exception
+    }
+}
+
+# Read optional top-level identity safely under StrictMode. Never coerce numbers/objects
+# into event IDs or use data.Id; absent event identity must never become job correlation.
+$requestEventId = $null
+$requestEventSource = ''
+if ($requestBody -is [System.Collections.IDictionary]) {
+    $requestEventId = $requestBody['id']
+    $requestEventSource = [string]$requestBody['source']
+}
+elseif ($null -ne $requestBody) {
+    $eventIdProperty = $requestBody.PSObject.Properties['id']
+    $eventSourceProperty = $requestBody.PSObject.Properties['source']
+    if ($null -ne $eventIdProperty) { $requestEventId = $eventIdProperty.Value }
+    if ($null -ne $eventSourceProperty) { $requestEventSource = [string]$eventSourceProperty.Value }
+}
+# Only the explicit JSON input path contributes event correlation. Webhook IDs can still
+# be shown in the request diagnostic below without becoming the correlation field.
+$hasRequestEventId = $requestEventId -is [string] -and -not [string]::IsNullOrWhiteSpace($requestEventId)
+if ($usesJsonRequestBody -and $hasRequestEventId) {
+    $script:CertLCCorrelationId = $requestEventId
+}
+
+# Now that the payload identity is known, validation and operation logs share correlation.
 
 # check version
 if ([string]::IsNullOrEmpty($requestBody.specversion)) {
@@ -3186,11 +3312,12 @@ else {
     Write-CertLCLog -Section 'Dispatcher' -Message "request type: $($requestBody.type)"
 }
 
-if ([string]::IsNullOrEmpty($requestBody.id)) {
+if (-not $hasRequestEventId) {
     Write-CertLCLog -Section 'Dispatcher' -Message "request id: (not provided)" -Level 'Warning'
 }
 else {
-    Write-CertLCLog -Section 'Dispatcher' -Message "request id: $($requestBody.id)"
+    # The logger adds jobId; webhook request diagnostics do not opt into correlation.
+    Write-CertLCLog -Section 'Dispatcher' -Message "request id: $requestEventId" -Context @{ eventSource = $requestEventSource }
 }
 
 # Process requests based on type
@@ -3212,7 +3339,7 @@ switch ($requestBody.type) {
         # Key Vault and Active Directory values have been retrieved and validated.
         $script:CertificateNotificationContext = [ordered]@{
             Operation          = 'Renewal'
-            'Event ID'         = $requestBody.id
+            # The shared renderer adds the Correlation ID row for every email type.
             'Request ID'       = $requestBody.data.Id
             'Key Vault'        = $VaultName
             'Certificate name' = $CertificateName
@@ -3378,7 +3505,7 @@ switch ($requestBody.type) {
             'PFX size'                  = "$($creationResult.PfxSizeBytes) bytes"
             'PFX certificate count'     = $creationResult.ChainCertificateCount
             'PFX protection principals' = $creationResult.PfxProtectTo
-            'Event ID'                  = $requestBody.id
+            # The shared renderer adds the Correlation ID row for every email type.
             'Request ID'                = $requestBody.data.Id
         }
         # send notification email if requested and SMTP is configured
@@ -3416,7 +3543,7 @@ switch ($requestBody.type) {
         # error email. Normalized values replace selected fields as validation succeeds below.
         $script:CertificateNotificationContext = [ordered]@{
             Operation          = 'Creation'
-            'Event ID'         = $requestBody.id
+            # The shared renderer adds the Correlation ID row for every email type.
             'Request ID'       = $requestBody.data.Id
             'Key Vault'        = $VaultName
             'Certificate name' = $CertificateName
@@ -3540,7 +3667,7 @@ switch ($requestBody.type) {
             'PFX size'                  = "$($creationResult.PfxSizeBytes) bytes"
             'PFX certificate count'     = $creationResult.ChainCertificateCount
             'PFX protection principals' = $creationResult.PfxProtectTo
-            'Event ID'                  = $requestBody.id
+            # The shared renderer adds the Correlation ID row for every email type.
             'Request ID'                = $requestBody.data.Id
         }
         # send notification email if requested and SMTP is configured
@@ -3573,7 +3700,7 @@ switch ($requestBody.type) {
         # lookup failures retain enough context for an actionable error notification.
         $script:CertificateNotificationContext = [ordered]@{
             Operation                = 'Revocation'
-            'Event ID'               = $requestBody.id
+            # The shared renderer adds the Correlation ID row for every email type.
             'Request ID'             = $requestBody.data.Id
             'Key Vault'              = $VaultName
             Thumbprint               = $CertificateThumbprint
@@ -3718,7 +3845,7 @@ switch ($requestBody.type) {
             'Latest version'    = $IsLatestVersion
             'Revocation reason' = "$revocationReasonName ($RevocationReason)"
             'Revoked at (UTC)'  = $revocationResult.RevokedAt
-            'Event ID'          = $requestBody.id
+            # The shared renderer adds the Correlation ID row for every email type.
             'Request ID'        = $requestBody.data.Id
         }
         # send notification email if requested and SMTP is configured
