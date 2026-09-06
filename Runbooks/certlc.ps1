@@ -1,8 +1,7 @@
 #Requires -PSEdition Core
+# Only these modules own the Az commands used by this runbook.
 using module Az.Accounts
 using module Az.KeyVault
-using module Az.Storage
-using module Az.Resources
 
 ##########
 # CERTLC #
@@ -146,7 +145,8 @@ $ErrorActionPreference = 'Stop'
 # STATIC SETTINGS AND GLOBAL VARS #
 ###################################
 
-$Version = '1.0'    # version of the script - must match specversion in the webhook body
+# CloudEvents envelope contract, not the runbook release version.
+$CloudEventSpecVersion = '1.0'
 
 # Correlation stays unknown until the Function-path payload supplies a valid event id.
 # Keep invocation state distinct from the logging helpers' optional override parameters.
@@ -269,13 +269,6 @@ $script:CertificateNotificationContext = [ordered]@{}
 #>
 
 function Write-CertLCLog {
-    <#
-        .SYNOPSIS
-            Emit a structured JSON log entry
-        .DESCRIPTION
-            Writes a single-line JSON object with standard fields plus optional custom context.
-
-    #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Message,
@@ -315,6 +308,7 @@ function Write-CertLCLog {
         $entry.jobId = $executionJobId
     }
 
+    # Preserve logger-owned identity fields when callers supply overlapping context keys.
     if ($Context) {
         foreach ($k in $Context.Keys) {
             $v = $Context[$k]
@@ -431,11 +425,11 @@ function Send-NotificationEmail {
 
 #endregion
 
-#region ### Send-SuccessNotification ###
+#region ### ConvertTo-CertLCHtmlText ###
 
-#########################################
-# FUNCTIONS - Send-SuccessNotification  #
-#########################################
+########################################
+# FUNCTIONS - ConvertTo-CertLCHtmlText #
+########################################
 
 <#
 .SYNOPSIS
@@ -463,6 +457,14 @@ function ConvertTo-CertLCHtmlText {
     return $encodedValues -join '<br />'
 }
 
+#endregion
+
+#region ### New-CertLCNotificationDetailsHtml ###
+
+#################################################
+# FUNCTIONS - New-CertLCNotificationDetailsHtml #
+#################################################
+
 <#
 .SYNOPSIS
     Render an ordered notification detail dictionary as email-compatible table rows.
@@ -486,6 +488,7 @@ function New-CertLCNotificationDetailsHtml {
         return '<tr><td style="padding:10px 12px;color:#5a6b7b;">No additional details are available.</td></tr>'
     }
 
+    # Omit absent optional values, then encode labels and values before inserting HTML.
     $rows = foreach ($entry in $Details.GetEnumerator()) {
         if ($null -eq $entry.Value -or
             ($entry.Value -is [string] -and [string]::IsNullOrWhiteSpace($entry.Value)) -or
@@ -498,6 +501,66 @@ function New-CertLCNotificationDetailsHtml {
     }
     return $rows -join ''
 }
+
+#endregion
+
+#region ### New-CertLCCreationNotificationDetails ###
+
+#####################################################
+# FUNCTIONS - New-CertLCCreationNotificationDetails #
+#####################################################
+
+<#
+.SYNOPSIS
+    Map a completed creation or renewal result to ordered success-notification details.
+
+.DESCRIPTION
+    Reports committed certificate and PFX values. Rendering and correlation remain owned
+    by the shared notification renderer; RequestId is supplied explicitly by the caller.
+#>
+function New-CertLCCreationNotificationDetails {
+    [OutputType([System.Collections.Specialized.OrderedDictionary])]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object]$OperationResult,
+        [Parameter(Mandatory = $true)][ValidateSet('Creation', 'Renewal')][string]$Operation,
+        [Parameter()][AllowNull()][object]$RequestId
+    )
+
+    # Preserve the existing email field order, raw values, and timestamp formatting.
+    return [ordered]@{
+        Operation                   = $Operation
+        'Certificate name'          = $OperationResult.CertificateName
+        Subject                     = $OperationResult.Subject
+        'DNS names'                 = $OperationResult.DnsNames
+        Template                    = $OperationResult.TemplateName
+        Thumbprint                  = $OperationResult.Thumbprint
+        'Serial number'             = $OperationResult.SerialNumber
+        Issuer                      = $OperationResult.Issuer
+        # Keep validity and persisted-version fields together for operational comparison.
+        'Valid from (UTC)'          = $OperationResult.NotBeforeUtc.ToString('yyyy-MM-dd HH:mm:ss')
+        'Valid until (UTC)'         = $OperationResult.NotAfterUtc.ToString('yyyy-MM-dd HH:mm:ss')
+        'Key Vault'                 = $OperationResult.VaultName
+        'Key Vault version'         = $OperationResult.CertificateVersion
+        Hostname                    = $OperationResult.Hostname
+        # These artifact details describe the verified export, not the requested destination.
+        'PFX filename'              = $OperationResult.PfxFileName
+        'PFX path'                  = $OperationResult.PfxPath
+        'PFX size'                  = "$($OperationResult.PfxSizeBytes) bytes"
+        'PFX certificate count'     = $OperationResult.ChainCertificateCount
+        'PFX protection principals' = $OperationResult.PfxProtectTo
+        # The shared renderer adds the Correlation ID row for every email type.
+        'Request ID'                = $RequestId
+    }
+}
+
+#endregion
+
+#region ### New-CertLCNotificationBody ###
+
+##########################################
+# FUNCTIONS - New-CertLCNotificationBody #
+##########################################
 
 <#
 .SYNOPSIS
@@ -542,6 +605,7 @@ function New-CertLCNotificationBody {
         [Parameter()][string]$CorrelationId
     )
 
+    # Select the failure template only for substantive errors; blank details mean success.
     $template = if ([string]::IsNullOrWhiteSpace($ErrorDetails)) {
         $CertificateNotificationEmailBodyHtml
     }
@@ -577,6 +641,7 @@ function New-CertLCNotificationBody {
         }
     }
 
+    # Only the renderer's table markup bypasses scalar encoding during template expansion.
     $body = $template.Replace('__TITLE__', (ConvertTo-CertLCHtmlText -Value $Title))
     $body = $body.Replace('__SUMMARY__', (ConvertTo-CertLCHtmlText -Value $Summary))
     $body = $body.Replace('__DETAILS__', (New-CertLCNotificationDetailsHtml -Details $emailDetails))
@@ -584,7 +649,14 @@ function New-CertLCNotificationBody {
     return $body.Replace('__FOOTER__', $footer)
 }
 
-# Shared success-email helper used by the dispatcher success paths (creation/renewal/revocation).
+#endregion
+
+#region ### Send-SuccessNotification ###
+
+########################################
+# FUNCTIONS - Send-SuccessNotification #
+########################################
+
 <#
 .SYNOPSIS
     Send a rendered success notification for a completed certificate operation.
@@ -617,6 +689,7 @@ function Send-SuccessNotification {
         [Parameter()][pscredential]$SmtpCredential
     )
 
+    # Delivery is optional and must not invalidate an already committed certificate operation.
     if (-not $NotifyTo) { return }
     if ([string]::IsNullOrEmpty($SmtpServer)) {
         Write-CertLCLog -Section $Section -Level 'Warning' -Message 'Notification requested but SMTP is not configured. Skipping email notification.'
@@ -699,6 +772,29 @@ function Write-CertLCLogAndThrow {
         [Parameter()][pscredential]$SmtpCredential
     )
 
+    #region ### Convert-ExceptionToObject ###
+
+    #########################################
+    # FUNCTIONS - Convert-ExceptionToObject #
+    #########################################
+
+    <#
+    .SYNOPSIS
+        Flatten an exception into bounded, JSON-friendly diagnostic fields.
+
+    .DESCRIPTION
+        Keeps exception type, message, HRESULT, and stack trace without serializing the
+        full exception graph. Remains local to the terminating-error logging helper.
+
+    .PARAMETER Exception
+        Exception to describe. A null value returns null.
+
+    .PARAMETER MaxDepth
+        Maximum number of inner-exception levels to include; defaults to two.
+
+    .OUTPUTS
+        Ordered dictionary of diagnostic fields, or null when no exception is supplied.
+    #>
     function Convert-ExceptionToObject {
         param([System.Exception]$Exception, [int]$MaxDepth = 2)
         if (-not $Exception) { return $null }
@@ -711,6 +807,9 @@ function Write-CertLCLogAndThrow {
         return $o
     }
 
+    #endregion
+
+    # Copy caller context before attaching diagnostics; never mutate the caller's dictionary.
     $ctx = @{}
     if ($Context) { $ctx = @{} + $Context }
     if ($InnerException) { $ctx.exception = Convert-ExceptionToObject -Exception $InnerException }
@@ -752,6 +851,7 @@ function Write-CertLCLogAndThrow {
         Write-CertLCLog -Level 'Warning' -Message "Error notification requested but SMTP is not configured. Skipping email notification." -Section $Section
     }
 
+    # Record the original failure after any best-effort notification attempt.
     Write-CertLCLog -Level 'Error' -Message $Message -Section $Section -CorrelationId $CorrelationId -Context $ctx
 
     # Throw a terminating exception
@@ -765,9 +865,9 @@ function Write-CertLCLogAndThrow {
 
 #region ### Invoke-WithRetry ###
 
-##############################
+################################
 # FUNCTIONS - Invoke-WithRetry #
-##############################
+################################
 
 <#
 .SYNOPSIS
@@ -825,6 +925,7 @@ function Invoke-WithRetry {
             $respProp = $ex.PSObject.Properties['Response']
             if ($null -ne $respProp -and $null -ne $respProp.Value) {
                 try { $statusCode = [int]$respProp.Value.StatusCode } catch { $statusCode = $null }
+                # Retry-After is optional; malformed headers must not mask the original error.
                 try {
                     $ra = $respProp.Value.Headers.RetryAfter
                     if ($null -ne $ra -and $null -ne $ra.Delta) {
@@ -847,11 +948,12 @@ function Invoke-WithRetry {
                 $shouldRetry = $true
             }
 
+            # Exhaustion and non-transient failures retain their original exception identity.
             if (-not $shouldRetry -or $isLastAttempt) {
                 throw
             }
 
-            # Backoff: Retry-After if present, otherwise exponential with jitter capped at 30s.
+            # Cap a positive Retry-After at 30s; otherwise cap the exponential base before jitter.
             if ($null -ne $retryAfterMs -and $retryAfterMs -gt 0) {
                 $delayMs = [Math]::Min($retryAfterMs, 30000)
             }
@@ -860,6 +962,7 @@ function Invoke-WithRetry {
                 $delayMs += (Get-Random -Minimum 0 -Maximum $InitialDelayMs)
             }
 
+            # Emit the selected delay before sleeping so retry latency remains diagnosable.
             $statusInfo = if ($null -ne $statusCode) { "HTTP $statusCode" } else { $ex.GetType().Name }
             Write-CertLCLog -Section $Section -Level 'Warning' -Message "[$OperationName] Attempt $attempt of $($MaxAttempts) failed ($statusInfo): $($ex.Message). Retrying after $([int]$delayMs)ms..."
             Start-Sleep -Milliseconds ([int]$delayMs)
@@ -871,9 +974,9 @@ function Invoke-WithRetry {
 
 #region ### Format-PfxProtectTo ###
 
-####################################
-# FUNCTIONS - Format-PfxProtectTo  #
-####################################
+###################################
+# FUNCTIONS - Format-PfxProtectTo #
+###################################
 
 <#
 
@@ -1035,9 +1138,9 @@ function Convert-PfxProtectToFromTag {
 
 #region ### Initialize-PfxExportTarget ###
 
-############################################
-# FUNCTIONS - Initialize-PfxExportTarget   #
-############################################
+##########################################
+# FUNCTIONS - Initialize-PfxExportTarget #
+##########################################
 
 <#
 .SYNOPSIS
@@ -1152,6 +1255,7 @@ function Initialize-PfxExportTarget {
             $null = $acl.RemoveAccessRule($rule)
         }
 
+        # Administrators and SYSTEM manage exports; protected recipients receive read access only.
         $inheritFlags = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
         $propagationFlags = [System.Security.AccessControl.PropagationFlags]::None
         $fullControlSids = @(
@@ -1164,6 +1268,7 @@ function Initialize-PfxExportTarget {
             )
             $acl.AddAccessRule($accessRule)
         }
+        # Apply recipient permissions to this folder and to subsequently exported files.
         foreach ($sid in $protectionSids) {
             $accessRule = [System.Security.AccessControl.FileSystemAccessRule]::new(
                 $sid, 'ReadAndExecute', $inheritFlags, $propagationFlags, 'Allow'
@@ -1183,6 +1288,7 @@ function Initialize-PfxExportTarget {
             4096,
             [System.IO.FileOptions]::DeleteOnClose
         )
+        # Force the probe to disk, then release it even if the write or flush fails.
         try {
             $probeStream.WriteByte(0)
             $probeStream.Flush($true)
@@ -1190,6 +1296,7 @@ function Initialize-PfxExportTarget {
         finally {
             $probeStream.Dispose()
         }
+        # A surviving probe means delete rights are insufficient for this export location.
         if ([System.IO.File]::Exists($probePath)) {
             throw [System.IO.IOException]::new("Preflight probe file '$probePath' was not deleted on close.")
         }
@@ -1209,11 +1316,11 @@ function Initialize-PfxExportTarget {
 
 #endregion
 
-#region ### Certificate chain helpers ###
+#region ### Test-DistinguishedNameEqual ###
 
-#########################################
-# FUNCTIONS - Certificate chain helpers #
-#########################################
+###########################################
+# FUNCTIONS - Test-DistinguishedNameEqual #
+###########################################
 
 <#
 .SYNOPSIS
@@ -1242,6 +1349,14 @@ function Test-DistinguishedNameEqual {
 
     return [Convert]::ToBase64String($Left.RawData) -ceq [Convert]::ToBase64String($Right.RawData)
 }
+
+#endregion
+
+#region ### ConvertFrom-Base64Pkcs7 ###
+
+#######################################
+# FUNCTIONS - ConvertFrom-Base64Pkcs7 #
+#######################################
 
 <#
 .SYNOPSIS
@@ -1301,6 +1416,14 @@ function ConvertFrom-Base64Pkcs7 {
     Write-Output -NoEnumerate $collection
 }
 
+#endregion
+
+#region ### Get-OrderedCertificateChain ###
+
+###########################################
+# FUNCTIONS - Get-OrderedCertificateChain #
+###########################################
+
 <#
 .SYNOPSIS
     Order a certificate collection from leaf to self-issued root.
@@ -1352,6 +1475,7 @@ function Get-OrderedCertificateChain {
                 $null -eq $basicConstraints -or -not $basicConstraints.CertificateAuthority
             }
         })
+    # Ambiguous or absent leaves are unsafe even if individual certificates are valid.
     if ($leafCandidates.Count -ne 1) {
         throw [System.Exception]::new("Get-OrderedCertificateChain: Expected exactly one leaf certificate in $Source; found $($leafCandidates.Count).")
     }
@@ -1365,6 +1489,7 @@ function Get-OrderedCertificateChain {
         }
     }
 
+    # Walk from the unique leaf until a self-issued endpoint is reached.
     $ordered = [System.Collections.Generic.List[System.Security.Cryptography.X509Certificates.X509Certificate2]]::new()
     $current = $leafCandidates[0]
     while ($null -ne $current) {
@@ -1388,6 +1513,7 @@ function Get-OrderedCertificateChain {
         $null = $remaining.Remove($current)
     }
 
+    # Reject unrelated certificates and incomplete chains before optionally stripping the root.
     if ($remaining.Count -gt 0) {
         throw [System.Exception]::new("Get-OrderedCertificateChain: $Source contains $($remaining.Count) certificate(s) outside the leaf's issuer chain.")
     }
@@ -1395,6 +1521,7 @@ function Get-OrderedCertificateChain {
         throw [System.Exception]::new("Get-OrderedCertificateChain: $Source does not terminate in a self-issued root certificate.")
     }
 
+    # Export policy still requires at least one intermediate after removing the trust anchor.
     if ($ExcludeRoot) {
         $ordered.RemoveAt($ordered.Count - 1)
         if ($ordered.Count -lt 2) {
@@ -1405,6 +1532,14 @@ function Get-OrderedCertificateChain {
     # Prevent output-pipeline enumeration so a one-item result remains an array for strict mode.
     Write-Output -NoEnumerate $ordered.ToArray()
 }
+
+#endregion
+
+#region ### Assert-CertificateSet ###
+
+#####################################
+# FUNCTIONS - Assert-CertificateSet #
+#####################################
 
 <#
 .SYNOPSIS
@@ -1447,6 +1582,14 @@ function Assert-CertificateSet {
     }
 }
 
+#endregion
+
+#region ### Assert-CertificateChain ###
+
+#######################################
+# FUNCTIONS - Assert-CertificateChain #
+#######################################
+
 <#
 .SYNOPSIS
     Cryptographically validate an ordered certificate chain without network retrieval.
@@ -1482,6 +1625,7 @@ function Assert-CertificateChain {
             }
         }
 
+        # Structural ordering alone is insufficient; verify certificate signatures and validity.
         if (-not $chain.Build($Certificates[0])) {
             $status = ($chain.ChainStatus.StatusInformation | ForEach-Object { $_.Trim() }) -join '; '
             throw [System.Exception]::new("Assert-CertificateChain: AD CS returned an invalid certificate chain: $status")
@@ -1494,11 +1638,11 @@ function Assert-CertificateChain {
 
 #endregion
 
-#region ### Key Vault certificate chain REST helpers ###
+#region ### Merge-KeyVaultCertificateChain ###
 
-##################################################
-# FUNCTIONS - Key Vault chain REST API helpers   #
-##################################################
+##############################################
+# FUNCTIONS - Merge-KeyVaultCertificateChain #
+##############################################
 
 <#
 .SYNOPSIS
@@ -1590,6 +1734,14 @@ function Merge-KeyVaultCertificateChain {
     return $response
 }
 
+#endregion
+
+#region ### Get-KeyVaultCertificateSecretValue ###
+
+##################################################
+# FUNCTIONS - Get-KeyVaultCertificateSecretValue #
+##################################################
+
 <#
 .SYNOPSIS
     Retrieve the PKCS#12 value for an exact Key Vault certificate secret version.
@@ -1636,6 +1788,7 @@ function Get-KeyVaultCertificateSecretValue {
     catch {
         throw [System.ArgumentException]::new("Get-KeyVaultCertificateSecretValue: Key Vault returned an invalid secret ID '$SecretId'.", 'SecretId', $_.Exception)
     }
+    # Reject alternate hosts, ports, and extra URI components before attaching the bearer token.
     $expectedHost = "$VaultName.vault.azure.net"
     if (-not $secretUri.IsAbsoluteUri -or
         $secretUri.Scheme -ine 'https' -or
@@ -1689,6 +1842,7 @@ function Get-KeyVaultCertificateSecretValue {
         throw [System.Exception]::new("Get-KeyVaultCertificateSecretValue: Secret '$SecretId' has content type '$actualContentType'; expected 'application/x-pkcs12'.")
     }
 
+    # A valid content-type marker alone does not guarantee usable certificate material.
     $valueProperty = if ($null -eq $secret) { $null } else { $secret.PSObject.Properties['value'] }
     if ($null -eq $valueProperty -or [string]::IsNullOrWhiteSpace([string]$valueProperty.Value)) {
         throw [System.Exception]::new("Get-KeyVaultCertificateSecretValue: Key Vault returned an empty value for versioned secret '$SecretId'.")
@@ -1814,7 +1968,8 @@ function Export-PfxWithGroupProtection {
             $password)
         $sourcePfxBuffer = [Runtime.InteropServices.Marshal]::AllocHGlobal($sourcePfxBytes.Length)
         [Runtime.InteropServices.Marshal]::Copy($sourcePfxBytes, 0, $sourcePfxBuffer, $sourcePfxBytes.Length)
-        $sourcePfx = New-Object CertLCPfxNative+BLOB
+        # Construct the interop value type directly; its native layout is unchanged.
+        $sourcePfx = [CertLCPfxNative+BLOB]::new()
         $sourcePfx.cbData = $sourcePfxBytes.Length
         $sourcePfx.pbData = $sourcePfxBuffer
         $store = [CertLCPfxNative]::PFXImportCertStore([ref]$sourcePfx, $password, 0x0001 -bor 0x8000)
@@ -1834,7 +1989,8 @@ function Export-PfxWithGroupProtection {
 
                 # PFXExportCertStoreEx follows the standard two-pass Win32 buffer pattern.
                 # Query size of PFX so that we know how much buffer to allocate (pass 1)
-                $blob = New-Object CertLCPfxNative+BLOB
+                # The size-query pass requires a zero-initialized native blob.
+                $blob = [CertLCPfxNative+BLOB]::new()
                 # Fail if any private key cannot be exported; include private keys and extended
                 # properties; and interpret pvPara as the NCrypt SID-protection descriptor.
                 $flags = 0x0002 -bor 0x0004 -bor 0x0010 -bor 0x0020  # REPORT_NOT_ABLE_TO_EXPORT_PRIVATE_KEY | EXPORT_PRIVATE_KEYS | INCLUDE_EXTENDED_PROPERTIES | PROTECT_TO_DOMAIN_SIDS
@@ -1858,7 +2014,8 @@ function Export-PfxWithGroupProtection {
                     $password = $null  # Release this reference; the managed string is not erased.
 
                     # save the file
-                    $bytes = New-Object byte[] $blob.cbData
+                    # Allocate the same zero-filled byte buffer using its typed constructor.
+                    $bytes = [byte[]]::new($blob.cbData)
                     [Runtime.InteropServices.Marshal]::Copy($blob.pbData, $bytes, 0, $blob.cbData)
                     [System.IO.File]::WriteAllBytes($PfxFile, $bytes)
                     Write-CertLCLog -Section 'Export-PfxWithGroupProtection' -Message "PFX exported to file: $PfxFile"
@@ -1936,7 +2093,8 @@ function Find-TemplateName {
         $configDN = $rootDse.configurationNamingContext
         $searchRoot = "LDAP://CN=Certificate Templates,CN=Public Key Services,CN=Services,$configDN"
         $entry = [ADSI]$searchRoot
-        $searcher = New-Object DirectoryServices.DirectorySearcher $entry
+        # Keep the explicit search root and existing caller-owned disposal boundary.
+        $searcher = [System.DirectoryServices.DirectorySearcher]::new($entry)
 
         # Escape the search value per RFC 4515 before interpolation into the LDAP filter.
         # Values may originate in request payloads or certificate metadata; neither is trusted
@@ -1969,9 +2127,9 @@ function Find-TemplateName {
 
 #region ### Get-CaRequestDiagnostic ###
 
-###########################################
-# FUNCTIONS - Get-CaRequestDiagnostic     #
-###########################################
+#######################################
+# FUNCTIONS - Get-CaRequestDiagnostic #
+#######################################
 
 <#
 .SYNOPSIS
@@ -2017,11 +2175,11 @@ function Get-CaRequestDiagnostic {
 
 #endregion
 
-#region ### New-CertificateCreationRequest ###
+#region ### Get-RecoverableKeyVaultCertificateOperation ###
 
-##############################################
-# FUNCTIONS - New-CertificateCreationRequest #
-##############################################
+###########################################################
+# FUNCTIONS - Get-RecoverableKeyVaultCertificateOperation #
+###########################################################
 
 <#
 .SYNOPSIS
@@ -2058,12 +2216,14 @@ function Get-RecoverableKeyVaultCertificateOperation {
         [Parameter()][ValidateRange(0, 30)][int]$DelaySeconds = 1
     )
 
+    # Reconcile using bounded reads only; never resubmit a possibly accepted creation request.
     for ($attempt = 1; $attempt -le $AttemptCount; $attempt++) {
         try {
             $operation = Get-AzKeyVaultCertificateOperation `
                 -VaultName $VaultName `
                 -Name $CertificateName `
                 -ErrorAction Stop
+            # Only a still-pending operation with a usable CSR can safely resume issuance.
             if ($null -ne $operation -and
                 $operation.Status -eq 'inProgress' -and
                 $operation.CertificateSigningRequest) {
@@ -2077,6 +2237,7 @@ function Get-RecoverableKeyVaultCertificateOperation {
                 -Message "KeyVault: Reconciliation attempt $attempt could not read certificate operation for $CertificateName in vault ${VaultName}: $($_.Exception.Message)"
         }
 
+        # Pause only between reads; the caller decides how to handle exhausted reconciliation.
         if ($attempt -lt $AttemptCount -and $DelaySeconds -gt 0) {
             Start-Sleep -Seconds $DelaySeconds
         }
@@ -2084,6 +2245,14 @@ function Get-RecoverableKeyVaultCertificateOperation {
 
     return $null
 }
+
+#endregion
+
+#region ### New-CertificateCreationRequest ###
+
+##############################################
+# FUNCTIONS - New-CertificateCreationRequest #
+##############################################
 
 <#
 .SYNOPSIS
@@ -2211,12 +2380,16 @@ function New-CertificateCreationRequest {
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
             Select-Object -Unique
         }
+        # Omit DnsName entirely when filtering leaves no names, preserving SDK defaults.
+        $policyParameters = @{
+            SecretContentType = 'application/x-pkcs12'
+            SubjectName       = $CertificateSubject
+            IssuerName        = 'Unknown'
+        }
         if ($effectiveDns) {
-            $Policy = New-AzKeyVaultCertificatePolicy -SecretContentType 'application/x-pkcs12' -SubjectName $CertificateSubject -IssuerName 'Unknown' -DnsName $effectiveDns
+            $policyParameters.DnsName = $effectiveDns
         }
-        else {
-            $Policy = New-AzKeyVaultCertificatePolicy -SecretContentType 'application/x-pkcs12' -SubjectName $CertificateSubject -IssuerName 'Unknown'
-        }
+        $Policy = New-AzKeyVaultCertificatePolicy @policyParameters
 
         # create the request in the key vault
         try {
@@ -2348,6 +2521,7 @@ function New-CertificateCreationRequest {
             catch {
                 throw [System.Exception]::new("New-CertificateCreationRequest: KeyVault returned an invalid certificate ID '$($mergedCertificate.id)'.", $_.Exception)
             }
+            # A returned URI must remain on the expected authenticated data-plane endpoint.
             if (-not $certificateUri.IsAbsoluteUri -or
                 $certificateUri.Scheme -ine 'https' -or
                 $certificateUri.Host -ine "$VaultName.vault.azure.net" -or
@@ -2357,6 +2531,7 @@ function New-CertificateCreationRequest {
                 throw [System.Exception]::new("New-CertificateCreationRequest: KeyVault returned an unexpected certificate ID '$($mergedCertificate.id)'.")
             }
 
+            # Pin later tag updates and export to the exact certificate version from this merge.
             $certificatePath = @($certificateUri.AbsolutePath.Trim('/').Split('/'))
             if ($certificatePath.Count -ne 3 -or
                 $certificatePath[0] -ine 'certificates' -or
@@ -2377,12 +2552,14 @@ function New-CertificateCreationRequest {
                     }
                 }
                 else {
+                    # REST deserialization may represent tags as properties rather than a dictionary.
                     foreach ($property in $mergedTagProperty.Value.PSObject.Properties) {
                         $mergedTags[$property.Name] = [string]$property.Value
                     }
                 }
             }
 
+            # Overlay request tags while retaining unrelated service-side metadata.
             $tagUpdateRequired = $false
             foreach ($tag in $tags.GetEnumerator()) {
                 if (-not $mergedTags.ContainsKey($tag.Key) -or $mergedTags[$tag.Key] -cne [string]$tag.Value) {
@@ -2579,6 +2756,7 @@ function New-CertificateCreationRequest {
             VaultName             = $VaultName
             CertificateVersion    = $certificateVersion
             TemplateName          = $CertificateTemplateName
+            # Snapshot public certificate fields before disposing the imported collection.
             Subject               = $leafCertificate.Subject
             DnsNames              = @($CertificateDnsNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
             Thumbprint            = $leafCertificate.Thumbprint
@@ -2586,6 +2764,7 @@ function New-CertificateCreationRequest {
             Issuer                = $leafCertificate.Issuer
             NotBeforeUtc          = $leafCertificate.NotBefore.ToUniversalTime()
             NotAfterUtc           = $leafCertificate.NotAfter.ToUniversalTime()
+            # Export details refer to the published file, not the temporary staging artifact.
             Hostname              = $Hostname
             PfxProtectTo          = @($PfxProtectTo)
             PfxFileName           = $pfxFileInfo.Name
@@ -2620,9 +2799,9 @@ function New-CertificateCreationRequest {
 
 #region ### Get-CertificateByThumbprint ###
 
-############################################
-# FUNCTIONS - Get-CertificateByThumbprint  #
-############################################
+###########################################
+# FUNCTIONS - Get-CertificateByThumbprint #
+###########################################
 
 <#
 
@@ -2679,8 +2858,8 @@ function Get-CertificateByThumbprint {
         [string]$Thumbprint
     )
 
-    # Normalize the input thumbprint (remove spaces, dashes, colons; convert to uppercase)
-    $normalizedThumbprint = ($Thumbprint -replace '[^a-fA-F0-9]', '').ToUpper()
+    # Thumbprints are identifiers: normalize hex casing independently of worker culture.
+    $normalizedThumbprint = ($Thumbprint -replace '[^a-fA-F0-9]', '').ToUpperInvariant()
 
     if ([string]::IsNullOrEmpty($normalizedThumbprint)) {
         throw [System.ArgumentException]::new('Get-CertificateByThumbprint: Thumbprint is empty after normalization.', 'Thumbprint')
@@ -2730,7 +2909,8 @@ function Get-CertificateByThumbprint {
 
         # Step 1: enumerate certificates (one entry per cert name; x5t is the LATEST version's thumbprint)
         # While iterating we also collect the certificate names so step 2 can fall back to per-cert version listings.
-        $certificateNames = New-Object 'System.Collections.Generic.List[string]'
+        # Retain a mutable typed list for the fallback version-enumeration pass.
+        $certificateNames = [System.Collections.Generic.List[string]]::new()
         $uri = "$vaultBaseUrl/certificates?api-version=$apiVersion"
 
         try {
@@ -2918,6 +3098,7 @@ function New-CertificateRevocationRequest {
         [string]$CA
     )
 
+    # Prefer the caller's exact-version public certificate; fetch it only when not supplied.
     $existingVersion = $null
     if (-not $PSBoundParameters.ContainsKey('Certificate')) {
         Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "KeyVault: Reading public certificate $CertificateName version $CertificateVersion from vault $VaultName..."
@@ -2931,6 +3112,7 @@ function New-CertificateRevocationRequest {
             $Certificate = $existingVersion.Certificate
         }
     }
+    # Refuse to revoke until both the serial and any caller-provided thumbprint are verified.
     if ($null -eq $Certificate -or [string]::IsNullOrWhiteSpace($Certificate.SerialNumber)) {
         throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Public certificate $CertificateName version $CertificateVersion is missing or has no serial number.")
     }
@@ -2938,6 +3120,7 @@ function New-CertificateRevocationRequest {
         throw [System.Exception]::new("New-CertificateRevocationRequest: Public certificate thumbprint does not match the requested thumbprint for $CertificateName version $CertificateVersion.")
     }
 
+    # Retain public metadata for the result without retrieving the certificate's private key.
     $serialNumber = $Certificate.SerialNumber
     $certificateSubject = $Certificate.Subject
     $certificateIssuer = $Certificate.Issuer
@@ -2958,6 +3141,7 @@ function New-CertificateRevocationRequest {
         throw [System.Exception]::new("New-CertificateRevocationRequest: CA: Error revoking certificate $CertificateName version $CertificateVersion (serial $serialNumber) in CA $CA", $_.Exception)
     }
     finally {
+        # Release COM ownership on either CA success or failure; callers still own certificates.
         if ($CertAdmin) {
             [void][Runtime.InteropServices.Marshal]::ReleaseComObject($CertAdmin)
             $CertAdmin = $null
@@ -2981,6 +3165,7 @@ function New-CertificateRevocationRequest {
         $sourceTags = $existingVersion.Tags
     }
     else {
+        # A missing tag snapshot needs one exact-version read before the replacement PATCH.
         try {
             $existingVersion = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -Version $CertificateVersion
         }
@@ -2997,6 +3182,7 @@ function New-CertificateRevocationRequest {
             $mergedTags[$k] = [string]$sourceTags[$k]
         }
     }
+    # Audit fields override older values, but all unrelated tags remain in the replacement set.
     $mergedTags['Revoked'] = 'true'
     $revokedAt = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
     $mergedTags['RevokedAt'] = $revokedAt
@@ -3015,6 +3201,7 @@ function New-CertificateRevocationRequest {
     }
     Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "KeyVault: Certificate $CertificateName version $CertificateVersion in key vault $($VaultName) has been disabled and tagged as revoked. The certificate object and other versions (if any) are left untouched."
 
+    # Return only public identity and committed audit metadata after both revocation steps.
     $operationResult = [pscustomobject]@{
         PSTypeName         = 'CertLC.CertificateRevocationResult'
         CertificateName    = $CertificateName
@@ -3024,6 +3211,7 @@ function New-CertificateRevocationRequest {
         Thumbprint         = $certificateThumbprint
         SerialNumber       = $serialNumber
         Issuer             = $certificateIssuer
+        # Validity remains certificate metadata; revocation fields describe this operation.
         NotBeforeUtc       = $certificateNotBeforeUtc
         NotAfterUtc        = $certificateNotAfterUtc
         RevocationReason   = $RevocationReason
@@ -3187,6 +3375,7 @@ else {
     if ([string]::IsNullOrEmpty($FromAddress)) {
         Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The automation account variable 'certlc-smtpserver' is set, but 'certlc-smtpfrom' is missing or empty. Both must be set to send email."
     }
+    # Partial SMTP credentials indicate configuration drift rather than anonymous delivery.
     $userSet = -not [string]::IsNullOrEmpty($SmtpUser)
     $passSet = -not [string]::IsNullOrEmpty($SmtpPassword)
     if ($userSet -xor $passSet) {
@@ -3204,6 +3393,7 @@ if (-not [string]::IsNullOrEmpty($SmtpServer)) {
         Write-CertLCLog -Section 'Dispatcher' -Message 'SMTP: Authentication will be used to send email.'
     }
     else {
+        # Anonymous SMTP is supported only when the relay allows this worker explicitly.
         Write-CertLCLog -Section 'Dispatcher' -Message 'SMTP: No authentication will be used to send email. Ensure the SMTP server allows unauthenticated email from this host!' -Level 'Warning'
     }
 }
@@ -3336,8 +3526,8 @@ if ($usesJsonRequestBody -and $hasRequestEventId) {
 if ([string]::IsNullOrEmpty($requestBody.specversion)) {
     Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "Missing or empty mandatory string parameter: 'specversion' in request body!"
 }
-if ($requestBody.specversion -ne $Version) {
-    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The version specified in the request, $($requestBody.specversion), does not match the script version $Version!"
+if ($requestBody.specversion -ne $CloudEventSpecVersion) {
+    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The CloudEvents specversion specified in the request, $($requestBody.specversion), does not match the supported specversion $CloudEventSpecVersion!"
 }
 else {
     Write-CertLCLog -Section 'Dispatcher' -Message "specversion: $($requestBody.specversion)"
@@ -3518,7 +3708,24 @@ switch ($requestBody.type) {
 
         $creationResult = $null
         try {
-            New-CertificateCreationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplateName $certificateTemplateName -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -Hostname $Hostname -PfxProtectTo $PfxProtectTo -NotifyTo $NotifyTo -RenewedJobId $jobId -Result ([ref]$creationResult) -PfxRootFolder $PfxRootFolder
+            # Keep renewal audit metadata and the reference result explicit in the call contract.
+            $creationParameters = @{
+                VaultName               = $VaultName
+                CertificateName         = $CertificateName
+                CertificateTemplateName = $certificateTemplateName
+                CertificateSubject      = $CertificateSubject
+                # Retain array-shaped request inputs and the explicit CA/export context.
+                CertificateDnsNames     = $CertificateDnsNames
+                CA                      = $CA
+                Hostname                = $Hostname
+                PfxProtectTo            = $PfxProtectTo
+                NotifyTo                = $NotifyTo
+                # Renewal audit identity is distinct from the reference used for returned metadata.
+                RenewedJobId            = $jobId
+                Result                  = ([ref]$creationResult)
+                PfxRootFolder           = $PfxRootFolder
+            }
+            New-CertificateCreationRequest @creationParameters
         }
         catch {
             Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message 'Error processing certificate creation request' -Inner $_.Exception -NotifyTo $NotifyTo @smtpArgs
@@ -3526,28 +3733,8 @@ switch ($requestBody.type) {
 
         # Success details come from the completed operation result rather than the original event,
         # so the email reports the certificate and PFX artifacts that were actually committed.
-        $notificationDetails = [ordered]@{
-            Operation                   = 'Renewal'
-            'Certificate name'          = $creationResult.CertificateName
-            Subject                     = $creationResult.Subject
-            'DNS names'                 = $creationResult.DnsNames
-            Template                    = $creationResult.TemplateName
-            Thumbprint                  = $creationResult.Thumbprint
-            'Serial number'             = $creationResult.SerialNumber
-            Issuer                      = $creationResult.Issuer
-            'Valid from (UTC)'          = $creationResult.NotBeforeUtc.ToString('yyyy-MM-dd HH:mm:ss')
-            'Valid until (UTC)'         = $creationResult.NotAfterUtc.ToString('yyyy-MM-dd HH:mm:ss')
-            'Key Vault'                 = $creationResult.VaultName
-            'Key Vault version'         = $creationResult.CertificateVersion
-            Hostname                    = $creationResult.Hostname
-            'PFX filename'              = $creationResult.PfxFileName
-            'PFX path'                  = $creationResult.PfxPath
-            'PFX size'                  = "$($creationResult.PfxSizeBytes) bytes"
-            'PFX certificate count'     = $creationResult.ChainCertificateCount
-            'PFX protection principals' = $creationResult.PfxProtectTo
-            # The shared renderer adds the Correlation ID row for every email type.
-            'Request ID'                = $requestBody.data.Id
-        }
+        $notificationDetails = New-CertLCCreationNotificationDetails `
+            -OperationResult $creationResult -Operation 'Renewal' -RequestId $requestBody.data.Id
         # send notification email if requested and SMTP is configured
         Send-SuccessNotification -Section 'Dispatcher.Renewal' `
             -Subject "Certificate $CertificateName renewed successfully" `
@@ -3651,7 +3838,8 @@ switch ($requestBody.type) {
         if ([string]::IsNullOrWhiteSpace($Hostname)) {
             Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.Hostname' in request body!" -NotifyTo $NotifyTo @smtpArgs
         }
-        $Hostname = $Hostname.Trim().ToLower()
+        # Hostname identifiers must not depend on the Hybrid Worker's current culture.
+        $Hostname = $Hostname.Trim().ToLowerInvariant()
         if ($Hostname -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9\-\.]{0,253})$') {
             Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Hostname '$Hostname' is not valid!" -NotifyTo $NotifyTo @smtpArgs
         }
@@ -3680,7 +3868,23 @@ switch ($requestBody.type) {
 
         $creationResult = $null
         try {
-            New-CertificateCreationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateTemplateName $CertificateTemplateName -CertificateSubject $CertificateSubject -CertificateDnsNames $CertificateDnsNames -CA $CA -Hostname $Hostname -PfxProtectTo $PfxProtectTo -NotifyTo $NotifyTo -Result ([ref]$creationResult) -PfxRootFolder $PfxRootFolder
+            # A new request uses the same explicit inputs without renewal-only audit metadata.
+            $creationParameters = @{
+                VaultName               = $VaultName
+                CertificateName         = $CertificateName
+                CertificateTemplateName = $CertificateTemplateName
+                CertificateSubject      = $CertificateSubject
+                # Preserve the optional DNS/notification arguments even when their values are null.
+                CertificateDnsNames     = $CertificateDnsNames
+                CA                      = $CA
+                Hostname                = $Hostname
+                PfxProtectTo            = $PfxProtectTo
+                NotifyTo                = $NotifyTo
+                # Preserve the separate metadata return while structured logs stay visible.
+                Result                  = ([ref]$creationResult)
+                PfxRootFolder           = $PfxRootFolder
+            }
+            New-CertificateCreationRequest @creationParameters
         }
         catch {
             Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message 'Error processing new certificate request' -Inner $_.Exception -NotifyTo $NotifyTo @smtpArgs
@@ -3688,28 +3892,8 @@ switch ($requestBody.type) {
 
         # Build the success email from the operation result: it reflects the issued certificate,
         # stored Key Vault version, and verified PFX rather than merely echoing requested values.
-        $notificationDetails = [ordered]@{
-            Operation                   = 'Creation'
-            'Certificate name'          = $creationResult.CertificateName
-            Subject                     = $creationResult.Subject
-            'DNS names'                 = $creationResult.DnsNames
-            Template                    = $creationResult.TemplateName
-            Thumbprint                  = $creationResult.Thumbprint
-            'Serial number'             = $creationResult.SerialNumber
-            Issuer                      = $creationResult.Issuer
-            'Valid from (UTC)'          = $creationResult.NotBeforeUtc.ToString('yyyy-MM-dd HH:mm:ss')
-            'Valid until (UTC)'         = $creationResult.NotAfterUtc.ToString('yyyy-MM-dd HH:mm:ss')
-            'Key Vault'                 = $creationResult.VaultName
-            'Key Vault version'         = $creationResult.CertificateVersion
-            Hostname                    = $creationResult.Hostname
-            'PFX filename'              = $creationResult.PfxFileName
-            'PFX path'                  = $creationResult.PfxPath
-            'PFX size'                  = "$($creationResult.PfxSizeBytes) bytes"
-            'PFX certificate count'     = $creationResult.ChainCertificateCount
-            'PFX protection principals' = $creationResult.PfxProtectTo
-            # The shared renderer adds the Correlation ID row for every email type.
-            'Request ID'                = $requestBody.data.Id
-        }
+        $notificationDetails = New-CertLCCreationNotificationDetails `
+            -OperationResult $creationResult -Operation 'Creation' -RequestId $requestBody.data.Id
         # send notification email if requested and SMTP is configured
         Send-SuccessNotification -Section 'Dispatcher.Creation' `
             -Subject "Certificate $CertificateName created successfully" `
@@ -3843,7 +4027,21 @@ switch ($requestBody.type) {
 
         Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "Performing certificate revocation for certificate $CertificateName version $CertificateVersion in vault $VaultName with reason $RevocationReason..."
         try {
-            New-CertificateRevocationRequest -VaultName $VaultName -CertificateName $CertificateName -CertificateVersion $CertificateVersion -RevocationReason $RevocationReason -JobId $jobId -ExistingTags $cert.Tags -Certificate $cert.Certificate -ExpectedThumbprint $CertificateThumbprint -Result ([ref]$revocationResult) -CA $CA
+            # Retain the exact-version certificate, tags, and reference result from the lookup.
+            $revocationParameters = @{
+                VaultName          = $VaultName
+                CertificateName    = $CertificateName
+                CertificateVersion = $CertificateVersion
+                RevocationReason   = $RevocationReason
+                JobId              = $jobId
+                # These objects identify the already-selected version; no latest-version lookup occurs here.
+                ExistingTags       = $cert.Tags
+                Certificate        = $cert.Certificate
+                ExpectedThumbprint = $CertificateThumbprint
+                Result             = ([ref]$revocationResult)
+                CA                 = $CA
+            }
+            New-CertificateRevocationRequest @revocationParameters
         }
         catch {
             # Include the configured SMTP transport so a genuine CA or Key Vault revocation

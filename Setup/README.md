@@ -22,7 +22,7 @@ Before deploying, ensure you have:
     - At least 2 CPU cores and 4 GB of RAM
     - A system-assigned managed identity; enable it before adding the VM to the Hybrid Worker Group
     - PowerShell 7.6 installed and available to the Hybrid Worker
-    - Az PowerShell 15.1.0 available to PowerShell 7.6, including `Az.Accounts`, `Az.KeyVault`, `Az.Storage`, and `Az.Resources`, as required by the runbooks
+    - Az PowerShell 15.1.0 available to PowerShell 7.6. Both runbooks directly import `Az.Accounts` and `Az.KeyVault`; the main runbook no longer directly imports `Az.Storage` or `Az.Resources`. The deployment still provisions the full default Az package
     - Domain membership (or an equivalent trust and identity configuration) with DNS, Kerberos, and LDAP connectivity to Active Directory; the runbooks query certificate templates through LDAP and resolve domain principals used to protect exported PFX files
     - RPC connectivity to the issuing Enterprise CA for certificate enrollment and revocation: TCP 135 for the RPC endpoint mapper and the dynamic RPC port range configured on the CA (TCP 49152-65535 by default on current Windows Server versions)
     - Routed HTTPS access on TCP 443, with working private DNS resolution, to the Key Vault private endpoint and the Automation Account `DSCAndHybridWorker` private endpoint
@@ -46,6 +46,7 @@ Before deploying, ensure you have:
 6. **Azure Resource Providers**: Ensure the resource providers used by the template are registered in the deployment subscription. The identity performing registration requires `Microsoft.Resources/subscriptions/providers/register/action` at subscription scope. If the private DNS zones are hosted in another subscription, ensure `Microsoft.Network` is also registered there.
 
     ```powershell
+    # Register the providers used by the templates and verify each registration completes.
     @(
       'Microsoft.Automation'
       'Microsoft.EventGrid'
@@ -56,6 +57,7 @@ Before deploying, ensure you have:
       'Microsoft.Storage'
       'Microsoft.Web'
     ) | ForEach-Object {
+      # Wait before checking state so template validation does not race registration.
       az provider register --namespace $_ --wait
       az provider show --namespace $_ --query "{Namespace:namespace, State:registrationState}" --output table
     }
@@ -237,7 +239,7 @@ The Bicep template creates and configures the following Azure resources:
 #### 4. **Custom Table** (`certlcstats_CL`)
 - **Type**: Custom table in Log Analytics Workspace
 - **Purpose**: Stores certificate statistics updated by the `certlcstats.ps1` runbook
-- **Configuration**: 30-day retention, Analytics plan
+- **Configuration**: Parameterized retention (default 30 days), Analytics plan
 - **Schema**: 9 columns including TimeGenerated, SnapshotId, Thumbprint, Name, Created, Expires, Subject, Template, DNSNames
 
 #### 5. **Data Collection Endpoint (DCE)**
