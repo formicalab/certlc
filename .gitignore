@@ -1,8 +1,9 @@
-# Ignore all Tests folders and their contents
+# Keep the event sample; exclude temporary test scripts and artifacts.
 Tests/
 !Tests/
 Tests/*
-!Tests/notification-template-test.ps1
-!Tests/certificate-operation-recovery-test.ps1
+!Tests/sample-eventgrideventschema.json
 # Ignore all .vscode folders and their contents
 .vscode/
+# Local Azure validation, deployment plans and resource snapshots are not release source.
+.azure/

@@ -38,7 +38,7 @@ certlcstats_CL
 | project TimeGenerated, Name, Thumbprint, Subject, Template, Expires
 ```
 
-The Azure Monitor workbook in [`Workbooks/certlcstats.workbook`](../../Workbooks/certlcstats.workbook) consumes this table to render the certificate inventory dashboard. The Bicep deployment resolves its resource-ID tokens and publishes the complete workbook.
+The Statistics tab in [`Workbooks/certlcstats.workbook`](../../Workbooks/certlcstats.workbook) consumes this table to render the certificate inventory dashboard. Event Journey, Job logs and Function bridge use existing operational telemetry instead (`AppTraces`, `AppExceptions` and `AzureDiagnostics`); adding Journey does not change this table, its schema or ingestion. The Bicep deployment resolves the workbook's resource-ID tokens and publishes the complete workbook. See the [query index](../../Workbooks/README.md) for the standalone queries matching each view.
 
 ## Modifying schema or transformation
 

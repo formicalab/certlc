@@ -260,8 +260,30 @@ The Bicep template creates and configures the following Azure resources:
   - Name: `certlcstats`
   - Complete workbook definition loaded from `Workbooks/certlcstats.workbook` and published by Bicep
   - Deployment replaces the workbook's resource-ID tokens with the resources created by the template
+  - Tabs: Statistics, Event Journey, Job logs, Function bridge; all share the original resource and time selectors
+  - Event Journey searches events/certificates and expands an event into attempts, Function activity, Automation jobs and logs
   - Linked to Log Analytics Workspace as data source
   - Depends on Application Insights to ensure workspace stability
+
+The production source is `Workbooks/certlcstats.workbook`; preserve its five resource-ID
+placeholders and tokenized fallback workspace. All 18 embedded queries have matching standalone
+KQL files directly under `Workbooks/`, including the three self-contained `event-journey-*.kql`
+queries. See the [query index](../Workbooks/README.md). When changing a query, update both its
+standalone file and the embedded workbook query. Temporary prototype sources and tests are not
+required for deployment.
+
+For a workbook-only upgrade, deploy `modules/workbook.bicep` at resource-group scope in
+Incremental mode using the existing location, resource IDs, runbook name and tags. Run
+validation and what-if first; require only a Modify of the existing `certlcstats` workbook.
+The deterministic resource name retains its portal identity. The full setup template is not
+needed for this upgrade. Back up the existing workbook content and verify both content and
+metadata after deployment; do not replace tokens in the repository file with environment IDs.
+
+Deploying Bicep workbook content does not publish Function or runbook source. For an upgrade
+from the former separate `CorrelationId` input, publish the updated bridge first, verify that it
+passes only `jsonRequestBody`, then publish the updated main runbook and update any other callers
+that still pass `CorrelationId`. Use the runtime publication steps below independently of the
+workbook-only upgrade. Historical telemetry is not rewritten by either deployment.
 
 #### Optional **Azure Monitor Alerts**
 - **Deployment**: Created only when `enableAlerts` is `true`
@@ -301,7 +323,7 @@ The Bicep template creates and configures the following Azure resources:
   - Hourly schedule linked to the `certlcstats` runbook on the configured Hybrid Worker Group by default
   - Diagnostic settings enabled: JobLogs, JobStreams, AllMetrics sent to Log Analytics
 - **Private Endpoints**:
-  - Webhook endpoint (for Function App to trigger runbooks)
+  - Webhook endpoint (for optional direct external callers; the Function starts jobs through the Automation management API)
   - DSC and Hybrid Worker endpoint (for hybrid worker communication)
 
 #### 10. **Hybrid Worker Group**
@@ -464,7 +486,7 @@ After deploying the infrastructure, complete these additional steps:
     - Verify that DNS can resolve the required public Azure endpoints and that Application Insights telemetry is received after the function starts
   - These firewall rules and SNAT configuration are not created by this template and must be configured in the customer network containing `fnSubnetId`. For details, see [Azure service tags](https://learn.microsoft.com/azure/virtual-network/service-tags-overview)
 7. **Grant CA Permissions**: Assign the hybrid worker's computer account Enroll permissions on the CA templates
-8. **Review the Workbook**: Open the deployed `certlcstats` workbook and verify that its resource selectors reference the deployed Log Analytics workspace, Automation Account, runbooks, and Function App. The repository file `Workbooks/certlcstats.workbook` is authoritative; later Bicep deployments overwrite workbook changes made only in the portal. If the tokenized file is imported manually instead, the workbook still opens, but its five resource parameters must be selected and saved in the portal before the queries can run.
+8. **Review the Workbook**: Open the deployed `certlcstats` workbook and verify that its resource selectors reference the deployed Log Analytics workspace, Automation Account, runbooks, and Function App. Confirm the tab order Statistics, Event Journey, Job logs, Function bridge. In Event Journey, search an existing ingested event/certificate and expand its attempt and job logs; this read-only check does not trigger a certificate operation. The repository file `Workbooks/certlcstats.workbook` is authoritative; later Bicep deployments overwrite workbook changes made only in the portal. For a manual import, resolve the five resource placeholders and the fallback workspace placeholder first, then verify the saved selectors before running queries.
 9. **Review Alerts** (when enabled): Verify the dedicated Action Group receiver is enabled, all six alert rules target that Action Group, and the Storage Queue service has the `StorageWrite` diagnostic setting. The receiver may get an initial stale-statistics notification while the `certlcstats` schedule remains unlinked.
 10. **Test End-to-End**:
    - **Create a test certificate** using the utility scripts in the `Utilities` folder:

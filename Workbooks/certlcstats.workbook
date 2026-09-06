@@ -188,6 +188,15 @@
             "style": "link"
           },
           {
+            "preText": "Tab 2",
+            "style": "link",
+            "cellValue": "selectedTab",
+            "linkLabel": "Event Journey",
+            "subTarget": "4",
+            "id": "f5a8336e-4e42-47ac-a844-a4179a94694c",
+            "linkTarget": "parameter"
+          },
+          {
             "id": "9c94a5f2-b4c1-45fc-a223-0c6e42398b17",
             "cellValue": "selectedTab",
             "linkTarget": "parameter",
@@ -760,10 +769,324 @@
         "value": "3"
       },
       "name": "grpFunctionBridge"
+    },
+    {
+      "name": "grpEventJourney",
+      "conditionalVisibility": {
+        "comparison": "isEqualTo",
+        "value": "4",
+        "parameterName": "selectedTab"
+      },
+      "content": {
+        "items": [
+          {
+            "name": "journey-parameters",
+            "content": {
+              "style": "formVertical",
+              "parameters": [
+                {
+                  "label": "Search events/certificates",
+                  "value": "",
+                  "version": "KqlParameterItem/1.0",
+                  "description": "Correlation ID, certificate, job ID, invocation ID, event type or source.",
+                  "id": "bafbe95b-4eca-4487-82cb-e4be0b68894d",
+                  "name": "JourneySearch",
+                  "type": 1
+                }
+              ],
+              "version": "KqlParameterItem/1.0"
+            },
+            "type": 9
+          },
+          {
+            "name": "event-list",
+            "content": {
+              "query": "// Test workbook only. Scope every scan to the selected time and existing resources.\r\n// Reuse certlcstats resource selectors instead of pinning Journey to one deployment.\r\n// Match Job History: nested resource names may include the Automation account prefix.\r\nlet SelectedRunbookName = tostring(split('{Runbook:name}', '/')[-1]);\r\nlet Traces = materialize(AppTraces\r\n| where TimeGenerated {TimeRange}\r\n| where AppRoleName =~ '{FunctionApp:name}'\r\n| extend AttemptId = coalesce(tostring(Properties.InvocationId), OperationId)\r\n| where isnotempty(AttemptId));\r\nlet Bridge = Traces\r\n| where Message has 'BridgeCorrelation'\r\n| extend Entry = parse_json(extract(@'(\\{.*\\})', 1, Message))\r\n| where tostring(Entry.recordType) == 'BridgeCorrelation';\r\n// Only receipt records establish event identity. Older Started records used job fallback.\r\nlet Receipts = Bridge\r\n| where tostring(Entry.stage) == 'Received'\r\n| summarize arg_min(TimeGenerated, *) by AttemptId\r\n| project AttemptId, OperationId, Received = TimeGenerated,\r\n    CorrelationId = tostring(Entry.correlationId), EventSource = tostring(Entry.eventSource);\r\n// Keep each invocation/job association: repeated delivery must not erase earlier attempts.\r\nlet Links = Bridge\r\n| where tostring(Entry.stage) == 'Started' and isnotempty(tostring(Entry.jobId))\r\n| summarize Submitted = min(TimeGenerated) by AttemptId, JobId = tolower(tostring(Entry.jobId));\r\nlet Payloads = Traces\r\n| where Message contains 'CERTLC: full message received is:'\r\n| extend Payload = parse_json(extract(@'CERTLC: full message received is:\\s*(.*)$', 1, Message))\r\n| summarize arg_min(TimeGenerated, *) by AttemptId\r\n// Bracket notation preserves the CloudEvent field whose name is a KQL keyword.\r\n| project AttemptId, Certificate = coalesce(tostring(Payload.data.ObjectName), tostring(Payload.subject)),\r\n    EventType = tostring(Payload.type), EventTime = todatetime(Payload['time']);\r\nlet Streams = materialize(AzureDiagnostics\r\n| where TimeGenerated {TimeRange}\r\n| where Category == 'JobStreams' and Resource =~ '{AutomationAccount:name}' and RunbookName_s =~ SelectedRunbookName\r\n| extend JobId = tolower(tostring(JobId_g)), Raw = replace_regex(tostring(ResultDescription), @'\\x1B\\[[0-9;]*[A-Za-z]', '')\r\n| extend Entry = parse_json(extract(@'(\\{.*\\})', 1, Raw))\r\n| extend Message = coalesce(tostring(Entry.message), Raw), Section = coalesce(tostring(Entry.section), StreamType_s),\r\n    Level = coalesce(tostring(Entry.level), StreamType_s), LogTime = coalesce(todatetime(Entry.timestamp), TimeGenerated));\r\nlet Jobs = AzureDiagnostics\r\n| where TimeGenerated {TimeRange}\r\n| where Category == 'JobLogs' and Resource =~ '{AutomationAccount:name}' and RunbookName_s =~ SelectedRunbookName\r\n| summarize arg_max(TimeGenerated, ResultType) by JobId = tolower(tostring(JobId_g))\r\n| project JobId, JobStatus = ResultType, StatusObserved = TimeGenerated;\r\n// Operation outcome is not the same as Automation completion or SMTP delivery.\r\nlet Outcomes = Streams\r\n| summarize Warnings = countif(Level =~ 'Warning'), Errors = countif(Level =~ 'Error'),\r\n    Succeeded = countif(Section startswith 'Dispatcher.' and Message contains 'successfully'),\r\n    // Missing SMTP is not a skipped certificate operation.\r\n    Skipped = countif(Section == 'Dispatcher.Renewal' and Message startswith 'Skipping auto-renewal of certificate'),\r\n    EmailSent = countif(Section == 'Send-NotificationEmail' and Message startswith 'Notification email sent'),\r\n    EmailFailed = countif(Section == 'Send-NotificationEmail' and Level =~ 'Warning') by JobId;\r\nlet Exceptions = AppExceptions\r\n| where TimeGenerated {TimeRange}\r\n| where AppRoleName =~ '{FunctionApp:name}'\r\n| extend AttemptId = coalesce(tostring(Properties.InvocationId), OperationId)\r\n| summarize FunctionErrors = count() by AttemptId;\r\nlet Attempts = Receipts\r\n| join kind=leftouter Links on AttemptId\r\n| join kind=leftouter Payloads on AttemptId\r\n| join kind=leftouter Jobs on JobId\r\n| join kind=leftouter Outcomes on JobId\r\n| join kind=leftouter Exceptions on AttemptId\r\n// JSON tuple prevents ambiguous concatenation; unidentified receipts remain separate.\r\n| extend EventKey = tostring(pack_array(EventSource, CorrelationId, iff(isempty(CorrelationId), AttemptId, ''))),\r\n    JobStatus = coalesce(JobStatus, 'Not observed'),\r\n    OperationOutcome = case(Errors > 0, 'Error logged', Skipped > 0, 'Skipped', Succeeded > 0, 'Success logged', 'Not observed'),\r\n    Notification = case(EmailFailed > 0, 'Delivery warning', EmailSent > 0, 'Sent', 'Not observed'),\r\n    Warnings = coalesce(Warnings, 0), Errors = coalesce(Errors, 0), FunctionErrors = coalesce(FunctionErrors, 0);\n// Workbook formatting encodes user input before KQL substitution, including quotes/newlines.\r\nlet SearchText = trim(@'\\s+', base64_decode_tostring('{JourneySearch:base64}'));\r\n// A matching job selects its whole event so search does not hide sibling retry attempts.\r\nlet MatchingEvents = Attempts\r\n| where isempty(SearchText) or CorrelationId contains SearchText or Certificate contains SearchText\r\n    or JobId contains SearchText or AttemptId contains SearchText or EventType contains SearchText or EventSource contains SearchText\r\n| distinct EventKey;\r\nAttempts\r\n| join kind=leftsemi MatchingEvents on EventKey\r\n// Group by the full event identity, while retaining counts and all observed outcomes.\r\n| summarize FirstReceipt = min(Received), LastObserved = max(StatusObserved),\r\n    // Empty join results do not represent an observed Automation job.\r\n    AttemptIds = make_set(AttemptId), Jobs = make_set_if(JobId, isnotempty(JobId)), Certificates = make_set(Certificate), EventTypes = make_set(EventType),\r\n    JobStates = make_set(JobStatus), Outcomes = make_set(OperationOutcome), Notifications = make_set(Notification),\r\n    Warnings = sum(Warnings), Errors = sum(Errors), FunctionErrors = sum(FunctionErrors)\r\n    by EventKey, CorrelationId, EventSource\r\n| extend Attempts = array_length(AttemptIds), JobCount = array_length(Jobs),\r\n    ObservedDuration = LastObserved - FirstReceipt\r\n// Compact display values avoid raw JSON arrays; retain all diagnostics for selection and export.\r\n| extend Certificate = strcat_array(Certificates, ', '),\r\n    EventType = replace_regex(strcat_array(EventTypes, ', '), @'(CertLC\\.|Microsoft\\.KeyVault\\.)', ''),\r\n    Outcome = strcat_array(Outcomes, ', '), JobStatus = strcat_array(JobStates, ', ')\r\n| project FirstReceipt, Certificate, EventType, Outcome, JobStatus, Attempts, JobCount,\r\n    CorrelationId, Certificates, EventTypes, JobStates, Outcomes, Notifications,\r\n    Warnings, Errors, FunctionErrors, ObservedDuration, EventSource, EventKey\r\n| order by FirstReceipt desc\r\n| take 500",
+              "visualization": "table",
+              "gridSettings": {
+                "filter": true,
+                "labelSettings": [
+                  {
+                    "columnId": "FirstReceipt",
+                    "label": "Received"
+                  },
+                  {
+                    "columnId": "EventType",
+                    "label": "Event type"
+                  },
+                  {
+                    "columnId": "Outcome",
+                    "label": "Operation outcome"
+                  },
+                  {
+                    "columnId": "JobStatus",
+                    "label": "Job status"
+                  },
+                  {
+                    "columnId": "JobCount",
+                    "label": "Jobs"
+                  }
+                ],
+                "rowLimit": 500,
+                "formatters": [
+                  {
+                    "formatter": 5,
+                    "columnMatch": "CorrelationId"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "Certificates"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "EventTypes"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "JobStates"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "Outcomes"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "Notifications"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "Warnings"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "Errors"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "FunctionErrors"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "ObservedDuration"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "EventSource"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "EventKey"
+                  },
+                  {
+                    "formatOptions": {
+                      "customColumnWidthSetting": "26ch"
+                    },
+                    "columnMatch": "FirstReceipt",
+                    "formatter": 6
+                  },
+                  {
+                    "formatOptions": {
+                      "customColumnWidthSetting": "1fr"
+                    },
+                    "columnMatch": "Certificate",
+                    "formatter": 1
+                  },
+                  {
+                    "formatOptions": {
+                      "customColumnWidthSetting": "1fr"
+                    },
+                    "columnMatch": "EventType",
+                    "formatter": 1
+                  },
+                  {
+                    "formatOptions": {
+                      "customColumnWidthSetting": "1fr"
+                    },
+                    "columnMatch": "Outcome",
+                    "formatter": 1
+                  },
+                  {
+                    "formatOptions": {
+                      "customColumnWidthSetting": "1fr"
+                    },
+                    "columnMatch": "JobStatus",
+                    "formatter": 1
+                  },
+                  {
+                    "formatOptions": {
+                      "customColumnWidthSetting": "8ch"
+                    },
+                    "columnMatch": "Attempts",
+                    "formatter": 1
+                  },
+                  {
+                    "formatOptions": {
+                      "customColumnWidthSetting": "5ch"
+                    },
+                    "columnMatch": "JobCount",
+                    "formatter": 1
+                  }
+                ]
+              },
+              "version": "KqlItem/1.0",
+              "exportToExcelOptions": "all",
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "showExportToExcel": true,
+              "timeContextFromParameter": "TimeRange",
+              "queryType": 0,
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ],
+              "title": "Found events (up to 500)",
+              "exportedParameters": [
+                {
+                  "parameterType": 1,
+                  "fieldName": "EventKey",
+                  "parameterName": "SelectedEvent"
+                }
+              ]
+            },
+            "type": 3
+          },
+          {
+            "name": "event-context",
+            "conditionalVisibility": {
+              "comparison": "isNotEqualTo",
+              "value": "",
+              "parameterName": "SelectedEvent"
+            },
+            "content": {
+              "query": "// Test workbook only. Scope every scan to the selected time and existing resources.\r\n// Reuse certlcstats resource selectors instead of pinning Journey to one deployment.\r\n// Match Job History: nested resource names may include the Automation account prefix.\r\nlet SelectedRunbookName = tostring(split('{Runbook:name}', '/')[-1]);\r\nlet Traces = materialize(AppTraces\r\n| where TimeGenerated {TimeRange}\r\n| where AppRoleName =~ '{FunctionApp:name}'\r\n| extend AttemptId = coalesce(tostring(Properties.InvocationId), OperationId)\r\n| where isnotempty(AttemptId));\r\nlet Bridge = Traces\r\n| where Message has 'BridgeCorrelation'\r\n| extend Entry = parse_json(extract(@'(\\{.*\\})', 1, Message))\r\n| where tostring(Entry.recordType) == 'BridgeCorrelation';\r\n// Only receipt records establish event identity. Older Started records used job fallback.\r\nlet Receipts = Bridge\r\n| where tostring(Entry.stage) == 'Received'\r\n| summarize arg_min(TimeGenerated, *) by AttemptId\r\n| project AttemptId, OperationId, Received = TimeGenerated,\r\n    CorrelationId = tostring(Entry.correlationId), EventSource = tostring(Entry.eventSource);\r\n// Keep each invocation/job association: repeated delivery must not erase earlier attempts.\r\nlet Links = Bridge\r\n| where tostring(Entry.stage) == 'Started' and isnotempty(tostring(Entry.jobId))\r\n| summarize Submitted = min(TimeGenerated) by AttemptId, JobId = tolower(tostring(Entry.jobId));\r\nlet Payloads = Traces\r\n| where Message contains 'CERTLC: full message received is:'\r\n| extend Payload = parse_json(extract(@'CERTLC: full message received is:\\s*(.*)$', 1, Message))\r\n| summarize arg_min(TimeGenerated, *) by AttemptId\r\n// Bracket notation preserves the CloudEvent field whose name is a KQL keyword.\r\n| project AttemptId, Certificate = coalesce(tostring(Payload.data.ObjectName), tostring(Payload.subject)),\r\n    EventType = tostring(Payload.type), EventTime = todatetime(Payload['time']);\r\nlet Streams = materialize(AzureDiagnostics\r\n| where TimeGenerated {TimeRange}\r\n| where Category == 'JobStreams' and Resource =~ '{AutomationAccount:name}' and RunbookName_s =~ SelectedRunbookName\r\n| extend JobId = tolower(tostring(JobId_g)), Raw = replace_regex(tostring(ResultDescription), @'\\x1B\\[[0-9;]*[A-Za-z]', '')\r\n| extend Entry = parse_json(extract(@'(\\{.*\\})', 1, Raw))\r\n| extend Message = coalesce(tostring(Entry.message), Raw), Section = coalesce(tostring(Entry.section), StreamType_s),\r\n    Level = coalesce(tostring(Entry.level), StreamType_s), LogTime = coalesce(todatetime(Entry.timestamp), TimeGenerated));\r\nlet Jobs = AzureDiagnostics\r\n| where TimeGenerated {TimeRange}\r\n| where Category == 'JobLogs' and Resource =~ '{AutomationAccount:name}' and RunbookName_s =~ SelectedRunbookName\r\n| summarize arg_max(TimeGenerated, ResultType) by JobId = tolower(tostring(JobId_g))\r\n| project JobId, JobStatus = ResultType, StatusObserved = TimeGenerated;\r\n// Operation outcome is not the same as Automation completion or SMTP delivery.\r\nlet Outcomes = Streams\r\n| summarize Warnings = countif(Level =~ 'Warning'), Errors = countif(Level =~ 'Error'),\r\n    Succeeded = countif(Section startswith 'Dispatcher.' and Message contains 'successfully'),\r\n    // Missing SMTP is not a skipped certificate operation.\r\n    Skipped = countif(Section == 'Dispatcher.Renewal' and Message startswith 'Skipping auto-renewal of certificate'),\r\n    EmailSent = countif(Section == 'Send-NotificationEmail' and Message startswith 'Notification email sent'),\r\n    EmailFailed = countif(Section == 'Send-NotificationEmail' and Level =~ 'Warning') by JobId;\r\nlet Exceptions = AppExceptions\r\n| where TimeGenerated {TimeRange}\r\n| where AppRoleName =~ '{FunctionApp:name}'\r\n| extend AttemptId = coalesce(tostring(Properties.InvocationId), OperationId)\r\n| summarize FunctionErrors = count() by AttemptId;\r\nlet Attempts = Receipts\r\n| join kind=leftouter Links on AttemptId\r\n| join kind=leftouter Payloads on AttemptId\r\n| join kind=leftouter Jobs on JobId\r\n| join kind=leftouter Outcomes on JobId\r\n| join kind=leftouter Exceptions on AttemptId\r\n// JSON tuple prevents ambiguous concatenation; unidentified receipts remain separate.\r\n| extend EventKey = tostring(pack_array(EventSource, CorrelationId, iff(isempty(CorrelationId), AttemptId, ''))),\r\n    JobStatus = coalesce(JobStatus, 'Not observed'),\r\n    OperationOutcome = case(Errors > 0, 'Error logged', Skipped > 0, 'Skipped', Succeeded > 0, 'Success logged', 'Not observed'),\r\n    Notification = case(EmailFailed > 0, 'Delivery warning', EmailSent > 0, 'Sent', 'Not observed'),\r\n    Warnings = coalesce(Warnings, 0), Errors = coalesce(Errors, 0), FunctionErrors = coalesce(FunctionErrors, 0);\n// Query the exact selected event; render values as table text, never interpolated Markdown.\r\nlet SelectedKey = base64_decode_tostring('{SelectedEvent:base64}');\r\nAttempts\r\n| where isnotempty(SelectedKey) and EventKey == SelectedKey\r\n| summarize Certificates = make_set_if(Certificate, isnotempty(Certificate)), EventTypes = make_set_if(EventType, isnotempty(EventType)) by CorrelationId\r\n| project Details = pack_array(\r\n    pack('Field', 'Certificate', 'Value', strcat_array(Certificates, ', ')),\r\n    pack('Field', 'Event type', 'Value', strcat_array(EventTypes, ', ')),\r\n    pack('Field', 'Correlation ID', 'Value', CorrelationId))\r\n| mv-expand Details\r\n| project Field = tostring(Details.Field), Value = coalesce(tostring(Details.Value), 'Not observed')",
+              "visualization": "table",
+              "gridSettings": {
+                "rowLimit": 3,
+                "formatters": [
+                  {
+                    "formatOptions": {
+                      "customColumnWidthSetting": "16ch"
+                    },
+                    "columnMatch": "Field",
+                    "formatter": 1
+                  },
+                  {
+                    "formatOptions": {
+                      "customColumnWidthSetting": "1fr"
+                    },
+                    "columnMatch": "Value",
+                    "formatter": 1
+                  }
+                ]
+              },
+              "version": "KqlItem/1.0",
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "timeContextFromParameter": "TimeRange",
+              "queryType": 0,
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ],
+              "title": "Selected event"
+            },
+            "type": 3
+          },
+          {
+            "name": "event-timeline",
+            "conditionalVisibility": {
+              "comparison": "isNotEqualTo",
+              "value": "",
+              "parameterName": "SelectedEvent"
+            },
+            "content": {
+              "query": "// Test workbook only. Scope every scan to the selected time and existing resources.\r\n// Reuse certlcstats resource selectors instead of pinning Journey to one deployment.\r\n// Match Job History: nested resource names may include the Automation account prefix.\r\nlet SelectedRunbookName = tostring(split('{Runbook:name}', '/')[-1]);\r\nlet Traces = materialize(AppTraces\r\n| where TimeGenerated {TimeRange}\r\n| where AppRoleName =~ '{FunctionApp:name}'\r\n| extend AttemptId = coalesce(tostring(Properties.InvocationId), OperationId)\r\n| where isnotempty(AttemptId));\r\nlet Bridge = Traces\r\n| where Message has 'BridgeCorrelation'\r\n| extend Entry = parse_json(extract(@'(\\{.*\\})', 1, Message))\r\n| where tostring(Entry.recordType) == 'BridgeCorrelation';\r\n// Only receipt records establish event identity. Older Started records used job fallback.\r\nlet Receipts = Bridge\r\n| where tostring(Entry.stage) == 'Received'\r\n| summarize arg_min(TimeGenerated, *) by AttemptId\r\n| project AttemptId, OperationId, Received = TimeGenerated,\r\n    CorrelationId = tostring(Entry.correlationId), EventSource = tostring(Entry.eventSource);\r\n// Keep each invocation/job association: repeated delivery must not erase earlier attempts.\r\nlet Links = Bridge\r\n| where tostring(Entry.stage) == 'Started' and isnotempty(tostring(Entry.jobId))\r\n| summarize Submitted = min(TimeGenerated) by AttemptId, JobId = tolower(tostring(Entry.jobId));\r\nlet Payloads = Traces\r\n| where Message contains 'CERTLC: full message received is:'\r\n| extend Payload = parse_json(extract(@'CERTLC: full message received is:\\s*(.*)$', 1, Message))\r\n| summarize arg_min(TimeGenerated, *) by AttemptId\r\n// Bracket notation preserves the CloudEvent field whose name is a KQL keyword.\r\n| project AttemptId, Certificate = coalesce(tostring(Payload.data.ObjectName), tostring(Payload.subject)),\r\n    EventType = tostring(Payload.type), EventTime = todatetime(Payload['time']);\r\nlet Streams = materialize(AzureDiagnostics\r\n| where TimeGenerated {TimeRange}\r\n| where Category == 'JobStreams' and Resource =~ '{AutomationAccount:name}' and RunbookName_s =~ SelectedRunbookName\r\n| extend JobId = tolower(tostring(JobId_g)), Raw = replace_regex(tostring(ResultDescription), @'\\x1B\\[[0-9;]*[A-Za-z]', '')\r\n| extend Entry = parse_json(extract(@'(\\{.*\\})', 1, Raw))\r\n| extend Message = coalesce(tostring(Entry.message), Raw), Section = coalesce(tostring(Entry.section), StreamType_s),\r\n    Level = coalesce(tostring(Entry.level), StreamType_s), LogTime = coalesce(todatetime(Entry.timestamp), TimeGenerated));\r\nlet Jobs = AzureDiagnostics\r\n| where TimeGenerated {TimeRange}\r\n| where Category == 'JobLogs' and Resource =~ '{AutomationAccount:name}' and RunbookName_s =~ SelectedRunbookName\r\n| summarize arg_max(TimeGenerated, ResultType) by JobId = tolower(tostring(JobId_g))\r\n| project JobId, JobStatus = ResultType, StatusObserved = TimeGenerated;\r\n// Operation outcome is not the same as Automation completion or SMTP delivery.\r\nlet Outcomes = Streams\r\n| summarize Warnings = countif(Level =~ 'Warning'), Errors = countif(Level =~ 'Error'),\r\n    Succeeded = countif(Section startswith 'Dispatcher.' and Message contains 'successfully'),\r\n    // Missing SMTP is not a skipped certificate operation.\r\n    Skipped = countif(Section == 'Dispatcher.Renewal' and Message startswith 'Skipping auto-renewal of certificate'),\r\n    EmailSent = countif(Section == 'Send-NotificationEmail' and Message startswith 'Notification email sent'),\r\n    EmailFailed = countif(Section == 'Send-NotificationEmail' and Level =~ 'Warning') by JobId;\r\nlet Exceptions = AppExceptions\r\n| where TimeGenerated {TimeRange}\r\n| where AppRoleName =~ '{FunctionApp:name}'\r\n| extend AttemptId = coalesce(tostring(Properties.InvocationId), OperationId)\r\n| summarize FunctionErrors = count() by AttemptId;\r\nlet Attempts = Receipts\r\n| join kind=leftouter Links on AttemptId\r\n| join kind=leftouter Payloads on AttemptId\r\n| join kind=leftouter Jobs on JobId\r\n| join kind=leftouter Outcomes on JobId\r\n| join kind=leftouter Exceptions on AttemptId\r\n// JSON tuple prevents ambiguous concatenation; unidentified receipts remain separate.\r\n| extend EventKey = tostring(pack_array(EventSource, CorrelationId, iff(isempty(CorrelationId), AttemptId, ''))),\r\n    JobStatus = coalesce(JobStatus, 'Not observed'),\r\n    OperationOutcome = case(Errors > 0, 'Error logged', Skipped > 0, 'Skipped', Succeeded > 0, 'Success logged', 'Not observed'),\r\n    Notification = case(EmailFailed > 0, 'Delivery warning', EmailSent > 0, 'Sent', 'Not observed'),\r\n    Warnings = coalesce(Warnings, 0), Errors = coalesce(Errors, 0), FunctionErrors = coalesce(FunctionErrors, 0);\n// Selection is an encoded source/id tuple, so equal IDs from different producers stay separate.\r\nlet SelectedKey = base64_decode_tostring('{SelectedEvent:base64}');\r\nlet Selected = materialize(Attempts | where isnotempty(SelectedKey) and EventKey == SelectedKey);\r\n// One parent per invocation, even if several job associations are observed for that invocation.\r\nlet SelectedInvocations = materialize(Selected\r\n| summarize Received = min(Received), FunctionErrors = max(FunctionErrors) by AttemptId, OperationId\r\n| order by Received asc, AttemptId asc\r\n| serialize AttemptNumber = row_number());\r\nlet SelectedJobs = materialize(Selected | where isnotempty(JobId)\r\n| distinct AttemptId, JobId, Submitted, JobStatus, OperationOutcome, Notification);\r\n// Explicit parents mirror the native Id/ParentId tree used by the production Job History.\r\nlet Parents = union\r\n    // Keep identity in the context view; parent details retain source, notifications and diagnostics.\r\n    (Selected | summarize Time = min(Received), Notifications = make_set(Notification), Warnings = sum(Warnings), Errors = sum(Errors), FunctionErrors = sum(FunctionErrors) by CorrelationId, EventSource\r\n        | project Id = 'event', ParentId = '', Name = 'Event',\r\n            Time, Component = 'Event', Stage = 'Correlation', FinalResult = 'info',\r\n            Message = strcat('Source: ', EventSource, '\\nNotifications: ', strcat_array(Notifications, ', '), '\\nWarnings: ', Warnings, '; Runbook errors: ', Errors, '; Function errors: ', FunctionErrors), AttemptId = '', JobId = ''),\r\n    (SelectedInvocations\r\n        | project Id = strcat('attempt:', AttemptId), ParentId = 'event', Name = strcat('Attempt ', AttemptNumber),\r\n            Time = Received, Component = 'Attempt', Stage = 'Receipt', FinalResult = iff(FunctionErrors > 0, 'failed', 'info'),\r\n            Message = strcat('Function invocation: ', AttemptId), AttemptId, JobId = ''),\r\n    (SelectedInvocations\r\n        | project Id = strcat('function:', AttemptId), ParentId = strcat('attempt:', AttemptId), Name = 'Function activity',\r\n            Time = Received, Component = 'Function', Stage = 'Invocation', FinalResult = iff(FunctionErrors > 0, 'failed', 'info'),\r\n            Message = strcat('Operation ID: ', OperationId), AttemptId, JobId = ''),\r\n    (SelectedJobs\r\n        // Show the full job ID once in parent details instead of repeating it across every leaf.\r\n        | project Id = strcat('job:', AttemptId, ':', JobId), ParentId = strcat('attempt:', AttemptId), Name = 'Automation job',\r\n            Time = Submitted, Component = 'Automation', Stage = 'Job',\r\n            FinalResult = case(JobStatus =~ 'Failed', 'failed', JobStatus in~ ('Stopped', 'Suspended'), 'warning', JobStatus =~ 'Completed', 'success', 'info'),\r\n            Message = strcat('Job ID: ', JobId, '\\nState: ', JobStatus, '; Operation: ', OperationOutcome, '; Notification: ', Notification), AttemptId, JobId);\r\n// Cap only leaf records. Parents remain present even when the detail stream is truncated.\r\nlet Records = union\r\n    (Selected | where isnotnull(EventTime) | distinct EventTime, EventType\r\n        | project ParentId = 'event', Time = EventTime, Component = 'Event payload', Stage = 'Producer timestamp (not delivery)',\r\n            Level = 'Information', Message = EventType, AttemptId = '', JobId = ''),\r\n    (Traces | join kind=inner SelectedInvocations on AttemptId, OperationId\r\n        | project ParentId = strcat('function:', AttemptId), Time = TimeGenerated, Component = 'Function', Stage = tostring(Properties.Category),\r\n            Level = coalesce(tostring(Properties.LogLevel), 'Information'), Message, AttemptId, JobId = ''),\r\n    // Detail scans use the same shared resource parameters as the summary.\r\n    (AppExceptions | where TimeGenerated {TimeRange} | where AppRoleName =~ '{FunctionApp:name}'\r\n        | extend AttemptId = coalesce(tostring(Properties.InvocationId), OperationId)\r\n        | join kind=inner SelectedInvocations on AttemptId, OperationId\r\n        | project ParentId = strcat('function:', AttemptId), Time = TimeGenerated, Component = 'Function', Stage = 'Exception', Level = 'Error', Message = OuterMessage, AttemptId, JobId = ''),\r\n    (Streams | join kind=inner SelectedJobs on JobId\r\n        | project ParentId = strcat('job:', AttemptId, ':', JobId), Time = LogTime, Component = 'Runbook', Stage = Section, Level, Message, AttemptId, JobId),\r\n    (AzureDiagnostics | where TimeGenerated {TimeRange}\r\n        // Reuse the normalized leaf name so portal resource formatting cannot hide job children.\r\n        | where Category == 'JobLogs' and Resource =~ '{AutomationAccount:name}' and RunbookName_s =~ SelectedRunbookName\r\n        | extend JobId = tolower(tostring(JobId_g)) | join kind=inner SelectedJobs on JobId\r\n        | project ParentId = strcat('job:', AttemptId, ':', JobId), Time = TimeGenerated, Component = 'Automation', Stage = 'Job status',\r\n            Level = iff(ResultType in~ ('Failed', 'Stopped', 'Suspended'), 'Warning', 'Information'),\r\n            Message = ResultType, AttemptId, JobId)\r\n| order by Time asc, ParentId asc, Stage asc, Message asc\r\n| take 2000\r\n// Row numbers keep identical timestamps/messages distinct rather than colliding as tree IDs.\r\n| serialize RecordNumber = row_number()\r\n| project Id = strcat('record:', RecordNumber), ParentId,\r\n    // Time already has a dedicated column; use the node label for log origin instead.\r\n    Name = case(Component == 'Runbook', Stage, Component == 'Function', strcat('Function / ', Level), Stage),\r\n    Time, Component, Stage, FinalResult = case(Level =~ 'Error', 'failed', Level =~ 'Warning', 'warning', 'info'), Message, AttemptId, JobId;\r\nunion Parents, Records\r\n| order by Time asc, Id asc\r\n// Lead with the expandable result icon, keeping the node name beside it and IDs hidden.\r\n| project FinalResult, Name, Time, Component, Stage, Message, AttemptId, JobId, Id, ParentId",
+              "visualization": "table",
+              "gridSettings": {
+                "filter": true,
+                "formatters": [
+                  {
+                    "formatter": 5,
+                    "columnMatch": "Id"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "ParentId"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "AttemptId"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "JobId"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "Component"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "Stage"
+                  },
+                  {
+                    "formatter": 11,
+                    "columnMatch": "FinalResult"
+                  },
+                  {
+                    "formatOptions": {
+                      "customColumnWidthSetting": "22ch"
+                    },
+                    "columnMatch": "Name",
+                    "formatter": 1
+                  },
+                  {
+                    "dateFormat": {
+                      "formatName": "shortDateTimeNoMsPattern",
+                      "showUtcTime": null
+                    },
+                    "formatOptions": {
+                      "customColumnWidthSetting": "20ch"
+                    },
+                    "columnMatch": "Time",
+                    "formatter": 6
+                  },
+                  {
+                    "formatOptions": {
+                      "customColumnWidthSetting": "50%"
+                    },
+                    "columnMatch": "Message",
+                    "formatter": 1
+                  }
+                ],
+                "rowLimit": 10000,
+                "hierarchySettings": {
+                  "expandTopLevel": true,
+                  "treeType": 0,
+                  "expanderColumn": "FinalResult",
+                  "parentColumn": "ParentId",
+                  "idColumn": "Id"
+                }
+              },
+              "version": "KqlItem/1.0",
+              "exportToExcelOptions": "all",
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "showExportToExcel": true,
+              "timeContextFromParameter": "TimeRange",
+              "queryType": 0,
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ],
+              "showExpandCollapseGrid": true,
+              "title": "Selected event: execution tree (up to 2000 log records)"
+            },
+            "type": 3
+          }
+        ],
+        "groupType": "editable",
+        "version": "NotebookGroup/1.0"
+      },
+      "type": 12
     }
   ],
   "fallbackResourceIds": [
-    "Azure Monitor"
+    "__LOG_ANALYTICS_WORKSPACE_ID__"
   ],
   "$schema": "https://github.com/Microsoft/Application-Insights-Workbooks/blob/master/schema/workbook.json"
 }

@@ -9,6 +9,7 @@ CertLC is an event-driven certificate lifecycle management solution that integra
 - **Certificate Chain Preservation**: Store the complete CA chain in Key Vault and export the private-key leaf with its intermediate certificates in the protected PFX
 - **Certificate Revocation**: Revoke certificates on demand using the certificate thumbprint
 - **Statistics Collection**: Gather and store certificate metadata in Log Analytics for monitoring and reporting
+- **Event Journey**: Search events or certificates and follow separate Function attempts, Automation jobs and their logs in the production workbook
 - **Proactive Alerting**: Optionally deploy a dedicated Action Group with alerts for poison messages, Event Grid delivery failures, failed Automation jobs, and stale statistics
 
 ## Architecture
@@ -54,7 +55,7 @@ CertLC is an event-driven certificate lifecycle management solution that integra
 | Hybrid Worker | Run the PowerShell 7.6 runbooks with network access to Azure private endpoints, Active Directory, the Enterprise CA, and the PFX file location |
 | Enterprise CA | Issue complete certificate chains and process enrollment and revocation requests through AD CS RPC/DCOM interfaces |
 | Key Vault | Hold versioned certificates, private keys, complete certificate chains, and lifecycle tags |
-| Log Analytics and Application Insights | Store latest-version certificate inventory and operational telemetry; the workbook shows expiration status/details, runbook job status, and per-job logs |
+| Log Analytics and Application Insights | Store latest-version certificate inventory and operational telemetry; the workbook provides Statistics, Event Journey, Job logs and Function bridge views |
 | Azure Monitor Alerts and Action Group | Notify operators about poison messages, Event Grid dead-lettering or delivery failures, failed runbooks, and missing statistics snapshots when alerting is enabled |
 
 Azure-to-Azure calls use managed identities. Storage, Function App, Automation Account, and Key Vault data-plane access is private; the Hybrid Worker provides the boundary between Azure automation and the on-premises CA. Azure Monitor ingestion endpoints remain public and require controlled outbound access.
@@ -99,7 +100,7 @@ The exported, SID-protected PFX contains the private-key leaf and every intermed
 2. The Function App triggers the `certlc` runbook
 3. The runbook locates the matching Key Vault version by thumbprint using paginated Key Vault REST requests: it checks each certificate name's latest-version `x5t` first, then enumerates older versions when needed
 4. **Idempotency guard**: if the version already carries `Revoked=true`, the runbook logs `ALREADY REVOKED` with the previous `RevokedAt`, `RevocationReason`, and `RevokedJobId`, then completes successfully so the duplicate queue message is acknowledged. The CA is not called again, no duplicate notification is sent, and existing tags are preserved
-5. Otherwise, the runbook extracts the version's serial number and submits a revocation request to the CA for that serial
+5. Otherwise, the runbook validates the already-fetched version's public certificate against the requested thumbprint, extracts its serial number, and submits a revocation request to the CA for that serial. Revocation never downloads the certificate's secret/PFX or private key
 6. The matching Key Vault version is set to `enabled = false` and tagged with audit metadata (`Revoked=true`, `RevokedAt`, `RevocationReason`, `RevokedJobId`). Existing tags on the version (e.g. `NotifyTo`, `Hostname`, `PfxProtectTo`) are preserved. **No Key Vault objects are deleted by the runbook**; other versions of the same certificate are left untouched, and the certificate object remains in the vault for audit
 
 ### Key Vault Certificate Tags
@@ -123,7 +124,7 @@ CertLC stores the following tags on individual Key Vault certificate versions. C
 1. The `certlcstats` runbook runs hourly on the configured Hybrid Worker Group by default
 2. It enumerates certificate names in Key Vault and collects metadata from the latest version of each name
 3. Certificate data is published to a custom Log Analytics table via Data Collection Rule
-4. The Azure Monitor workbook shows certificate expiration status and details, runbook job status, and logs for selected jobs
+4. The Azure Monitor workbook shows certificate expiration status and details, an Event Journey from event/certificate search through Function attempts and Automation jobs to logs, plus the existing job and Function bridge views
 
 ### Proactive Alerting
 
@@ -162,13 +163,15 @@ CertLC/
 ├── Runbooks/                    # Automation runbooks
 │   ├── certlc.ps1              # Main certificate operations runbook
 │   ├── certlcstats.ps1         # Certificate statistics collection
+│   ├── certlc-jobid-test.ps1   # Retained Hybrid Worker job-identity diagnostic
 │   ├── normalnotification.html # Email template for successful operations
 │   └── errornotification.html  # Email template for failures
 ├── LogAnalytics/               # Custom table configuration
 │   └── customTable/            # Schema and transformation for certlcstats_CL table
 ├── Workbooks/                  # Azure Monitor workbooks
-│   ├── certlcstats.workbook    # Tokenized certificate statistics dashboard deployed by Bicep
-│   └── *.kql                   # KQL queries for visualizations
+│   ├── certlcstats.workbook    # Tokenized production workbook deployed by Bicep
+│   ├── README.md              # Embedded-query index and maintenance guidance
+│   └── *.kql                   # 18 queries matching the production workbook
 ├── Utilities/                  # Helper scripts
 │   ├── Export-PfxWithGroupProtection.ps1 # Export a Key Vault certificate as a SID-protected PFX
 │   ├── Extract-KeyCer.ps1      # Extract a certificate and private key from a PFX
@@ -177,14 +180,15 @@ CertLC/
 │   ├── testnewcertchain.ps1    # Validate full-chain creation and PFX export
 │   ├── testrenewcert.ps1       # Test certificate renewal
 │   └── testrevocationcert.ps1  # Test certificate revocation
-└── Tests/                      # Development and testing scripts
+└── Tests/                      # Retained legacy Event Grid schema sample
+  └── sample-eventgrideventschema.json
 ```
 
 ## Certificate Request Schema
 
 Requests are sent as JSON messages to the Storage Queue using CloudEventSchema. The schema varies by operation type:
 
-The runbook validates `specversion` (`1.0`) and `type`, and logs `id` when supplied. It consumes the operation-specific fields identified below. Other envelope and `data` fields shown in the examples are retained for CloudEvent/Event Grid compatibility but are not read by the current dispatcher.
+The runbook validates `specversion` (`1.0`) and `type`, and reads optional top-level `id` and `source` for diagnostics and the [correlation rules](#request-correlation) below. It consumes the operation-specific fields identified below. Other envelope and `data` fields shown in the examples are retained for CloudEvent/Event Grid compatibility but are not read by the current dispatcher. The retained [Event Grid schema sample](Tests/sample-eventgrideventschema.json) shows the legacy `eventType`/`topic` envelope, not the CloudEvents input expected by the current dispatcher; use the request examples below for current inputs.
 
 **Creation Request:**
 
@@ -268,6 +272,26 @@ Consumed `data` fields: `VaultName`, `CertificateThumbprint`, and `RevocationRea
 - **RBAC Authorization**: Key Vault uses Azure RBAC (not access policies) with least-privilege assignments
 - **Encrypted Variables**: Non-Azure secrets required by the runbooks, such as SMTP credentials, are stored as encrypted Automation variables
 - **Audit Logging**: Diagnostic settings enabled on Key Vault and Automation Account; enabling alerts also sends Queue Storage writes to Log Analytics for poison-message detection
+
+## Request Correlation
+
+`correlationId` represents only the top-level nonblank string event `id`, never `data.Id` or a job-ID fallback. The Function forwards only the unchanged `jsonRequestBody`; there is no separate runbook `CorrelationId` input. The runbook populates correlation after parsing this explicit JSON input path. Direct `WebhookData` calls omit correlation, including native, JSON, and legacy PowerShell webhook envelopes. This distinguishes input paths, not authenticated caller identity: any caller supplying `jsonRequestBody` receives the same behavior as the Function. Custom IDs need not be GUIDs; missing, null, empty, whitespace-only, or non-string IDs leave correlation omitted.
+
+The runbook checks Hybrid Worker execution, PowerShell 7.6+, and job identity before Azure authentication. Every custom log includes a separate `jobId` once discovered, including warnings, errors, verbose records, and serialization-failure records. Startup and payload-parsing failures omit `correlationId`. After explicit JSON parsing, validation and operation logs inherit the event ID when valid. `correlationIdSource` is no longer needed because the field never switches to execution identity. Nonblank logging-helper overrides are event IDs, not job IDs; they are not runbook inputs. Context cannot overwrite the reserved `jobId` or `correlationId` fields. These stream logs do not require Azure login, but module-loading failures and native cmdlet output are outside the custom logger contract. Early startup failures do not send SMTP notifications before notification configuration is available.
+
+Event correlation is diagnostic metadata, not authorization or duplicate suppression. A retried event retains its correlation ID but receives a separate Function invocation and Automation job. `RenewedJobId`, `RevokedJobId`, and notification job references always use the actual Automation job ID. Event `source` is logged separately because IDs are unique within a producer's source, not necessarily across producers.
+
+Every success and error email includes **Correlation ID** as the first row in its main details table. Emails can use the parsed top-level event ID from either input path, including direct `WebhookData`, without changing the stricter log correlation rules above. When no valid event ID is available, the row explicitly shows **Unavailable (no valid event ID)**; it never substitutes a job ID. The footer separately shows **Automation Job ID** when known. There is no duplicate **Event ID** row; the distinct **Request ID** (`data.Id`) remains. Values are HTML-encoded. Email delivery remains non-fatal and requires configured SMTP and recipients.
+
+The Function preserves its workbook-sensitive plain-text messages and emits separate JSON `BridgeCorrelation` receipt/start association records in Application Insights trace messages. Missing event IDs remain omitted in both records; the started record independently includes the returned `jobId`. These can be joined to other traces using the platform `OperationId`; they are not automatic distributed tracing or custom properties. Reserved workbook-filter terms within association values are JSON-escaped and restored by JSON parsing. The runbook's JSON fields and streams remain compatible with Job History, which still groups by platform `JobId_g`. The independent stats runbook, its `SnapshotId`, ingestion schema, and existing workbook queries remain unchanged.
+
+When upgrading from the separate-input version, publish and verify the Function first so it stops forwarding `CorrelationId`, then publish the runbook that removes the parameter. Update any other callers that explicitly pass it. During this transition the old runbook may use job-ID correlation; certificate behavior is unchanged. Verify actual telemetry ingestion after deployment. Temporary development tests are not distributed.
+
+## Workbook Maintenance
+
+The production workbook has four tabs in order: **Statistics**, **Event Journey**, **Job logs**, and **Function bridge**. Event Journey uses **Search events/certificates**, shows **Found events (up to 500)**, and opens selected-event details and an expandable execution tree. All views share the original resource and time selectors.
+
+Keep the resource placeholders in [Workbooks/certlcstats.workbook](Workbooks/certlcstats.workbook) unresolved. Bicep supplies the environment IDs at deployment time. The [workbook query index](Workbooks/README.md) maps all 18 standalone KQL files to their embedded counterparts; maintain both copies together. A workbook-only deployment does not publish the Function or either runbook. Prototype workbooks and temporary generators are not needed for deployment.
 
 ## Getting Started
 
