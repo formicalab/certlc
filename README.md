@@ -137,10 +137,10 @@ Alerting is controlled by the Bicep `enableAlerts` parameter, which defaults to 
 - Event Grid dead-lettered and dropped events (severity 1)
 - Repeated Event Grid delivery failures (severity 3)
 - Messages written to the `certlc-poison` queue (severity 1)
-- Failed, stopped, or suspended `certlc` and `certlcstats` Automation jobs (severity 2)
-- No successful `certlcstats` completion within two hours (severity 2)
+- Failed, stopped, or suspended `certlc` lifecycle Automation jobs (severity 2)
+- Unhealthy statistics: `certlcstats` failed, stopped, or suspended without a later successful completion, or has no successful completion within two hours (severity 2)
 
-Action Group email receivers are configured per environment and use the common alert schema. The stale-statistics rule reports an unhealthy state when the hourly statistics schedule is disabled or has not completed successfully.
+Action Group email receivers are configured per environment and use the common alert schema. The statistics-health rule retains the resource name `alert-certlc-statistics-stale` and evaluates every five minutes over the last two hours. It remains unhealthy through missing data and created, queued, or running jobs; failure records aging out do not count as recovery. Only a recent `Completed` record strictly later than the latest failure makes it healthy. Azure then applies its stateful resolution delay (three healthy evaluation periods at this frequency), so recovery notification is not immediate. The rule also reports an unhealthy state when the hourly statistics schedule is disabled or has not completed successfully. Statistics jobs are excluded from the short-window lifecycle failure rule to avoid duplicate, cycling notifications. These source changes take effect only after deploying the alert updates.
 
 ### Resilience
 

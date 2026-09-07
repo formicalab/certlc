@@ -295,10 +295,11 @@ workbook-only upgrade. Historical telemetry is not rewritten by either deploymen
   - More than five failed delivery attempts in 15 minutes (severity 3)
 - **Log alerts**:
   - A message written to the `certlc-poison` queue (severity 1)
-  - A `certlc` or `certlcstats` Automation job entering Failed, Stopped, or Suspended state (severity 2)
-  - No successful `certlcstats` completion within two hours (severity 2)
+  - A `certlc` lifecycle Automation job entering Failed, Stopped, or Suspended state (severity 2)
+  - A `certlcstats` failure, stop, or suspension without a later successful completion, or no successful completion within two hours (severity 2)
 - **Queue diagnostics**: Enabling alerts also sends Queue Storage `StorageWrite` logs to the existing Log Analytics workspace
-- **Statistics schedule**: The stale-statistics alert intentionally fires while the `certlcstats` schedule remains unlinked or otherwise fails to produce successful runs
+- **Statistics recovery**: The existing `alert-certlc-statistics-stale` resource is displayed as **CertLC statistics are unhealthy** and evaluates every five minutes over two hours. Only a recent `Completed` record strictly later than the latest Failed, Stopped, or Suspended record permits recovery. Missing data, failure records aging out, and created/queued/running jobs never clear the condition. Azure sends the resolved notification after its stateful resolution delay (three healthy evaluation periods). The separate lifecycle failure rule excludes `certlcstats`, preventing duplicate hourly firing/resolution cycles. Deploy both rule updates together; changing local source alone does not change Azure alerts
+- **Statistics schedule**: The statistics-health alert intentionally fires while the `certlcstats` schedule remains unlinked or otherwise fails to produce successful runs
 
 ### Application and Automation
 
