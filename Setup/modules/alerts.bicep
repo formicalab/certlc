@@ -213,7 +213,8 @@ module scheduledQueryAlerts 'br/public:avm/res/insights/scheduled-query-rule:0.6
     evaluationFrequency: definition.evaluationFrequency
     windowSize: definition.windowSize
     severity: definition.severity
-    autoMitigate: true
+    // Lifecycle failures are stateless for now: window expiry must not report recovery.
+    autoMitigate: definition.key != 'automation-failure'
     // Fresh workspaces may not expose these tables until their first diagnostic record arrives.
     skipQueryValidation: true
     tags: tags
