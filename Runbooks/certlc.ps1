@@ -152,10 +152,9 @@ $CloudEventSpecVersion = '1.0'
 # Keep invocation state distinct from the logging helpers' optional override parameters.
 $script:CertLCCorrelationId = ''
 
-<# Unified SMTP / Email templates
- There are two templates with placeholders populated by New-CertLCNotificationBody.
- 1. $CertificateNotificationEmailBodyHtml -> generic (creation / renewal / revocation / info)
- 2. $CertificateErrorEmailBodyHtml        -> error (distinct colors + icon)
+<# Unified SMTP / Email layout
+ New-CertLCNotificationBody supplies fixed success/error colors and spacing to one layout.
+ $CertificateErrorEmailSectionHtml is inserted only when substantive error details exist.
 
  Usage (example):
      $body = New-CertLCNotificationBody -Title 'Certificate renewed' -Summary 'Renewal completed.' -Details ([ordered]@{ Certificate = $name })
@@ -168,12 +167,13 @@ $CertificateNotificationEmailBodyHtml = @'
         <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#eef2f6;">
             <tr>
                 <td align="center" style="padding:24px 12px;">
-                    <table role="presentation" width="640" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:640px;background:#ffffff;border:1px solid #ccd6e0;">
-                        <tr><td style="padding:22px 24px;background:#0b5cab;color:#ffffff;font-size:20px;font-weight:600;">__TITLE__</td></tr>
+                    <table role="presentation" width="640" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:640px;background:#ffffff;border:1px solid __BORDER_COLOR__;">
+                        <tr><td style="padding:22px 24px;background:__HEADER_COLOR__;color:#ffffff;font-size:20px;font-weight:600;">__TITLE__</td></tr>
                         <tr><td style="padding:18px 24px 8px;color:#263746;">__SUMMARY__</td></tr>
-                        <tr><td style="padding:10px 24px 24px;">
+                        <tr><td style="padding:10px 24px __DETAILS_BOTTOM_PADDING__;">
                             <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;border:1px solid #d8e2ec;">__DETAILS__</table>
                         </td></tr>
+                        __ERROR_SECTION__
                         <tr><td style="padding:14px 24px;background:#f7f9fb;border-top:1px solid #d8e2ec;font-size:11px;color:#5a6b7b;">__FOOTER__</td></tr>
                     </table>
                 </td>
@@ -183,28 +183,10 @@ $CertificateNotificationEmailBodyHtml = @'
 </html>
 '@
 
-$CertificateErrorEmailBodyHtml = @'
-<html>
-    <body style="margin:0;padding:0;background:#eef2f6;font-family:Segoe UI,Arial,sans-serif;font-size:14px;line-height:1.5;color:#17202a;">
-        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;background:#eef2f6;">
-            <tr>
-                <td align="center" style="padding:24px 12px;">
-                    <table role="presentation" width="640" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:640px;background:#ffffff;border:1px solid #e1b4b4;">
-                        <tr><td style="padding:22px 24px;background:#b42318;color:#ffffff;font-size:20px;font-weight:600;">__TITLE__</td></tr>
-                        <tr><td style="padding:18px 24px 8px;color:#263746;">__SUMMARY__</td></tr>
-                        <tr><td style="padding:10px 24px 16px;">
-                            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;border:1px solid #d8e2ec;">__DETAILS__</table>
-                        </td></tr>
+$CertificateErrorEmailSectionHtml = @'
                         <tr><td style="padding:0 24px 24px;">
                             <div style="background:#fff1f0;border:1px solid #f3b7b2;padding:14px 16px;color:#7a271a;font-family:Consolas,'Courier New',monospace;font-size:12px;line-height:1.5;">__ERROR_DETAILS__</div>
                         </td></tr>
-                        <tr><td style="padding:14px 24px;background:#f7f9fb;border-top:1px solid #d8e2ec;font-size:11px;color:#5a6b7b;">__FOOTER__</td></tr>
-                    </table>
-                </td>
-            </tr>
-        </table>
-    </body>
-</html>
 '@
 
 # Error notifications can be raised at any point in a dispatcher path. This ordered map is
@@ -406,14 +388,18 @@ function Send-NotificationEmail {
 
     try {
 
-        if ($null -eq $SmtpCredential) {
-            # send without authentication
-            Send-MailMessage -SmtpServer $SmtpServer -From $FromAddress -To $To -Subject $Subject -Body $Body -BodyAsHtml:$true -WarningAction:SilentlyContinue
+        # Omit Credential for anonymous relays rather than binding a null credential.
+        $mailParameters = @{
+            SmtpServer = $SmtpServer
+            From = $FromAddress
+            To = $To
+            Subject = $Subject
+            Body = $Body
+            BodyAsHtml = $true
+            WarningAction = 'SilentlyContinue'
         }
-        else {
-            # send with authentication
-            Send-MailMessage -SmtpServer $SmtpServer -From $FromAddress -To $To -Subject $Subject -Body $Body -BodyAsHtml:$true -Credential $SmtpCredential -WarningAction:SilentlyContinue
-        }
+        if ($null -ne $SmtpCredential) { $mailParameters.Credential = $SmtpCredential }
+        Send-MailMessage @mailParameters
 
         Write-CertLCLog -Message "Notification email sent to: $($To -join ', ')" -Section 'Send-NotificationEmail'
     }
@@ -421,6 +407,31 @@ function Send-NotificationEmail {
         # don't throw if email sending fails, just log the error
         Write-CertLCLog -Level 'Warning' -Message "Error sending notification email to $($To -join ', '): $($_.Exception.Message)" -Section 'Send-NotificationEmail'
     }
+}
+
+#endregion
+
+#region ### ConvertFrom-CertLCNotifyToTag ###
+
+#############################################
+# FUNCTIONS - ConvertFrom-CertLCNotifyToTag #
+#############################################
+
+<#
+.SYNOPSIS
+    Split a certificate's notification tag into trimmed, nonempty email addresses.
+.DESCRIPTION
+    Preserves address order, casing, and duplicates. Missing tags produce an empty array;
+    callers retain their existing logging and optional-notification decisions.
+#>
+function ConvertFrom-CertLCNotifyToTag {
+    [OutputType([string[]])]
+    param([AllowNull()][AllowEmptyString()][string]$TagValue)
+
+    # The framework split options perform the same trim/filter pass in one operation.
+    $options = [System.StringSplitOptions]::TrimEntries -bor [System.StringSplitOptions]::RemoveEmptyEntries
+    $addresses = if ($null -eq $TagValue) { @() } else { $TagValue.Split(';', $options) }
+    Write-Output -NoEnumerate @($addresses)
 }
 
 #endregion
@@ -564,11 +575,11 @@ function New-CertLCCreationNotificationDetails {
 
 <#
 .SYNOPSIS
-    Build a complete success or error notification from the embedded HTML templates.
+    Build a complete success or error notification from the shared embedded HTML layout.
 
 .DESCRIPTION
-    Selects the error template when ErrorDetails is supplied; otherwise selects the normal
-    template. Dynamic values are encoded individually, while the detail rows and fixed footer
+    Selects error styling and an error section when ErrorDetails is supplied. Dynamic values
+    are encoded individually, while the detail rows and fixed footer
     markup remain trusted renderer output. Literal String.Replace calls are used because the
     placeholders are fixed tokens and must not be interpreted as regular expressions.
 
@@ -582,7 +593,7 @@ function New-CertLCCreationNotificationDetails {
     Ordered label/value pairs rendered into the detail table.
 
 .PARAMETER ErrorDetails
-    Optional exception text. Supplying a nonblank value selects the error template.
+    Optional exception text. Supplying a nonblank value selects error styling and content.
 
 .PARAMETER JobId
     Optional actual Automation execution identifier, labelled separately in the footer.
@@ -605,13 +616,17 @@ function New-CertLCNotificationBody {
         [Parameter()][string]$CorrelationId
     )
 
-    # Select the failure template only for substantive errors; blank details mean success.
-    $template = if ([string]::IsNullOrWhiteSpace($ErrorDetails)) {
-        $CertificateNotificationEmailBodyHtml
-    }
-    else {
-        $CertificateErrorEmailBodyHtml
-    }
+    # Only fixed renderer-owned values enter CSS or raw markup. Blank error text keeps
+    # the success layout; the error section retains its original table row and spacing.
+    $isError = -not [string]::IsNullOrWhiteSpace($ErrorDetails)
+    $borderColor = $isError ? '#e1b4b4' : '#ccd6e0'
+    $headerColor = $isError ? '#b42318' : '#0b5cab'
+    $detailsPadding = $isError ? '16px' : '24px'
+    $errorSection = $isError ? $CertificateErrorEmailSectionHtml : ''
+    $template = $CertificateNotificationEmailBodyHtml.Replace('__BORDER_COLOR__', $borderColor).
+        Replace('__HEADER_COLOR__', $headerColor).
+        Replace('__DETAILS_BOTTOM_PADDING__', $detailsPadding).
+        Replace('__ERROR_SECTION__', $errorSection)
     $footer = 'Automated message &bull; CERTLC'
     # Keep the execution identifier separate from the correlation row in the main details.
     if (-not [string]::IsNullOrWhiteSpace($JobId)) {
@@ -630,7 +645,7 @@ function New-CertLCNotificationBody {
             $CorrelationId = $eventVariable.Value
         }
     }
-    # Always display correlation prominently in both templates, even for early error emails.
+    # Always display correlation prominently for both outcomes, even for early error emails.
     # Copy details without mutating the caller or allowing custom details to replace identity.
     $emailDetails = [ordered]@{
         'Correlation ID' = if ([string]::IsNullOrWhiteSpace($CorrelationId)) { 'Unavailable (no valid event ID)' } else { $CorrelationId }
@@ -1128,9 +1143,8 @@ function Convert-PfxProtectToFromTag {
         return
     }
 
-    # Parse then normalize to keep parity with input handling
-    $raw = @($TagValue.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
-    $normalized = Format-PfxProtectTo -InputValue $raw
+    # The shared normalizer already trims and removes empty entries after splitting.
+    $normalized = Format-PfxProtectTo -InputValue $TagValue.Split(';')
     Write-Output -NoEnumerate @($normalized)
 }
 
@@ -2048,6 +2062,50 @@ function Export-PfxWithGroupProtection {
         # free the protection descriptor handle
         [CertLCPfxNative]::NCryptCloseProtectionDescriptor($hDesc) | Out-Null
     }
+}
+
+#endregion
+
+#region ### Get-CertLCTemplateOid ###
+
+#####################################
+# FUNCTIONS - Get-CertLCTemplateOid #
+#####################################
+
+<#
+.SYNOPSIS
+    Decode the AD CS template OID without localized extension names or formatted text.
+.DESCRIPTION
+    Reads Certificate Template Information (1.3.6.1.4.1.311.21.7) as a DER sequence
+    containing the template OID and up to two optional unsigned version integers.
+    Rejects malformed or trailing data. The caller retains ownership of the certificate.
+#>
+function Get-CertLCTemplateOid {
+    [OutputType([string])]
+    param([Parameter(Mandatory)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate)
+
+    $extension = $Certificate.Extensions['1.3.6.1.4.1.311.21.7']
+    if ($null -eq $extension) {
+        throw [System.ArgumentException]::new('Certificate Template Information extension was not found.')
+    }
+
+    # Decode the encoded value, never Format() output or FriendlyName. Read the entire
+    # structure so malformed version fields cannot be mistaken for a usable template.
+    $reader = [System.Formats.Asn1.AsnReader]::new(
+        [System.ReadOnlyMemory[byte]]::new($extension.RawData), [System.Formats.Asn1.AsnEncodingRules]::DER)
+    $sequence = $reader.ReadSequence()
+    $templateOid = $sequence.ReadObjectIdentifier()
+    foreach ($versionField in 'major', 'minor') {
+        if ($sequence.HasData) {
+            $version = $sequence.ReadInteger()
+            if ($version -lt 0 -or $version -gt [uint32]::MaxValue) {
+                throw [System.ArgumentException]::new("Invalid template $versionField version: expected an unsigned 32-bit integer.")
+            }
+        }
+    }
+    $sequence.ThrowIfNotEmpty()
+    $reader.ThrowIfNotEmpty()
+    return $templateOid
 }
 
 #endregion
@@ -3230,6 +3288,93 @@ function New-CertificateRevocationRequest {
 
 #endregion
 
+#region ### ConvertTo-CertLCRequestMap ###
+
+##########################################
+# FUNCTIONS - ConvertTo-CertLCRequestMap #
+##########################################
+
+<#
+.SYNOPSIS
+    Normalize a JSON or native request object to a case-insensitive dictionary.
+.DESCRIPTION
+    Missing optional keys return null under StrictMode. Values retain their original
+    types and array shapes; only object containers are normalized, without serialization.
+.PARAMETER Value
+    A parsed JSON dictionary or native webhook object. Scalars and arrays are rejected.
+.PARAMETER Label
+    Request location included in validation errors.
+#>
+function ConvertTo-CertLCRequestMap {
+    [OutputType([hashtable])]
+    param([AllowNull()][object]$Value, [string]$Label = 'request body')
+
+    if ($Value -is [System.Collections.IDictionary]) {
+        $entries = $Value.GetEnumerator()
+    }
+    # The [pscustomobject] accelerator also matches PSObject-wrapped JSON scalars and
+    # arrays. The concrete base type admits native objects without admitting those shapes.
+    elseif ($Value -is [System.Management.Automation.PSCustomObject]) {
+        $entries = foreach ($property in $Value.PSObject.Properties) {
+            [System.Collections.DictionaryEntry]::new($property.Name, $property.Value)
+        }
+    }
+    else {
+        throw [System.ArgumentException]::new("Expected a single object for '$Label'.")
+    }
+
+    # Use PowerShell's case-insensitive map for native and JSON inputs alike. Reject
+    # ambiguous case-only duplicate keys instead of choosing a different field silently.
+    $normalized = @{}
+    foreach ($entry in $entries) {
+        if ($entry.Key -isnot [string] -or $normalized.ContainsKey($entry.Key)) {
+            throw [System.ArgumentException]::new("Invalid or duplicate field in '$Label': '$($entry.Key)'.")
+        }
+        $normalized[$entry.Key] = $entry.Value
+    }
+    return $normalized
+}
+
+#endregion
+
+#region ### Assert-CertLCRequestFields ###
+
+##########################################
+# FUNCTIONS - Assert-CertLCRequestFields #
+##########################################
+
+<#
+.SYNOPSIS
+    Validate required strings and optional arrays without coercing request values.
+.DESCRIPTION
+    Missing or null optional arrays are accepted; scalars are not promoted to arrays.
+    Domain rules such as hostname syntax, principal normalization, and reason codes
+    remain with the dispatcher. Callers own structured logging and email context.
+#>
+function Assert-CertLCRequestFields {
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Data,
+        [string[]]$RequiredStrings = @(),
+        [string[]]$OptionalArrays = @(),
+        [string]$Prefix = 'data.'
+    )
+
+    foreach ($name in $RequiredStrings) {
+        $value = $Data[$name]
+        if ($value -isnot [string] -or [string]::IsNullOrWhiteSpace($value)) {
+            throw [System.ArgumentException]::new("Missing, empty, or invalid mandatory string parameter: '$Prefix$name' in request body!")
+        }
+    }
+    foreach ($name in $OptionalArrays) {
+        # Indexing a normalized map returns null for omitted optional properties.
+        if ($null -ne $Data[$name] -and $Data[$name] -isnot [array]) {
+            throw [System.ArgumentException]::new("Parameter '$Prefix$name' is not an array!")
+        }
+    }
+}
+
+#endregion
+
 #region ### Dispatcher ###
 
 ###############
@@ -3435,8 +3580,9 @@ if (-not $usesJsonRequestBody) {
     # Accept a native webhook envelope or its JSON representation. Keep the existing
     # malformed PowerShell webhook fallback below for envelopes that are not valid JSON.
     try {
-        $request = if ($WebhookData -is [string]) { ConvertFrom-Json -InputObject $WebhookData -Depth 10 } else { $WebhookData }
-        $requestBody = $request.RequestBody
+        $request = if ($WebhookData -is [string]) { ConvertFrom-Json -InputObject $WebhookData -Depth 10 -AsHashtable -NoEnumerate } else { $WebhookData }
+        $request = ConvertTo-CertLCRequestMap -Value $request -Label 'webhook envelope'
+        $requestBody = $request['RequestBody']
     }
     catch {
         # Fallback to regex extraction for broken format. The following regex matches these cases:
@@ -3451,7 +3597,7 @@ if (-not $usesJsonRequestBody) {
             $jsonRequestBody = $matches[1]
             Write-CertLCLog -Section 'Dispatcher' -Message "Regex extracted RequestBody: $jsonRequestBody"
             try {
-                $RequestBody = ConvertFrom-Json -InputObject $jsonRequestBody -Depth 10
+                $RequestBody = ConvertFrom-Json -InputObject $jsonRequestBody -Depth 10 -AsHashtable -NoEnumerate
             }
             catch {
                 # The extracted body may contain literal escape sequences (e.g. \r\n, \") from callers that
@@ -3461,7 +3607,7 @@ if (-not $usesJsonRequestBody) {
                 $jsonRequestBody = $jsonRequestBody -replace '\\r\\n', "`r`n" -replace '\\"', '"'
                 Write-CertLCLog -Section 'Dispatcher' -Message "Unescaped RequestBody: $jsonRequestBody"
                 try {
-                    $RequestBody = ConvertFrom-Json -InputObject $jsonRequestBody -Depth 10
+                    $RequestBody = ConvertFrom-Json -InputObject $jsonRequestBody -Depth 10 -AsHashtable -NoEnumerate
                     Write-CertLCLog -Section 'Dispatcher' -Message 'Successfully parsed RequestBody after unescaping.'
                 }
                 catch {
@@ -3481,7 +3627,7 @@ else {
     # parse the jsonRequestBody parameter as JSON
     Write-CertLCLog -Section 'Dispatcher' -Message "jsonRequestBody received is: $($jsonRequestBody)"
     try {
-        $requestBody = ConvertFrom-Json -InputObject $jsonRequestBody -Depth 10
+        $requestBody = ConvertFrom-Json -InputObject $jsonRequestBody -Depth 10 -AsHashtable -NoEnumerate
     }
     catch {
         Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'Failed to parse jsonRequestBody parameter as JSON' -Inner $_.Exception
@@ -3492,27 +3638,23 @@ else {
 # before reading identity so native, JSON, and legacy webhook paths share one contract.
 if ($requestBody -is [string]) {
     try {
-        $requestBody = ConvertFrom-Json -InputObject $requestBody -Depth 10
+        $requestBody = ConvertFrom-Json -InputObject $requestBody -Depth 10 -AsHashtable -NoEnumerate
     }
     catch {
         Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'Failed to parse request body as JSON' -Inner $_.Exception
     }
 }
 
-# Read optional top-level identity safely under StrictMode. Never coerce numbers/objects
-# into event IDs or use data.Id; absent event identity must never become job correlation.
-$requestEventId = $null
-$requestEventSource = ''
-if ($requestBody -is [System.Collections.IDictionary]) {
-    $requestEventId = $requestBody['id']
-    $requestEventSource = [string]$requestBody['source']
+# Normalize once after the transport-specific parsing. No property access or string
+# coercion should turn a malformed envelope into an apparently valid request.
+try {
+    $requestBody = ConvertTo-CertLCRequestMap -Value $requestBody
 }
-elseif ($null -ne $requestBody) {
-    $eventIdProperty = $requestBody.PSObject.Properties['id']
-    $eventSourceProperty = $requestBody.PSObject.Properties['source']
-    if ($null -ne $eventIdProperty) { $requestEventId = $eventIdProperty.Value }
-    if ($null -ne $eventSourceProperty) { $requestEventSource = [string]$eventSourceProperty.Value }
+catch {
+    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message $_.Exception.Message -InnerException $_.Exception
 }
+$requestEventId = $requestBody['id']
+$requestEventSource = [string]$requestBody['source']
 # Only the explicit JSON input path contributes event correlation. Webhook IDs can still
 # be shown in the request diagnostic below without becoming the correlation field.
 $hasRequestEventId = $requestEventId -is [string] -and -not [string]::IsNullOrWhiteSpace($requestEventId)
@@ -3522,9 +3664,13 @@ if ($usesJsonRequestBody -and $hasRequestEventId) {
 
 # Now that the payload identity is known, validation and operation logs share correlation.
 
-# check version
-if ([string]::IsNullOrEmpty($requestBody.specversion)) {
-    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "Missing or empty mandatory string parameter: 'specversion' in request body!"
+# Establish correlation before reporting envelope/data validation failures.
+try {
+    Assert-CertLCRequestFields -Data $requestBody -RequiredStrings 'specversion', 'type' -Prefix ''
+    $requestData = ConvertTo-CertLCRequestMap -Value $requestBody['data'] -Label 'data'
+}
+catch {
+    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message $_.Exception.Message -InnerException $_.Exception
 }
 if ($requestBody.specversion -ne $CloudEventSpecVersion) {
     Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "The CloudEvents specversion specified in the request, $($requestBody.specversion), does not match the supported specversion $CloudEventSpecVersion!"
@@ -3533,12 +3679,7 @@ else {
     Write-CertLCLog -Section 'Dispatcher' -Message "specversion: $($requestBody.specversion)"
 }
 
-if ([string]::IsNullOrEmpty($requestBody.type)) {
-    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "Missing or empty mandatory string parameter: 'type' in request body!"
-}
-else {
-    Write-CertLCLog -Section 'Dispatcher' -Message "request type: $($requestBody.type)"
-}
+Write-CertLCLog -Section 'Dispatcher' -Message "request type: $($requestBody.type)"
 
 if (-not $hasRequestEventId) {
     Write-CertLCLog -Section 'Dispatcher' -Message "request id: (not provided)" -Level 'Warning'
@@ -3561,28 +3702,24 @@ switch ($requestBody.type) {
         ######################
 
         # get parameters
-        $VaultName = $requestBody.data.VaultName
-        $CertificateName = $requestBody.data.ObjectName
+        $VaultName = $requestData['VaultName']
+        $CertificateName = $requestData['ObjectName']
         # Seed error-notification context from the event immediately, then enrich it only after
         # Key Vault and Active Directory values have been retrieved and validated.
         $script:CertificateNotificationContext = [ordered]@{
             Operation          = 'Renewal'
             # The shared renderer adds the Correlation ID row for every email type.
-            'Request ID'       = $requestBody.data.Id
+            'Request ID'       = $requestData['Id']
             'Key Vault'        = $VaultName
             'Certificate name' = $CertificateName
         }
 
-        # start formal validation of mandatory parameters:
-
-        # VaultName: presence and non-empty check
-        if ([string]::IsNullOrEmpty($VaultName)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Missing or empty mandatory string parameter: 'VaultName'!"
+        # Validate the event's local fields before retrieving certificate metadata.
+        try {
+            Assert-CertLCRequestFields -Data $requestData -RequiredStrings 'VaultName', 'ObjectName'
         }
-
-        # CertificateName: presence and non-empty check
-        if ([string]::IsNullOrEmpty($CertificateName)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Missing or empty mandatory string parameter: 'ObjectName'!"
+        catch {
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message $_.Exception.Message -InnerException $_.Exception
         }
 
         # before processing the request, we need to obtain the other certificate details, such as template, subject, and DNS names
@@ -3623,7 +3760,7 @@ switch ($requestBody.type) {
         }
         else {
             Write-CertLCLog -Section 'Dispatcher.Renewal' -Message "NotifyTo addresses found for certificate $CertificateName in vault ${VaultName}: $rawNotifyTo"
-            $notifyTo = @($rawNotifyTo.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+            $notifyTo = ConvertFrom-CertLCNotifyToTag -TagValue $rawNotifyTo
         }
 
         # Certificate subject
@@ -3640,22 +3777,13 @@ switch ($requestBody.type) {
             $CertificateDnsNames = @($sanExtension.EnumerateDnsNames())
         }
 
-        # get the OID of the Certificate Template
-        $templateExtension = $cert.Certificate.Extensions | Where-Object { $_.Oid.FriendlyName -eq 'Certificate Template Information' }
-        if ($null -eq $templateExtension) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message 'Error getting template information from certificate: the Certificate Template Information extension was not found.' -NotifyTo $NotifyTo @smtpArgs
+        # Decode the template's numeric OID directly from DER, independent of worker locale.
+        try {
+            $oid = Get-CertLCTemplateOid -Certificate $cert.Certificate
         }
-        # $templateExtension.Format($false) returns a string like:
-        # - Template=Flab-ShortWebServer(1.3.6.1.4.1.311.21.8.15431357.2613787.6440092.16459852.14380503.11.12399345.16691736), Major Version Number=100, Minor Version Number=5
-        # - Template=1.3.6.1.4.1.311.21.8.15431357.2613787.6440092.16459852.14380503.11.12399345.16691736, Major Version Number=100, Minor Version Number=5
-        $asn = $templateExtension.Format($false)
-
-        # extract the OID using a regex working for both cases
-        $regex = [regex]'(?<=Template=(?:[^\(]*\()?)(\d+(?:\.\d+)+)'
-        if (-not $regex.IsMatch($asn)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message "Error getting OID from certificate: Template OID not found in string: $asn" -NotifyTo $NotifyTo @smtpArgs
+        catch {
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Renewal' -Message 'Error decoding certificate template information.' -InnerException $_.Exception -NotifyTo $NotifyTo @smtpArgs
         }
-        $oid = $regex.Match($asn).Value
 
         # lookup the template name using the OID
         try {
@@ -3734,7 +3862,7 @@ switch ($requestBody.type) {
         # Success details come from the completed operation result rather than the original event,
         # so the email reports the certificate and PFX artifacts that were actually committed.
         $notificationDetails = New-CertLCCreationNotificationDetails `
-            -OperationResult $creationResult -Operation 'Renewal' -RequestId $requestBody.data.Id
+            -OperationResult $creationResult -Operation 'Renewal' -RequestId $requestData['Id']
         # send notification email if requested and SMTP is configured
         Send-SuccessNotification -Section 'Dispatcher.Renewal' `
             -Subject "Certificate $CertificateName renewed successfully" `
@@ -3758,20 +3886,20 @@ switch ($requestBody.type) {
         #######################
 
         # get parameters
-        $VaultName = $requestBody.data.VaultName
-        $CertificateName = $requestBody.data.ObjectName
-        $CertificateTemplate = $requestBody.data.CertificateTemplate
-        $CertificateSubject = $requestBody.data.CertificateSubject
-        $CertificateDnsNames = $requestBody.data.CertificateDnsNames
-        $Hostname = $requestBody.data.Hostname
-        $PfxProtectTo = $requestBody.data.PfxProtectTo
-        $NotifyTo = $requestBody.data.NotifyTo
+        $VaultName = $requestData['VaultName']
+        $CertificateName = $requestData['ObjectName']
+        $CertificateTemplate = $requestData['CertificateTemplate']
+        $CertificateSubject = $requestData['CertificateSubject']
+        $CertificateDnsNames = $requestData['CertificateDnsNames']
+        $Hostname = $requestData['Hostname']
+        $PfxProtectTo = $requestData['PfxProtectTo']
+        $NotifyTo = $requestData['NotifyTo']
         # Preserve raw request context early enough for validation failures to produce a useful
         # error email. Normalized values replace selected fields as validation succeeds below.
         $script:CertificateNotificationContext = [ordered]@{
             Operation          = 'Creation'
             # The shared renderer adds the Correlation ID row for every email type.
-            'Request ID'       = $requestBody.data.Id
+            'Request ID'       = $requestData['Id']
             'Key Vault'        = $VaultName
             'Certificate name' = $CertificateName
             Template           = $CertificateTemplate
@@ -3780,24 +3908,38 @@ switch ($requestBody.type) {
             Hostname           = $Hostname
         }
 
-        # start formal validation of mandatory parameters:
-
-        # NotifyTo (optional, but if specified, must be an array)
-        if ($NotifyTo -and $NotifyTo -isnot [array]) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Parameter 'NotifyTo' is not an array!"
+        # Reject malformed recipients before they can be passed to an error notification.
+        try {
+            Assert-CertLCRequestFields -Data $requestData -OptionalArrays 'NotifyTo'
+        }
+        catch {
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message $_.Exception.Message -InnerException $_.Exception
+        }
+        try {
+            Assert-CertLCRequestFields -Data $requestData `
+                -RequiredStrings 'VaultName', 'ObjectName', 'CertificateTemplate', 'CertificateSubject', 'Hostname' `
+                -OptionalArrays 'CertificateDnsNames'
+        }
+        catch {
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message $_.Exception.Message -InnerException $_.Exception -NotifyTo $NotifyTo @smtpArgs
         }
 
-        # VaultName: presence and non-empty check
-        if ([string]::IsNullOrEmpty($VaultName)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.VaultName' in request body!" -NotifyTo $NotifyTo @smtpArgs
+        # Finish local domain validation before any Key Vault or AD lookup.
+        $Hostname = $Hostname.Trim().ToLowerInvariant()
+        if ($Hostname -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9\-\.]{0,253})$') {
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Hostname '$Hostname' is not valid!" -NotifyTo $NotifyTo @smtpArgs
         }
-
-        # CertificateName: presence and non-empty check
-        if ([string]::IsNullOrEmpty($CertificateName)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.ObjectName' in request body!" -NotifyTo $NotifyTo @smtpArgs
+        if (-not $PfxProtectTo) {
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing mandatory parameter 'PfxProtectTo'!" -NotifyTo $NotifyTo @smtpArgs
         }
+        $PfxProtectTo = Format-PfxProtectTo -InputValue $PfxProtectTo
+        if (-not $PfxProtectTo) {
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message 'PfxProtectTo list is empty after normalization!' -NotifyTo $NotifyTo @smtpArgs
+        }
+        $script:CertificateNotificationContext['Hostname'] = $Hostname
+        $script:CertificateNotificationContext['PFX protection principals'] = $PfxProtectTo
 
-        # CertificateName: check if the certificate already exists in the key vault
+        # CertificateName: check whether it is soft-deleted before attempting issuance.
         try {
             $deletedCert = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -InRemovedState
         }
@@ -3806,11 +3948,6 @@ switch ($requestBody.type) {
         }
         if (($null -ne $deletedCert) -and ($null -ne $deletedCert.DeletedDate)) {
             Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Certificate $CertificateName is deleted since $($deletedCert.DeletedDate). Purge it or use a different name." -NotifyTo $NotifyTo @smtpArgs
-        }
-
-        # CertificateTemplate: presence and non-empty check
-        if ([string]::IsNullOrEmpty($CertificateTemplate)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.CertificateTemplate' in request body!" -NotifyTo $NotifyTo @smtpArgs
         }
 
         # CertificateTemplate: check if the template exists in AD; caller may have specified the template name (CN) or the display name or the OID. We need the 'name' attribute
@@ -3824,38 +3961,8 @@ switch ($requestBody.type) {
             Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Certificate template $CertificateTemplate not found in Active Directory!" -NotifyTo $NotifyTo @smtpArgs
         }
 
-        # CertificateSubject: presence and non-empty check
-        if ([string]::IsNullOrEmpty($CertificateSubject)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.CertificateSubject' in request body!" -NotifyTo $NotifyTo @smtpArgs
-        }
-
-        # DnsNames (optional, but if specified, must be an array)
-        if ($CertificateDnsNames -and $CertificateDnsNames -isnot [array]) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Parameter 'CertificateDnsNames' is not an array!" -NotifyTo $NotifyTo @smtpArgs
-        }
-
-        # Hostname
-        if ([string]::IsNullOrWhiteSpace($Hostname)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing or empty mandatory string parameter: 'data.Hostname' in request body!" -NotifyTo $NotifyTo @smtpArgs
-        }
-        # Hostname identifiers must not depend on the Hybrid Worker's current culture.
-        $Hostname = $Hostname.Trim().ToLowerInvariant()
-        if ($Hostname -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9\-\.]{0,253})$') {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Hostname '$Hostname' is not valid!" -NotifyTo $NotifyTo @smtpArgs
-        }
-
-        # PfxProtectTo
-        if (-not $PfxProtectTo) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message "Missing mandatory parameter 'PfxProtectTo'!" -NotifyTo $NotifyTo @smtpArgs
-        }
-        $PfxProtectTo = Format-PfxProtectTo -InputValue $PfxProtectTo
-        # Avoid .Count: Format-PfxProtectTo guarantees array; empty array evaluates to $false
-        if (-not $PfxProtectTo) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Creation' -Message 'PfxProtectTo list is empty after normalization!' -NotifyTo $NotifyTo @smtpArgs
-        }
-        # Store normalized values so failures after validation do not report ambiguous input.
+        # Replace the requested template with the authoritative AD name for later failures.
         $script:CertificateNotificationContext['Template'] = $CertificateTemplateName
-        $script:CertificateNotificationContext['PFX protection principals'] = $PfxProtectTo
 
         # end of validation. Now process the new certificate request
 
@@ -3893,7 +4000,7 @@ switch ($requestBody.type) {
         # Build the success email from the operation result: it reflects the issued certificate,
         # stored Key Vault version, and verified PFX rather than merely echoing requested values.
         $notificationDetails = New-CertLCCreationNotificationDetails `
-            -OperationResult $creationResult -Operation 'Creation' -RequestId $requestBody.data.Id
+            -OperationResult $creationResult -Operation 'Creation' -RequestId $requestData['Id']
         # send notification email if requested and SMTP is configured
         Send-SuccessNotification -Section 'Dispatcher.Creation' `
             -Subject "Certificate $CertificateName created successfully" `
@@ -3917,28 +4024,26 @@ switch ($requestBody.type) {
         #########################
 
         # get required parameters
-        $VaultName = $requestBody.data.VaultName
-        $CertificateThumbprint = $requestBody.data.CertificateThumbprint
-        $RevocationReasonString = $requestBody.data.RevocationReason
+        $VaultName = $requestData['VaultName']
+        $CertificateThumbprint = $requestData['CertificateThumbprint']
+        $RevocationReasonString = $requestData['RevocationReason']
         # Begin with request fields available before certificate lookup so early validation and
         # lookup failures retain enough context for an actionable error notification.
         $script:CertificateNotificationContext = [ordered]@{
             Operation                = 'Revocation'
             # The shared renderer adds the Correlation ID row for every email type.
-            'Request ID'             = $requestBody.data.Id
+            'Request ID'             = $requestData['Id']
             'Key Vault'              = $VaultName
             Thumbprint               = $CertificateThumbprint
             'Revocation reason code' = $RevocationReasonString
         }
 
-        # VaultName: presence and non-empty check
-        if ([string]::IsNullOrEmpty($VaultName)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "Missing or empty mandatory string parameter: 'data.VaultName' in request body!"
+        # Reason is intentionally not a required string: numeric zero is a valid code.
+        try {
+            Assert-CertLCRequestFields -Data $requestData -RequiredStrings 'VaultName', 'CertificateThumbprint'
         }
-
-        # CertificateThumbprint: presence and non-empty check
-        if ([string]::IsNullOrEmpty($CertificateThumbprint)) {
-            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message "Missing or empty mandatory string parameter: 'data.CertificateThumbprint' in request body!"
+        catch {
+            Write-CertLCLogAndThrow -Section 'Dispatcher.Revocation' -Message $_.Exception.Message -InnerException $_.Exception
         }
 
         # RevocationReason: presence and integer check
@@ -4008,7 +4113,7 @@ switch ($requestBody.type) {
         }
         else {
             Write-CertLCLog -Section 'Dispatcher.Revocation' -Message "NotifyTo addresses found for certificate $CertificateName version $CertificateVersion in vault ${VaultName}: $rawNotifyTo"
-            $notifyTo = @($rawNotifyTo.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+            $notifyTo = ConvertFrom-CertLCNotifyToTag -TagValue $rawNotifyTo
         }
 
         $revokedTag = if ($cert.Tags -and $cert.Tags.ContainsKey('Revoked')) { [string]$cert.Tags['Revoked'] } else { $null }
@@ -4084,7 +4189,7 @@ switch ($requestBody.type) {
             'Revocation reason' = "$revocationReasonName ($RevocationReason)"
             'Revoked at (UTC)'  = $revocationResult.RevokedAt
             # The shared renderer adds the Correlation ID row for every email type.
-            'Request ID'        = $requestBody.data.Id
+            'Request ID'        = $requestData['Id']
         }
         # send notification email if requested and SMTP is configured
         Send-SuccessNotification -Section 'Dispatcher.Revocation' `

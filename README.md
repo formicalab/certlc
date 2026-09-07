@@ -186,7 +186,8 @@ CertLC/
 │   ├── testnewcertchain.ps1    # Validate full-chain creation and PFX export
 │   ├── testrenewcert.ps1       # Test certificate renewal
 │   └── testrevocationcert.ps1  # Test certificate revocation
-└── Tests/                      # Retained legacy Event Grid schema sample
+└── Tests/                      # Local helper/dispatcher checks and legacy schema sample
+  ├── certlc-refactoring.tests.ps1
   └── sample-eventgrideventschema.json
 ```
 
@@ -200,7 +201,9 @@ The runbook validates `specversion` (`1.0`) and `type`, and reads optional top-l
 
 Consumed `data` fields: `VaultName`, `ObjectName`, `CertificateTemplate`, `CertificateSubject`, `CertificateDnsNames` (optional array), `Hostname`, `PfxProtectTo`, and `NotifyTo` (optional array). `CertificateTemplate` may be the template's internal name, display name, or OID; the runbook resolves and stores the internal name.
 
-With the current StrictMode dispatcher, include the `CertificateDnsNames` and `NotifyTo` properties even when unused, using `[]` or `null`; omitting the properties can fail before validation. Include `data.Id` for notification details in creation, renewal, and revocation messages. It is a request identifier, not the event correlation ID. The envelope's `specversion` is the CloudEvents contract version (`1.0`), not the runbook release version.
+`CertificateDnsNames` and `NotifyTo` may be omitted, `null`, or arrays (including `[]`). Non-null scalars, including empty strings, are rejected rather than silently converted to arrays. `data.Id` is optional in all three operations; when supplied it contributes notification details, not event correlation. The envelope's `specversion` is the CloudEvents contract version (`1.0`), not the runbook release version.
+
+The dispatcher normalizes JSON and native webhook objects to case-insensitive dictionaries before validation. The envelope and `data` must each be a single object; arrays, scalars, and ambiguous case-only duplicate fields are rejected. Required strings must be actual nonblank strings. Creation validates local fields, hostname syntax, and protection-principal normalization before Key Vault or AD lookups. Revocation reason codes still accept integers or integer strings, including `0`. These stricter checks may reject malformed inputs previously accepted through coercion; valid request shapes and correlation rules are unchanged.
 
 ```json
 {
@@ -302,6 +305,16 @@ When upgrading from the separate-input version, publish and verify the Function 
 The lifecycle helpers receive the export root (`PfxRootFolder`) and revocation CA (`CA`) explicitly from the dispatcher. Creation and renewal use the same ordered notification-details helper, populated from the completed operation result. Keep the `[ref]` result contract when changing dispatcher calls: structured logs share the success stream, so capturing the entire function output as metadata would also capture log records.
 
 Long control-flow blocks should include concise comments explaining ownership, validation boundaries, ordering, or failure behavior. Preserve the comments around non-retried mutations, exact-version reads, chain checks, array shape, and native-resource cleanup. Comment-only edits can be verified by comparing PowerShell executable tokens before and after the change, in addition to syntax checks. Embedded templates and native declarations need their own format-appropriate documentation rather than injected PowerShell comments.
+
+Renewal selects Certificate Template Information by numeric extension OID `1.3.6.1.4.1.311.21.7` and decodes its DER sequence with `System.Formats.Asn1`. It does not depend on localized extension names or formatted text. Both notification outcomes share one embedded HTML layout with fixed success/error styling and an optional error section; renewal and revocation also share notification-tag parsing.
+
+Run the focused regression suite from the repository root with PowerShell 7.6 or later:
+
+```powershell
+./Tests/certlc-refactoring.tests.ps1
+```
+
+The suite extracts selected functions and the request-handling dispatcher using the PowerShell AST, mocks external operations, and creates temporary certificates only in memory. It does not execute runbook startup, authenticate to Azure, contact AD/AD CS, send email, or write PFX files. It covers request transports and validation, correlation, renewal/revocation routing, ASN.1 decoding, SMTP arguments, and notification rendering. Live Hybrid Worker certificate issuance and export remain separate integration checks.
 
 ## Workbook Maintenance
 
