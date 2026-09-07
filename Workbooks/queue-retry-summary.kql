@@ -1,0 +1,36 @@
+// Host trigger records expose actual dequeue count and insertion time; storage calls do not.
+let QueueTraces = materialize(AppTraces
+| where TimeGenerated {TimeRange} and AppRoleName =~ '{FunctionApp:name}'
+| extend InvocationId = coalesce(tostring(Properties.InvocationId), extract(@'Id=([0-9a-fA-F-]{36})', 1, Message), OperationId)
+| where isnotempty(InvocationId));
+let QueueInvocations = QueueTraces
+| where Message startswith "Executing 'Functions.QueueHandler'" and Message contains 'New queue message detected'
+| extend Queue = extract(@"New queue message detected on '([^']+)'", 1, Message)
+| where Queue in ('certlc', 'certlc-poison')
+| summarize Started=min(TimeGenerated) by InvocationId, Queue;
+let QueueTriggerDetails = QueueTraces
+| where Message startswith 'Trigger Details:'
+| extend MessageId=extract(@'MessageId:\s*([^,\s]+)',1,Message),
+    DequeueCount=toint(extract(@'DequeueCount:\s*(\d+)',1,Message)),
+    InsertedOn=todatetime(extract(@'InsertedOn:\s*([^,\s]+)',1,Message))
+| summarize arg_min(TimeGenerated, *) by InvocationId
+| project InvocationId, MessageId, DequeueCount, InsertedOn;
+let QueueCompletions = QueueTraces
+| where Message startswith "Executed 'Functions.QueueHandler'"
+| summarize arg_max(TimeGenerated, Message) by InvocationId
+| project InvocationId, Completed=TimeGenerated,
+    Result=case(Message contains '(Succeeded,', 'Succeeded', Message contains '(Failed,', 'Failed', 'Not parsed');
+let QueueAttempts = QueueInvocations
+| join kind=leftouter QueueTriggerDetails on InvocationId
+| join kind=leftouter QueueCompletions on InvocationId
+| extend Result=coalesce(Result,'Completion not observed'),
+    AgeAtDequeueSeconds = datetime_diff('second', Started, InsertedOn)
+| project Started, Queue, MessageId, DequeueCount, AgeAtDequeueSeconds, Result, Completed, InvocationId;
+let QueueSelection=base64_decode_tostring('{QueueFilter:base64}');
+let SearchText=trim(@'\s+',base64_decode_tostring('{QueueSearch:base64}'));
+QueueAttempts
+| where QueueSelection == 'all' or Queue == QueueSelection
+| where isempty(SearchText) or MessageId contains SearchText or InvocationId contains SearchText or Result contains SearchText
+| where DequeueCount > 1 or Result == 'Failed'
+| project Started, Queue, MessageId, DequeueCount, AgeAtDequeueSeconds, Result, InvocationId
+| order by Started desc | take 200

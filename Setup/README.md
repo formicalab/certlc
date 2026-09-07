@@ -262,24 +262,35 @@ The Bicep template creates and configures the following Azure resources:
   - Name: `certlcstats`
   - Complete workbook definition loaded from `Workbooks/certlcstats.workbook` and published by Bicep
   - Deployment replaces the workbook's resource-ID tokens with the resources created by the template
-  - Tabs: Statistics, Event Journey, Job logs, Function bridge; all share the original resource and time selectors
-  - Event Journey searches events/certificates and expands an event into attempts, Function activity, Automation jobs and logs
+  - Tabs: Statistics, Event Journey, EventGrid, Queue, Job Logs, Function Bridge Logs; shared selectors include the Event Grid topic/source and queue storage account/service
+  - Event Journey searches events, certificates and queue message IDs, grouping host-observed dequeues under each message with Function/Automation children, retry timing and processing outcomes
+  - EventGrid prioritizes delivery health, searchable delivery failures and explicitly labeled Function receipt evidence
+  - Queue shows current approximate main/poison backlog, searchable request logs, retry observations and account-wide native metrics
   - Linked to Log Analytics Workspace as data source
   - Depends on Application Insights to ensure workspace stability
 
-The production source is `Workbooks/certlcstats.workbook`; preserve its five resource-ID
-placeholders and tokenized fallback workspace. All 18 embedded queries have matching standalone
+The production source is `Workbooks/certlcstats.workbook`; preserve its nine resource-ID
+placeholders and tokenized fallback workspace. All 35 embedded KQL queries have matching standalone
 KQL files directly under `Workbooks/`, including the three self-contained `event-journey-*.kql`
 queries. See the [query index](../Workbooks/README.md). When changing a query, update both its
 standalone file and the embedded workbook query. Temporary prototype sources and tests are not
 required for deployment.
 
 For a workbook-only upgrade, deploy `modules/workbook.bicep` at resource-group scope in
-Incremental mode using the existing location, resource IDs, runbook name and tags. Run
+Incremental mode using the existing location, resource IDs (including `eventGridSystemTopicId`
+`eventGridSourceId` and `queueStorageAccountId`), runbook name and tags. Run
 validation and what-if first; require only a Modify of the existing `certlcstats` workbook.
 The deterministic resource name retains its portal identity. The full setup template is not
 needed for this upgrade. Back up the existing workbook content and verify both content and
 metadata after deployment; do not replace tokens in the repository file with environment IDs.
+The workbook module does not configure logging: `modules/integrations.bicep` owns the Event Grid
+`DeliveryFailures` diagnostic setting targeting the existing Log Analytics workspace. Upgrades
+from the four-tab workbook also require that setting; no full application redeployment is needed
+for a scoped diagnostic-setting update. The alerts module owns queue-service diagnostics and
+enables `StorageRead`, `StorageWrite` and `StorageDelete` when alerts are enabled. Workbook-only
+upgrades from write-only queue logging need a separate diagnostic-setting update. Logs are not backfilled.
+The workbook module uses `string(loadJsonContent(...))` before token replacement to support the
+larger workbook without Bicep's 128-KB `loadTextContent` limit.
 
 Deploying Bicep workbook content does not publish Function or runbook source. For an upgrade
 from the former separate `CorrelationId` input, publish the updated bridge first, verify that it
@@ -297,7 +308,7 @@ workbook-only upgrade. Historical telemetry is not rewritten by either deploymen
   - A message written to the `certlc-poison` queue (severity 1)
   - A `certlc` lifecycle Automation job entering Failed, Stopped, or Suspended state (severity 2)
   - A `certlcstats` failure, stop, or suspension without a later successful completion, or no successful completion within two hours (severity 2)
-- **Queue diagnostics**: Enabling alerts also sends Queue Storage `StorageWrite` logs to the existing Log Analytics workspace
+- **Queue diagnostics**: Enabling alerts also sends Queue Storage `StorageRead`, `StorageWrite` and `StorageDelete` logs to the existing Log Analytics workspace; historical gaps remain
 - **Lifecycle resolution**: `alert-certlc-automation-failure` temporarily uses `autoMitigate: false`. It is stateless and sends no automatic recovery notification when failures age out or a later run succeeds. Repeated firing notifications are possible while failures remain in the ten-minute window. Statistics and the other alert rules retain automatic resolution
 - **Statistics recovery**: The existing `alert-certlc-statistics-stale` resource is displayed as **CertLC statistics are unhealthy** and evaluates every five minutes over two hours. Only a recent `Completed` record strictly later than the latest Failed, Stopped, or Suspended record permits recovery. Missing data, failure records aging out, and created/queued/running jobs never clear the condition. Azure sends the resolved notification after its stateful resolution delay (three healthy evaluation periods). The separate lifecycle failure rule excludes `certlcstats`, preventing duplicate hourly firing/resolution cycles. Deploy both rule updates together; changing local source alone does not change Azure alerts
 - **Statistics schedule**: The statistics-health alert intentionally fires while the `certlcstats` schedule remains unlinked or otherwise fails to produce successful runs
@@ -357,6 +368,8 @@ workbook-only upgrade. Historical telemetry is not rewritten by either deploymen
   - Uses system-assigned managed identity
   - Connected to Key Vault as event source
   - Topic type: `Microsoft.KeyVault.Vaults`
+  - Diagnostic setting `diag-<system-topic-name>` exports `DeliveryFailures` to the existing Log Analytics workspace (`AzureDiagnostics`)
+  - Native metrics are queried directly; successful delivery is to Storage Queue, not completion of a certificate operation
 
 #### 13. **Event Grid Event Subscription**
 - **Type**: Event subscription with Storage Queue destination
@@ -490,8 +503,8 @@ After deploying the infrastructure, complete these additional steps:
     - Verify that DNS can resolve the required public Azure endpoints and that Application Insights telemetry is received after the function starts
   - These firewall rules and SNAT configuration are not created by this template and must be configured in the customer network containing `fnSubnetId`. For details, see [Azure service tags](https://learn.microsoft.com/azure/virtual-network/service-tags-overview)
 7. **Grant CA Permissions**: Assign the hybrid worker's computer account Enroll permissions on the CA templates
-8. **Review the Workbook**: Open the deployed `certlcstats` workbook and verify that its resource selectors reference the deployed Log Analytics workspace, Automation Account, runbooks, and Function App. Confirm the tab order Statistics, Event Journey, Job logs, Function bridge. In Event Journey, search an existing ingested event/certificate and expand its attempt and job logs; this read-only check does not trigger a certificate operation. The repository file `Workbooks/certlcstats.workbook` is authoritative; later Bicep deployments overwrite workbook changes made only in the portal. For a manual import, resolve the five resource placeholders and the fallback workspace placeholder first, then verify the saved selectors before running queries.
-9. **Review Alerts** (when enabled): Verify the dedicated Action Group receiver is enabled, all six alert rules target that Action Group, and the Storage Queue service has the `StorageWrite` diagnostic setting. The receiver may get an initial stale-statistics notification while the `certlcstats` schedule remains unlinked.
+8. **Review the Workbook**: Open the deployed `certlcstats` workbook and verify its workspace, Automation, runbook, Function, Event Grid and queue storage selectors. Confirm the order Statistics, Event Journey, EventGrid, Queue, Job Logs, Function Bridge Logs. Search an existing event/certificate/message ID in Journey and expand the queue-message, dequeue and job branches; this read-only check does not trigger a certificate operation. The repository workbook is authoritative; later Bicep deployments overwrite portal-only changes. For a manual import, resolve all nine resource placeholders and the fallback workspace placeholder first, then verify the saved selectors. Queue metrics cover all account queues, and host completion does not prove queue deletion or runbook success.
+9. **Review Alerts** (when enabled): Verify the dedicated Action Group receiver is enabled, all six alert rules target that Action Group, and the Storage Queue service exports `StorageRead`, `StorageWrite` and `StorageDelete` to the workspace. The receiver may get an initial stale-statistics notification while the `certlcstats` schedule remains unlinked.
 10. **Test End-to-End**:
    - **Create a test certificate** using the utility scripts in the `Utilities` folder:
      - `testnewcert.ps1` - Request a new certificate enrollment

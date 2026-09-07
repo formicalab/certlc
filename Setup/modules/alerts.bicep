@@ -43,7 +43,15 @@ resource queueDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-prev
     logAnalyticsDestinationType: 'Dedicated'
     logs: [
       {
+        category: 'StorageRead'
+        enabled: true
+      }
+      {
         category: 'StorageWrite'
+        enabled: true
+      }
+      {
+        category: 'StorageDelete'
         enabled: true
       }
     ]

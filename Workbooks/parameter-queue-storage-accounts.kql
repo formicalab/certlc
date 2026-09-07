@@ -1,0 +1,1 @@
+Resources | where type =~ 'microsoft.storage/storageaccounts' | project id, name | order by name asc

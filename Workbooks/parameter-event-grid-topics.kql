@@ -1,0 +1,1 @@
+Resources | where type =~ 'microsoft.eventgrid/systemtopics' | project id, name | order by name asc

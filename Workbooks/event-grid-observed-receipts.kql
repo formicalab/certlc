@@ -1,0 +1,25 @@
+// Receipt evidence comes from the Function, not an Event Grid success-log feed.
+let ReceiptTraces=materialize(AppTraces
+| where TimeGenerated {TimeRange} and AppRoleName =~ '{FunctionApp:name}'
+| extend InvocationId=coalesce(tostring(Properties.InvocationId),OperationId)
+| where isnotempty(InvocationId));
+let ReceiptIdentity=ReceiptTraces
+| where Message has 'BridgeCorrelation'
+| extend Entry=parse_json(extract(@'(\{.*\})',1,Message))
+| where tostring(Entry.recordType) == 'BridgeCorrelation' and tostring(Entry.stage) == 'Received'
+| where tostring(Entry.eventSource) =~ '{EventGridSource}'
+| summarize arg_min(TimeGenerated,*) by InvocationId
+| project Received=TimeGenerated,InvocationId,CorrelationId=tostring(Entry.correlationId);
+let ReceiptPayload=ReceiptTraces
+| where Message contains 'CERTLC: full message received is:'
+| extend Payload=parse_json(extract(@'CERTLC: full message received is:\s*(.*)$',1,Message))
+| where tostring(Payload.type) == 'Microsoft.KeyVault.CertificateNearExpiry'
+| summarize arg_min(TimeGenerated,*) by InvocationId
+| project InvocationId,Certificate=coalesce(tostring(Payload.data.ObjectName),tostring(Payload.subject)),
+    EventTime=todatetime(Payload['time']);
+let SearchText=trim(@'\s+',base64_decode_tostring('{EventGridSearch:base64}'));
+ReceiptIdentity
+| join kind=inner ReceiptPayload on InvocationId
+| where isempty(SearchText) or Certificate contains SearchText or CorrelationId contains SearchText or InvocationId contains SearchText
+| project Received,Certificate,EventTime,CorrelationId,InvocationId
+| order by Received desc | take 500

@@ -1,0 +1,1 @@
+Resources | where id =~ '{EventGridTopic}' | project value = tostring(properties.source), label = tostring(properties.source)

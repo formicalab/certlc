@@ -38,7 +38,7 @@ certlcstats_CL
 | project TimeGenerated, Name, Thumbprint, Subject, Template, Expires
 ```
 
-The Statistics tab in [`Workbooks/certlcstats.workbook`](../../Workbooks/certlcstats.workbook) consumes this table to render the certificate inventory dashboard. Event Journey, Job logs and Function bridge use existing operational telemetry instead (`AppTraces`, `AppExceptions` and `AzureDiagnostics`); adding Journey does not change this table, its schema or ingestion. The Bicep deployment resolves the workbook's resource-ID tokens and publishes the complete workbook. See the [query index](../../Workbooks/README.md) for the standalone queries matching each view.
+The Statistics tab in [`Workbooks/certlcstats.workbook`](../../Workbooks/certlcstats.workbook) consumes this table to render the certificate inventory dashboard. Event Journey, Job Logs and Function Bridge Logs use operational telemetry (`AppTraces`, `AppExceptions` and `AzureDiagnostics`). EventGrid adds native metrics, delivery-failure logs and labeled Function receipt evidence. Queue combines `StorageQueueLogs`, Function-host attempts, live approximate backlog and account-wide native metrics. Journey correlates host message/dequeue observations by invocation ID alongside Event Grid failures and Automation jobs. These views do not change this table, its schema or ingestion. Bicep resolves nine resource-ID placeholders and the fallback workspace scope; queue read/write/delete logs are enabled by the alerts module and are not backfilled. See the [query index](../../Workbooks/README.md) for the 35 standalone queries matching the workbook.
 
 ## Modifying schema or transformation
 

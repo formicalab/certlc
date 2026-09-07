@@ -1,11 +1,47 @@
-// Test workbook only. Scope every scan to the selected time and existing resources.
+// Host trigger records expose actual dequeue count and insertion time; storage calls do not.
+let QueueTraces = materialize(AppTraces
+| where TimeGenerated {TimeRange} and AppRoleName =~ '{FunctionApp:name}'
+| extend InvocationId = coalesce(tostring(Properties.InvocationId), extract(@'Id=([0-9a-fA-F-]{36})', 1, Message), OperationId)
+| where isnotempty(InvocationId));
+let QueueInvocations = QueueTraces
+| where Message startswith "Executing 'Functions.QueueHandler'" and Message contains 'New queue message detected'
+| extend Queue = extract(@"New queue message detected on '([^']+)'", 1, Message)
+| where Queue in ('certlc', 'certlc-poison')
+| summarize Started=min(TimeGenerated) by InvocationId, Queue;
+let QueueTriggerDetails = QueueTraces
+| where Message startswith 'Trigger Details:'
+| extend MessageId=extract(@'MessageId:\s*([^,\s]+)',1,Message),
+    DequeueCount=toint(extract(@'DequeueCount:\s*(\d+)',1,Message)),
+    InsertedOn=todatetime(extract(@'InsertedOn:\s*([^,\s]+)',1,Message))
+| summarize arg_min(TimeGenerated, *) by InvocationId
+| project InvocationId, MessageId, DequeueCount, InsertedOn;
+let QueueCompletions = QueueTraces
+| where Message startswith "Executed 'Functions.QueueHandler'"
+| summarize arg_max(TimeGenerated, Message) by InvocationId
+| project InvocationId, Completed=TimeGenerated,
+    Result=case(Message contains '(Succeeded,', 'Succeeded', Message contains '(Failed,', 'Failed', 'Not parsed');
+let QueueAttempts = QueueInvocations
+| join kind=leftouter QueueTriggerDetails on InvocationId
+| join kind=leftouter QueueCompletions on InvocationId
+| extend Result=coalesce(Result,'Completion not observed'),
+    AgeAtDequeueSeconds = datetime_diff('second', Started, InsertedOn)
+| project Started, Queue, MessageId, InsertedOn, DequeueCount, AgeAtDequeueSeconds, Result, Completed, InvocationId;
+let JourneyQueueEvidence=QueueAttempts
+| order by Queue asc, MessageId asc, Started asc, InvocationId asc
+| serialize
+| extend RetryGapSeconds=iff(isnotempty(MessageId) and Queue == prev(Queue) and MessageId == prev(MessageId),
+    datetime_diff('millisecond',Started,prev(Started))/1000.0, real(null))
+| project AttemptId=InvocationId, Queue, QueueMessageId=MessageId, Dequeued=Started, InsertedOn, DequeueCount,
+    AgeAtDequeueSeconds, RetryGapSeconds, QueueResult=Result, QueueCompleted=Completed,
+    FunctionDurationSeconds=datetime_diff('millisecond',Completed,Started)/1000.0;
+// Scope every scan to the selected time and existing resources.
 // Reuse certlcstats resource selectors instead of pinning Journey to one deployment.
 // Match Job History: nested resource names may include the Automation account prefix.
 let SelectedRunbookName = tostring(split('{Runbook:name}', '/')[-1]);
 let Traces = materialize(AppTraces
 | where TimeGenerated {TimeRange}
 | where AppRoleName =~ '{FunctionApp:name}'
-| extend AttemptId = coalesce(tostring(Properties.InvocationId), OperationId)
+| extend AttemptId = coalesce(tostring(Properties.InvocationId), extract(@'Id=([0-9a-fA-F-]{36})', 1, Message), OperationId)
 | where isnotempty(AttemptId));
 let Bridge = Traces
 | where Message has 'BridgeCorrelation'
@@ -16,7 +52,7 @@ let Receipts = Bridge
 | where tostring(Entry.stage) == 'Received'
 | summarize arg_min(TimeGenerated, *) by AttemptId
 | project AttemptId, OperationId, Received = TimeGenerated,
-    CorrelationId = tostring(Entry.correlationId), EventSource = tostring(Entry.eventSource);
+    CorrelationId = tostring(Entry.correlationId), EventSource = iff(tostring(Entry.eventSource) startswith '/subscriptions/', tolower(tostring(Entry.eventSource)), tostring(Entry.eventSource));
 // Keep each invocation/job association: repeated delivery must not erase earlier attempts.
 let Links = Bridge
 | where tostring(Entry.stage) == 'Started' and isnotempty(tostring(Entry.jobId))
@@ -51,9 +87,10 @@ let Outcomes = Streams
 let Exceptions = AppExceptions
 | where TimeGenerated {TimeRange}
 | where AppRoleName =~ '{FunctionApp:name}'
-| extend AttemptId = coalesce(tostring(Properties.InvocationId), OperationId)
+| extend AttemptId = coalesce(tostring(Properties.InvocationId), extract(@'Id=([0-9a-fA-F-]{36})', 1, Message), OperationId)
 | summarize FunctionErrors = count() by AttemptId;
-let Attempts = Receipts
+let BridgeAttempts = Receipts
+| join kind=leftouter JourneyQueueEvidence on AttemptId
 | join kind=leftouter Links on AttemptId
 | join kind=leftouter Payloads on AttemptId
 | join kind=leftouter Jobs on JobId
@@ -65,27 +102,107 @@ let Attempts = Receipts
     OperationOutcome = case(Errors > 0, 'Error logged', Skipped > 0, 'Skipped', Succeeded > 0, 'Success logged', 'Not observed'),
     Notification = case(EmailFailed > 0, 'Delivery warning', EmailSent > 0, 'Sent', 'Not observed'),
     Warnings = coalesce(Warnings, 0), Errors = coalesce(Errors, 0), FunctionErrors = coalesce(FunctionErrors, 0);
+
+// Failure columns may not exist until diagnostic logging produces its first record.
+// Use the selected topic's actual source, never a job ID or an Event Grid systemId.
+let EventGridFailures = materialize(AzureDiagnostics
+| where TimeGenerated {TimeRange}
+| where Category == 'DeliveryFailures' and _ResourceId =~ '{EventGridTopic}'
+| extend Extra = column_ifexists('AdditionalFields', dynamic({}))
+| extend Raw = coalesce(tostring(column_ifexists('message_s', '')), tostring(column_ifexists('Message', '')), tostring(Extra.message)),
+    EventSubscription = coalesce(tostring(column_ifexists('eventSubscriptionName_s', '')), tostring(Extra.eventSubscriptionName))
+| extend CorrelationId = extract(@'(?:^|[,;]\s*|Message:)id=([^,;\s]+)', 1, Raw),
+    FailureOutcome = extract(@'(?:^|[,;]\s*|Message:)outcome=([^,;]+)', 1, Raw),
+    DeliveryCount = tolong(extract(@'(?:^|[,;]\s*)deliveryCount=(\d+)', 1, Raw)),
+    LatencyMs = todouble(extract(@'(?:^|[,;]\s*)latencyInMs=([\d.]+)', 1, Raw)),
+    EventType = extract(@'(?:^|[,;]\s*)eventType=([^,;\s]+)', 1, Raw),
+    EventTime = todatetime(extract(@'(?:^|[,;]\s*)eventTime=([^,;]+)', 1, Raw)),
+    EventSource = tolower('{EventGridSource}')
+// Unknown identities stay isolated and still offer their raw diagnostic record.
+| extend EventKey = tostring(pack_array(EventSource, CorrelationId,
+    iff(isempty(CorrelationId), strcat('eventgrid:', hash_sha256(strcat(TimeGenerated, '|', EventSubscription, '|', Raw))), '')))
+| project TimeGenerated, EventKey, CorrelationId, EventSource, EventSubscription,
+    FailureOutcome = coalesce(FailureOutcome, 'Not parsed'), DeliveryCount, LatencyMs, EventType, EventTime, Raw);
+let FailureSummary = EventGridFailures
+| summarize FirstFailure = min(TimeGenerated), LastFailure = max(TimeGenerated),
+    EventGridFailureCount = count(), FailureEventTypes = make_set(EventType), FailureEventTime = min(EventTime)
+    by EventKey, CorrelationId, EventSource;
+// A failed delivery is an observation, not a Function invocation or an Automation outcome.
+let Attempts = union
+    (BridgeAttempts
+    | join kind=leftouter FailureSummary on EventKey
+    | extend FirstObserved = min_of(Received, FirstFailure),
+        StatusObserved = max_of(StatusObserved, Received, LastFailure),
+        EventGridFailureCount = coalesce(EventGridFailureCount, 0)),
+    (FailureSummary
+    | join kind=leftanti (BridgeAttempts | distinct EventKey) on EventKey
+    | project EventKey, CorrelationId, EventSource,
+        FirstObserved = FirstFailure, Received = datetime(null), StatusObserved = LastFailure,
+        AttemptId = '', OperationId = '', JobId = '', Certificate = '',
+        EventType = tostring(FailureEventTypes[0]), EventTime = FailureEventTime,
+        JobStatus = 'Not observed', OperationOutcome = 'Not observed', Notification = 'Not observed',
+        Warnings = tolong(0), Errors = tolong(0), FunctionErrors = tolong(0), EventGridFailureCount);
 // Selection is an encoded source/id tuple, so equal IDs from different producers stay separate.
+let JourneyQueueObservations = materialize(Attempts
+| where isnotempty(AttemptId) and isnotempty(QueueMessageId)
+| distinct EventKey, AttemptId, Queue, QueueMessageId, Dequeued, InsertedOn, DequeueCount,
+    AgeAtDequeueSeconds, RetryGapSeconds, QueueResult, QueueCompleted, FunctionDurationSeconds);
+let JourneyMessages = JourneyQueueObservations
+| summarize arg_max(Dequeued, QueueResult), ObservedDequeues=count(), HighestDequeueCount=max(DequeueCount),
+    FailedDequeues=countif(QueueResult == 'Failed'), RetryObservations=countif(DequeueCount > 1)
+    by EventKey, Queue, QueueMessageId;
+let JourneyQueueSummary = JourneyMessages
+| summarize QueueMessages=count(), ObservedDequeues=sum(ObservedDequeues), HighestDequeueCount=max(HighestDequeueCount),
+    FailedDequeues=sum(FailedDequeues), RetryObservations=sum(RetryObservations),
+    LatestSucceeded=countif(QueueResult == 'Succeeded'), LatestFailed=countif(QueueResult == 'Failed'),
+    LatestUnobserved=countif(QueueResult !in ('Succeeded','Failed')) by EventKey
+| extend QueueStatus=case(LatestFailed > 0, 'Latest processing failed', LatestUnobserved > 0, 'Completion not observed',
+    LatestSucceeded > 0, 'Latest processing succeeded', 'Not observed');
 let SelectedKey = base64_decode_tostring('{SelectedEvent:base64}');
 let Selected = materialize(Attempts | where isnotempty(SelectedKey) and EventKey == SelectedKey);
 // One parent per invocation, even if several job associations are observed for that invocation.
-let SelectedInvocations = materialize(Selected
-| summarize Received = min(Received), FunctionErrors = max(FunctionErrors) by AttemptId, OperationId
+let SelectedInvocations = materialize(Selected | where isnotempty(AttemptId)
+| summarize Received=min(Received), FunctionErrors=max(FunctionErrors), Queue=take_any(Queue), QueueMessageId=take_any(QueueMessageId),
+    Dequeued=min(Dequeued), InsertedOn=min(InsertedOn), DequeueCount=max(DequeueCount), AgeAtDequeueSeconds=max(AgeAtDequeueSeconds),
+    RetryGapSeconds=max(RetryGapSeconds), QueueResult=take_any(QueueResult), QueueCompleted=max(QueueCompleted),
+    FunctionDurationSeconds=max(FunctionDurationSeconds) by AttemptId,OperationId
 | order by Received asc, AttemptId asc
 | serialize AttemptNumber = row_number());
 let SelectedJobs = materialize(Selected | where isnotempty(JobId)
 | distinct AttemptId, JobId, Submitted, JobStatus, OperationOutcome, Notification);
 // Explicit parents mirror the native Id/ParentId tree used by the production Job History.
+let SelectedFailures = materialize(EventGridFailures
+| where isnotempty(SelectedKey) and EventKey == SelectedKey);
+let SelectedQueueMessages=materialize(SelectedInvocations
+| where isnotempty(QueueMessageId)
+| summarize InsertedOn=min(InsertedOn), FirstDequeue=min(Dequeued), ObservedDequeues=count(),
+    HighestDequeueCount=max(DequeueCount), FailedDequeues=countif(QueueResult == 'Failed'), arg_max(Dequeued,QueueResult)
+    by Queue,QueueMessageId
+| extend MessageNode=strcat('queue:',hash_sha256(tostring(pack_array(Queue,QueueMessageId)))));
 let Parents = union
+    (SelectedQueueMessages
+        | project Id=MessageNode, ParentId='event', Name=strcat('Queue message / ',Queue), Time=coalesce(InsertedOn,FirstDequeue),
+            Component='Queue', Stage='Message', FinalResult=case(QueueResult == 'Failed','failed',QueueResult == 'Succeeded','success','info'),
+            Message=strcat('Message ID: ',QueueMessageId,'\nHost-observed dequeues: ',ObservedDequeues,
+                '; highest dequeue count: ',HighestDequeueCount,'; failed attempts: ',FailedDequeues,
+                '\nLatest observed processing: ',QueueResult,'\nInsertion time is reported by the Function host. Deletion and poison movement are not established.'),
+            AttemptId='', JobId=''),
+    (SelectedFailures | summarize Time = min(TimeGenerated), FailureRecords = count()
+        | where FailureRecords > 0
+        | project Id = 'eventgrid', ParentId = 'event', Name = 'Event Grid delivery',
+            Time, Component = 'EventGrid', Stage = 'Delivery attempts', FinalResult = 'warning',
+            Message = strcat('Observed delivery-failure records: ', FailureRecords), AttemptId = '', JobId = ''),
     // Keep identity in the context view; parent details retain source, notifications and diagnostics.
-    (Selected | summarize Time = min(Received), Notifications = make_set(Notification), Warnings = sum(Warnings), Errors = sum(Errors), FunctionErrors = sum(FunctionErrors) by CorrelationId, EventSource
+    (Selected | summarize Time = min(FirstObserved), Notifications = make_set(Notification), Warnings = sum(Warnings), Errors = sum(Errors), FunctionErrors = sum(FunctionErrors) by CorrelationId, EventSource
         | project Id = 'event', ParentId = '', Name = 'Event',
             Time, Component = 'Event', Stage = 'Correlation', FinalResult = 'info',
             Message = strcat('Source: ', EventSource, '\nNotifications: ', strcat_array(Notifications, ', '), '\nWarnings: ', Warnings, '; Runbook errors: ', Errors, '; Function errors: ', FunctionErrors), AttemptId = '', JobId = ''),
     (SelectedInvocations
-        | project Id = strcat('attempt:', AttemptId), ParentId = 'event', Name = strcat('Attempt ', AttemptNumber),
-            Time = Received, Component = 'Attempt', Stage = 'Receipt', FinalResult = iff(FunctionErrors > 0, 'failed', 'info'),
-            Message = strcat('Function invocation: ', AttemptId), AttemptId, JobId = ''),
+        | project Id = strcat('attempt:', AttemptId),
+            ParentId=iff(isnotempty(QueueMessageId),strcat('queue:',hash_sha256(tostring(pack_array(Queue,QueueMessageId)))),'event'),
+            Name=iff(isnotnull(DequeueCount),strcat('Dequeue ',DequeueCount),strcat('Attempt ',AttemptNumber)),
+            Time = coalesce(Dequeued,Received), Component = 'Attempt', Stage = 'Receipt', FinalResult = case(QueueResult == 'Failed' or FunctionErrors > 0,'failed',QueueResult == 'Succeeded','success','info'),
+            Message = strcat('Function invocation: ',AttemptId,'\nHost completion: ',coalesce(QueueResult,'Not observed')), AttemptId, JobId = ''),
     (SelectedInvocations
         | project Id = strcat('function:', AttemptId), ParentId = strcat('attempt:', AttemptId), Name = 'Function activity',
             Time = Received, Component = 'Function', Stage = 'Invocation', FinalResult = iff(FunctionErrors > 0, 'failed', 'info'),
@@ -98,15 +215,38 @@ let Parents = union
             Message = strcat('Job ID: ', JobId, '\nState: ', JobStatus, '; Operation: ', OperationOutcome, '; Notification: ', Notification), AttemptId, JobId);
 // Cap only leaf records. Parents remain present even when the detail stream is truncated.
 let Records = union
+    (SelectedQueueMessages | where isnotnull(InsertedOn)
+        | project ParentId=MessageNode,Time=InsertedOn,Component='Queue',Stage='Insertion timestamp (host-reported)',Level='Information',
+            Message=strcat('Queue: ',Queue,'; Message ID: ',QueueMessageId),AttemptId='',JobId=''),
+    (SelectedInvocations | where isnotnull(Dequeued)
+        | project ParentId=strcat('attempt:',AttemptId),Time=Dequeued,Component='Queue',Stage='Dequeue observed by Function host',
+            Level=iff(DequeueCount > 1,'Warning','Information'),
+            Message=strcat('Message ID: ',QueueMessageId,'\nDequeue count: ',DequeueCount,
+                '; age at dequeue (seconds, includes retries): ',coalesce(tostring(AgeAtDequeueSeconds),'Not observed'),
+                '\nGap since previous observed dequeue (seconds): ',coalesce(tostring(RetryGapSeconds),'Not observed')),
+            AttemptId,JobId=''),
+    (SelectedInvocations | where isnotnull(QueueCompleted)
+        | project ParentId=strcat('function:',AttemptId),Time=QueueCompleted,Component='Function',Stage='Host completion',
+            Level=iff(QueueResult == 'Failed','Error','Information'),
+            Message=strcat('Result: ',QueueResult,'; Function duration (seconds): ',FunctionDurationSeconds,
+                '\nFunction completion does not establish runbook success or queue deletion.'),AttemptId,JobId=''),
+    (Selected | where isnotempty(JobId) and isnotnull(Submitted)
+        | distinct AttemptId,JobId,Submitted,Dequeued
+        | project ParentId=strcat('job:',AttemptId,':',JobId),Time=Submitted,Component='Automation',Stage='Job submission',Level='Information',
+            Message=strcat('Seconds from observed dequeue to job submission: ',
+                coalesce(tostring(datetime_diff('millisecond',Submitted,Dequeued)/1000.0),'Not observed')),AttemptId,JobId),
+    (SelectedFailures
+        | project ParentId = 'eventgrid', Time = TimeGenerated, Component = 'EventGrid', Stage = FailureOutcome,
+            Level = 'Warning', Message = strcat('Subscription: ', EventSubscription, '\n', Raw), AttemptId = '', JobId = ''),
     (Selected | where isnotnull(EventTime) | distinct EventTime, EventType
         | project ParentId = 'event', Time = EventTime, Component = 'Event payload', Stage = 'Producer timestamp (not delivery)',
             Level = 'Information', Message = EventType, AttemptId = '', JobId = ''),
-    (Traces | join kind=inner SelectedInvocations on AttemptId, OperationId
+    (Traces | where Message !startswith 'Trigger Details:' | join kind=inner SelectedInvocations on AttemptId
         | project ParentId = strcat('function:', AttemptId), Time = TimeGenerated, Component = 'Function', Stage = tostring(Properties.Category),
             Level = coalesce(tostring(Properties.LogLevel), 'Information'), Message, AttemptId, JobId = ''),
     // Detail scans use the same shared resource parameters as the summary.
     (AppExceptions | where TimeGenerated {TimeRange} | where AppRoleName =~ '{FunctionApp:name}'
-        | extend AttemptId = coalesce(tostring(Properties.InvocationId), OperationId)
+        | extend AttemptId = coalesce(tostring(Properties.InvocationId), extract(@'Id=([0-9a-fA-F-]{36})', 1, Message), OperationId)
         | join kind=inner SelectedInvocations on AttemptId, OperationId
         | project ParentId = strcat('function:', AttemptId), Time = TimeGenerated, Component = 'Function', Stage = 'Exception', Level = 'Error', Message = OuterMessage, AttemptId, JobId = ''),
     (Streams | join kind=inner SelectedJobs on JobId

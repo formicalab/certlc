@@ -55,7 +55,7 @@ CertLC is an event-driven certificate lifecycle management solution that integra
 | Hybrid Worker | Run the PowerShell 7.6 runbooks with network access to Azure private endpoints, Active Directory, the Enterprise CA, and the PFX file location |
 | Enterprise CA | Issue complete certificate chains and process enrollment and revocation requests through AD CS RPC/DCOM interfaces |
 | Key Vault | Hold versioned certificates, private keys, complete certificate chains, and lifecycle tags |
-| Log Analytics and Application Insights | Store latest-version certificate inventory and operational telemetry; the workbook provides Statistics, Event Journey, Job logs and Function bridge views |
+| Log Analytics and Application Insights | Store latest-version certificate inventory and operational telemetry; the workbook provides Statistics, Event Journey, EventGrid, Queue, Job Logs and Function Bridge Logs views |
 | Azure Monitor Alerts and Action Group | Notify operators about poison messages, Event Grid dead-lettering or delivery failures, failed runbooks, and missing statistics snapshots when alerting is enabled |
 
 Azure-to-Azure calls use managed identities. Storage, Function App, Automation Account, and Key Vault data-plane access is private; the Hybrid Worker provides the boundary between Azure automation and the on-premises CA. Azure Monitor ingestion endpoints remain public and require controlled outbound access.
@@ -128,7 +128,7 @@ CertLC stores the following tags on individual Key Vault certificate versions. C
 1. The `certlcstats` runbook runs hourly on the configured Hybrid Worker Group by default
 2. It enumerates certificate names in Key Vault and collects metadata from the latest version of each name
 3. Certificate data is published to a custom Log Analytics table via Data Collection Rule
-4. The Azure Monitor workbook shows certificate expiration status and details, an Event Journey from event/certificate search through Function attempts and Automation jobs to logs, plus the existing job and Function bridge views
+4. The Azure Monitor workbook shows certificate expiration status and details, an Event Journey linking observed Event Grid failures, queue messages/dequeue attempts, Function invocations and Automation jobs, plus dedicated EventGrid, Queue, Job Logs and Function Bridge Logs views. Queue includes approximate main/poison backlog, searchable logs and account-wide metrics; Journey retains retry timing and separate processing/job outcomes.
 
 ### Proactive Alerting
 
@@ -177,7 +177,7 @@ CertLC/
 ├── Workbooks/                  # Azure Monitor workbooks
 │   ├── certlcstats.workbook    # Tokenized production workbook deployed by Bicep
 │   ├── README.md              # Embedded-query index and maintenance guidance
-│   └── *.kql                   # 18 queries matching the production workbook
+│   └── *.kql                   # 35 queries matching the production workbook
 ├── Utilities/                  # Helper scripts
 │   ├── Export-PfxWithGroupProtection.ps1 # Export a Key Vault certificate as a SID-protected PFX
 │   ├── Extract-KeyCer.ps1      # Extract a certificate and private key from a PFX
