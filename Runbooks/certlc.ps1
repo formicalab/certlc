@@ -3375,6 +3375,112 @@ function Assert-CertLCRequestFields {
 
 #endregion
 
+#region ### Find-CertLCJobId ###
+
+###################################
+# FUNCTIONS - Find-CertLCJobId    #
+###################################
+
+<#
+.SYNOPSIS
+    Resolve this execution's Automation job ID from its unique JSON Output marker.
+.DESCRIPTION
+    Scan Running jobs for the configured runbook, follow paginated Output streams,
+    and require one job containing the exact identityMarker in section JobIdentity.
+    The caller must emit the marker through Write-CertLCLog before invoking this
+    function; emitting it here would capture it with the returned job ID instead.
+.PARAMETER Marker
+    Random per-execution marker already written to the Automation Output stream.
+.PARAMETER AccountResourceId
+    ARM resource ID of the Automation account whose jobs will be searched.
+.PARAMETER RunbookName
+    Published runbook name, independent of worker-generated script filenames.
+.PARAMETER AzureContext
+    Explicit managed-identity context with permission to read jobs and job streams.
+.PARAMETER MaxPasses
+    Maximum scans to allow for Output visibility; defaults to eight.
+.OUTPUTS
+    System.String. The unique, verified Automation job ID in canonical GUID format.
+.NOTES
+    Fails closed on missing or ambiguous identity. The 120-second budget is checked
+    between requests, not a hard HTTP timeout. No worker metadata or trace is read.
+#>
+function Find-CertLCJobId {
+    param(
+        [Parameter(Mandatory)][string]$Marker,
+        [Parameter(Mandatory)][string]$AccountResourceId,
+        [Parameter(Mandatory)][string]$RunbookName,
+        [Parameter(Mandatory)][object]$AzureContext,
+        [ValidateRange(1, 12)][int]$MaxPasses = 8
+    )
+
+    # Keep the API scope and scan clock local to this lookup, not shared logger state.
+    $baseUri = "https://management.azure.com$AccountResourceId"
+    $api = 'api-version=2024-10-23'
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+
+    <#
+    .SYNOPSIS
+        Read an Automation object or all collection pages within this account.
+    .DESCRIPTION
+        Reject escaped/repeated links and failed responses; tolerate omitted nextLink.
+        Uses an explicit managed-identity profile and the enclosing account scope and clock.
+    #>
+    function Get-CertLCAutomationData {
+        param([string]$Uri, [object]$RequestContext)
+        $visited = [System.Collections.Generic.HashSet[string]]::new()
+        do {
+            # Validate every page before sending the authenticated request.
+            if (-not $Uri.StartsWith("$baseUri/", [System.StringComparison]::OrdinalIgnoreCase)) { throw 'Automation API link escaped the account scope.' }
+            if (-not $visited.Add($Uri)) { throw 'Automation API returned a repeated pagination link.' }
+            if ($clock.Elapsed.TotalSeconds -ge 120) { throw 'Automation identity lookup exceeded its scan budget.' }
+            $response = Invoke-AzRestMethod -Method GET -Uri $Uri -DefaultProfile $RequestContext -ErrorAction Stop
+            if ($response.StatusCode -ne 200) { throw "Automation API GET failed: HTTP $($response.StatusCode)." }
+            $page = ConvertFrom-Json -InputObject $response.Content -AsHashtable -ErrorAction Stop
+            if ($page.ContainsKey('value')) { $page['value'] } else { $page }
+            $Uri = [string]$page['nextLink']
+        } while (-not [string]::IsNullOrWhiteSpace($Uri))
+    }
+
+    # Check every Running job for this runbook and identify ours by its exact marker.
+    # Do not assume the first or most recently started job is ours.
+    $filter = [uri]::EscapeDataString("properties/runbook/name eq '$($RunbookName.Replace("'", "''"))' and properties/status eq 'Running'")
+    for ($pass = 1; $pass -le $MaxPasses; $pass++) {
+        $matchingJobIds = [System.Collections.Generic.HashSet[string]]::new()
+        foreach ($candidate in @(Get-CertLCAutomationData "$baseUri/jobs?$api&`$filter=$filter" -RequestContext $AzureContext)) {
+            $candidateId = ([guid]$candidate.properties.jobId).ToString('D')
+            if ($candidateId -eq [guid]::Empty.ToString()) { throw 'Automation API returned an empty job ID.' }
+            $jobUri = "$baseUri/jobs/$candidateId"
+            foreach ($stream in @(Get-CertLCAutomationData "$jobUri/streams?$api&`$filter=properties/streamType%20eq%20'Output'" -RequestContext $AzureContext)) {
+                # Read full records, not potentially truncated summaries; ignore unrelated output.
+                $record = Get-CertLCAutomationData "$jobUri/streams/$($stream.properties.jobStreamId)?$api" -RequestContext $AzureContext
+                if ($record.properties.streamType -ne 'Output') { continue }
+                try { $entry = ConvertFrom-Json $record.properties.streamText -AsHashtable -ErrorAction Stop }
+                catch { continue }
+                if ($entry -is [System.Collections.IDictionary] -and $entry['section'] -ceq 'JobIdentity' -and
+                    $entry['identityMarker'] -is [string] -and $entry['identityMarker'] -ceq $Marker) {
+                    $null = $matchingJobIds.Add($candidateId)
+                }
+            }
+        }
+
+        # Duplicate records from one job are harmless; matches in different jobs are not.
+        if ($matchingJobIds.Count -gt 1) { throw "Identity marker matched $($matchingJobIds.Count) different jobs; refusing ambiguous identity." }
+        if ($matchingJobIds.Count -eq 1) {
+            $foundId = @($matchingJobIds)[0]
+            $confirmed = Get-CertLCAutomationData "$baseUri/jobs/$foundId`?$api" -RequestContext $AzureContext
+            if (([guid]$confirmed.properties.jobId).ToString('D') -ne $foundId -or
+                $confirmed.properties.runbook.name -ne $RunbookName -or $confirmed.properties.status -ne 'Running') {
+                throw 'The matching job failed identity verification.'
+            }
+            return $foundId
+        }
+    }
+    throw 'The marker was not visible in any running job Output stream within the probe budget.'
+}
+
+#endregion
+
 #region ### Dispatcher ###
 
 ###############
@@ -3383,8 +3489,7 @@ function Assert-CertLCRequestFields {
 
 # Reject unsupported hosts before Azure authentication. Automation captures runbook streams
 # without Connect-AzAccount; event correlation is not available until request parsing below.
-# Resolve the actual job ID locally, independently of any later event correlation ID.
-# https://rakhesh.com/azure/psprivatemetadata-is-system-collections-hashtabl/
+# Resolve identity through authenticated Automation APIs, independently of event correlation.
 
 if ($env:AZUREPS_HOST_ENVIRONMENT -eq 'AzureAutomation') {
     # Azure Automation sandbox: not supported (we require the hybrid worker for CA access).
@@ -3400,49 +3505,47 @@ if ($PSVersionTable.PSVersion -lt [version]'7.6') {
     Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'This runbook requires PowerShell 7.6 or later.'
 }
 
-# Prefer the worker-provided metadata when it contains a usable GUID. Some worker versions
-# expose the literal string "System.Collections.Hashtable" instead; TryParse rejects it.
-# Guid.Empty is also rejected because it cannot identify an actual Automation execution.
-$parsedJobId = [guid]::Empty
-$jobIdSource = 'EnvironmentMetadata'
-if (-not [guid]::TryParse($env:PSPrivateMetadata, [ref]$parsedJobId) -or $parsedJobId -eq [guid]::Empty) {
-    # Read only this execution's sandbox trace, using the runbook's own directory as the anchor.
-    # This worker-internal path is a tested workaround, not a stable public Azure contract.
-    # The script filename can also be a GUID, but it is not the Automation job ID.
-    $tracePath = Join-Path (Split-Path -Parent $PSScriptRoot) 'diags\trace.log'
+# Emit outside the resolver so its return-value assignment cannot swallow this Output record.
+# The random marker is not an Automation ID or event correlation ID; neither is guessed.
+$jobId = $null
+$identityMarker = 'CERTLC-JOB-IDENTITY:' + [guid]::NewGuid().ToString('D')
+Write-CertLCLog -Section 'JobIdentity' -Message 'Resolving Automation job identity.' -Context @{ identityMarker = $identityMarker }
 
-    # Match the explicit jobId= label, not unrelated GUIDs such as sandboxId. Require the
-    # complete GUID format and reject matches that are merely prefixes of longer identifiers.
-    $jobIdPattern = '(?i)\bjobId\s*=\s*(?<JobId>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?![0-9a-f-])'
-
-    # Log and stop if the trace cannot be read. Scan all matches and normalize GUID values
-    # before deduplication, since repeated entries for the same job are not ambiguous.
-    # The array wrapper preserves Count/index access for zero, one, or multiple distinct IDs.
-    try {
-        $traceJobIds = @(Get-Content -LiteralPath $tracePath -ErrorAction Stop | ForEach-Object {
-            foreach ($jobMatch in [regex]::Matches($_, $jobIdPattern)) {
-                [guid]$jobMatch.Groups['JobId'].Value
-            }
-        } | Sort-Object -Unique)
+# Use explicit account/runbook configuration, not undocumented environment metadata or paths.
+# Internal Automation variables are available on the Hybrid Worker before Connect-AzAccount.
+try {
+    $identityAccountId = Get-AutomationVariable -Name 'certlc-automationaccountid' -ErrorAction Stop
+    $identityRunbookName = Get-AutomationVariable -Name 'certlc-runbookname' -ErrorAction Stop
+    if ($identityAccountId -isnot [string] -or $identityAccountId -notmatch '^/subscriptions/([0-9a-fA-F-]{36})/resourceGroups/[^/?#]+/providers/Microsoft\.Automation/automationAccounts/[^/?#]+$' -or
+        $identityRunbookName -isnot [string] -or [string]::IsNullOrWhiteSpace($identityRunbookName)) {
+        throw 'Set certlc-automationaccountid to the Automation account ARM resource ID and certlc-runbookname to this published runbook name.'
     }
-    catch {
-        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'Cannot determine the Automation job ID: unable to read the current sandbox trace.' -InnerException $_.Exception
-    }
-
-    # Fail before certificate operations if identity is missing, empty, or ambiguous rather
-    # than recording a guessed ID in certificate audit tags or notification details.
-    # Short-circuit evaluation avoids indexing an empty array under StrictMode.
-    if ($traceJobIds.Count -ne 1 -or $traceJobIds[0] -eq [guid]::Empty) {
-        Write-CertLCLogAndThrow -Section 'Dispatcher' -Message "Cannot determine the Automation job ID: expected one distinct non-empty jobId in the current sandbox trace; found $($traceJobIds.Count)."
-    }
-
-    # Adopt the sole validated trace ID and record which discovery method succeeded.
-    $parsedJobId = $traceJobIds[0]
-    $jobIdSource = 'SandboxTrace'
+    $identitySubscriptionId = ([guid]$identityAccountId.Split('/')[2]).ToString('D')
+}
+catch {
+    Write-CertLCLogAndThrow -Section 'JobIdentity' -Message 'Unable to load Automation identity lookup configuration.' -InnerException $_.Exception
 }
 
-# Preserve the canonical GUID string expected by existing tag and notification callers.
-$jobId = $parsedJobId.ToString('D')
+# Authenticate before API discovery. Early failures have no jobId until it is verified.
+$null = Disable-AzContextAutosave -Scope Process
+Write-CertLCLog -Section 'Dispatcher' -Message 'Connecting to Azure using default identity...'
+try {
+    $AzureConnection = (Connect-AzAccount -Identity -Subscription $identitySubscriptionId -ErrorAction Stop).Context
+    Set-AzContext -SubscriptionId $identitySubscriptionId -DefaultProfile $AzureConnection -ErrorAction Stop | Out-Null
+}
+catch {
+    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'Unable to authenticate or select the Automation subscription using managed identity.' -InnerException $_.Exception
+}
+
+# Fail before certificate operations if no unique Running job owns our exact JSON marker.
+try {
+    $jobId = Find-CertLCJobId -Marker $identityMarker -AccountResourceId $identityAccountId -RunbookName $identityRunbookName -AzureContext $AzureConnection
+}
+catch {
+    Write-CertLCLogAndThrow -Section 'JobIdentity' -Message 'Cannot determine the Automation job ID using the Output marker.' -InnerException $_.Exception
+}
+$jobIdSource = 'AutomationApiMarker'
+Write-CertLCLog -Section 'JobIdentity' -Message 'Automation job identity resolved.' -Context @{ jobIdSource = $jobIdSource }
 
 # The logger now includes jobId independently; correlation remains absent until event parsing.
 # Delay the positive host message until execution identity is available for all normal
@@ -3459,25 +3562,6 @@ Write-CertLCLog -Section 'Dispatcher' -Message ([ordered]@{
     PowerShellVersion = $PSVersionTable.PSVersion.ToString()
     HostEnvironment = $env:AZUREPS_HOST_ENVIRONMENT
 } | ConvertTo-Json -Compress)
-
-# Authenticate only after local identity discovery. Existing log consumers retain their
-# fields/streams, while authentication failures carry jobId without event correlation.
-$null = Disable-AzContextAutosave -Scope Process
-Write-CertLCLog -Section 'Dispatcher' -Message 'Connecting to Azure using default identity...'
-try {
-    $AzureConnection = (Connect-AzAccount -Identity).context
-}
-catch {
-    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'There is no system-assigned user identity.' -Inner $_.Exception
-}
-
-# Context selection can fail independently of login; preserve structured failure logging.
-try {
-    Set-AzContext -SubscriptionId $AzureConnection.Subscription.Id -DefaultProfile $AzureConnection | Out-Null
-}
-catch {
-    Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'Unable to select the Azure subscription context.' -InnerException $_.Exception
-}
 
 # Get the runbook variables from the Automation Account
 # Since they are encrypted, we must use the internal cmdlet Get-AutomationVariable to retrieve them, not Get-AzAutomationVariable

@@ -333,6 +333,7 @@ workbook-only upgrade. Historical telemetry is not rewritten by either deploymen
   - Custom PowerShell 7.6 runtime environment (default name `certlc-PowerShell-7-6`, parameterized) used by both runbooks, with default packages `Az` 15.1.0 and `Azure CLI` 2.77.0 preloaded
   - `disableLocalAuth: false` — kept enabled because legacy webhook authentication (key in query string) is still required by external callers that cannot use Entra ID
   - Includes encrypted variables used by the runbooks (CA name, PFX root folder, SMTP settings, Key Vault name, DCR details)
+  - Includes non-secret `certlc-automationaccountid` and `certlc-runbookname` variables for API-based job identity lookup; create these before publishing the updated lifecycle runbook to an existing account
   - Two placeholder runbooks created: the primary runbook named by `runbookName` and `certlcstats` (code must be uploaded post-deployment)
   - Hybrid Worker Group for on-premises CA communication
   - Hourly schedule linked to the `certlcstats` runbook on the configured Hybrid Worker Group by default
@@ -428,7 +429,7 @@ The Bicep template automatically creates the following role assignments for the 
 |------|-------|---------|
 | Key Vault Certificates Officer | Key Vault | Create and manage certificates in Key Vault |
 | Key Vault Secrets Officer | Key Vault | Export certificates as PFX (access to private keys) |
-| Reader | Automation Account (self) | Allow hybrid worker to read automation account variables |
+| Reader | Automation Account (self) | Read account metadata, jobs, and Output streams for job identity lookup |
 | Monitoring Metrics Publisher | Data Collection Rule | Publish certificate statistics to custom Log Analytics table |
 
 **Function App Managed Identity** (6 assignments):

@@ -110,6 +110,8 @@ resource automationAccount 'Microsoft.Automation/automationAccounts@2024-10-23' 
 
 // Values are JSON-string encoded because the Automation variables API expects quoted string payloads.
 var variableValues = {
+  'certlc-automationaccountid': automationAccount.id
+  'certlc-runbookname':        runbookName
   'certlc-ca':                 ca
   'certlc-pfxrootfolder':      pfxRootFolder
   'certlc-smtpfrom':           smtpFrom
@@ -123,6 +125,8 @@ var variableValues = {
 }
 
 var variableNames = [
+  'certlc-automationaccountid'
+  'certlc-runbookname'
   'certlc-ca'
   'certlc-pfxrootfolder'
   'certlc-smtpfrom'
@@ -140,7 +144,8 @@ resource variables 'Microsoft.Automation/automationAccounts/variables@2024-10-23
   name: variableName
   properties: {
     value: substring(string([variableValues[variableName]]), 1, max(0, length(string([variableValues[variableName]])) - 2))
-    isEncrypted: true
+    // Identity lookup scope is non-secret; preserve encryption for existing settings.
+    isEncrypted: variableName != 'certlc-automationaccountid' && variableName != 'certlc-runbookname'
   }
 }]
 
