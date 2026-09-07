@@ -55,12 +55,14 @@ CertLC is an event-driven certificate lifecycle management solution that integra
 | Hybrid Worker | Run the PowerShell 7.6 runbooks with network access to Azure private endpoints, Active Directory, the Enterprise CA, and the PFX file location |
 | Enterprise CA | Issue complete certificate chains and process enrollment and revocation requests through AD CS RPC/DCOM interfaces |
 | Key Vault | Hold versioned certificates, private keys, complete certificate chains, and lifecycle tags |
-| Log Analytics and Application Insights | Store latest-version certificate inventory and operational telemetry; the workbook provides Statistics, Event Journey, Job logs and Function bridge views |
+| Log Analytics and Application Insights | Store latest-version certificate inventory and operational telemetry; the workbook provides Statistics, Event Journey, EventGrid, Queue, Job Logs and Function Bridge Logs views |
 | Azure Monitor Alerts and Action Group | Notify operators about poison messages, Event Grid dead-lettering or delivery failures, failed runbooks, and missing statistics snapshots when alerting is enabled |
 
 Azure-to-Azure calls use managed identities. Storage, Function App, Automation Account, and Key Vault data-plane access is private; the Hybrid Worker provides the boundary between Azure automation and the on-premises CA. Azure Monitor ingestion endpoints remain public and require controlled outbound access.
 
 The Bicep deployment creates a custom PowerShell 7.6 Automation runtime named `certlc-PowerShell-7-6`, with the `Az` and `Azure CLI` modules loaded as default packages for both runbooks.
+
+The main lifecycle runbook directly imports only `Az.Accounts` and `Az.KeyVault`. Removing its unused `Az.Storage` and `Az.Resources` imports does not remove packages from the Automation runtime or change the dependencies of other scripts.
 
 ## How It Works
 
@@ -73,6 +75,8 @@ leaf certificate -> intermediate CA certificate(s) -> self-issued root CA certif
 ```
 
 The runbook merges that complete leaf-to-root sequence into the pending Key Vault certificate operation. It then downloads the exact secret version returned by the merge, verifies that Key Vault persisted the same certificates, and uses that verified copy for export. A latest-version race or a merge that loses part of the chain therefore causes the operation to fail instead of being reported as successful.
+
+AD CS PKCS#7 bundles are decoded with `SignedCms` without requiring a CMS signature: certificates-only bundles may be unsigned, while the existing certificate-chain checks remain mandatory. Key Vault PKCS#12 data is loaded with `X509CertificateLoader`, using `Exportable | EphemeralKeySet` so the private key remains exportable without being persisted to the worker's key store. `Pkcs12LoaderLimits.DangerousNoLimits` deliberately preserves the former explicit-password import policy and certificate attributes; adopting the loader's default limits would be a separate compatibility change. Both loaders now enforce their expected input format rather than auto-detecting unrelated certificate formats.
 
 The exported, SID-protected PFX contains the private-key leaf and every intermediate CA certificate, but excludes the self-issued root. CertLC's chain selection follows the TLS certificate-list convention in [RFC 8446, Section 4.4.2](https://www.rfc-editor.org/rfc/rfc8446.html#section-4.4.2): the sender's certificate is first, each following certificate should certify the preceding certificate, and a trust anchor may be omitted because peers receive trust anchors independently. [RFC 5280, Sections 6 and 6.1](https://www.rfc-editor.org/rfc/rfc5280.html#section-6) defines certification-path validation and states that a self-signed certificate supplied as the trust anchor is not part of the prospective certification path. Therefore, CertLC preserves the root in Key Vault as part of the CA response but does not distribute it as part of the deployable PFX; target systems must trust the root through their normal trust-store administration.
 
@@ -124,7 +128,7 @@ CertLC stores the following tags on individual Key Vault certificate versions. C
 1. The `certlcstats` runbook runs hourly on the configured Hybrid Worker Group by default
 2. It enumerates certificate names in Key Vault and collects metadata from the latest version of each name
 3. Certificate data is published to a custom Log Analytics table via Data Collection Rule
-4. The Azure Monitor workbook shows certificate expiration status and details, an Event Journey from event/certificate search through Function attempts and Automation jobs to logs, plus the existing job and Function bridge views
+4. The Azure Monitor workbook shows certificate expiration status and details, an Event Journey linking observed Event Grid failures, queue messages/dequeue attempts, Function invocations and Automation jobs, plus dedicated EventGrid, Queue, Job Logs and Function Bridge Logs views. Queue includes approximate main/poison backlog, searchable logs and account-wide metrics; Journey retains retry timing and separate processing/job outcomes.
 
 ### Proactive Alerting
 
@@ -133,14 +137,16 @@ Alerting is controlled by the Bicep `enableAlerts` parameter, which defaults to 
 - Event Grid dead-lettered and dropped events (severity 1)
 - Repeated Event Grid delivery failures (severity 3)
 - Messages written to the `certlc-poison` queue (severity 1)
-- Failed, stopped, or suspended `certlc` and `certlcstats` Automation jobs (severity 2)
-- No successful `certlcstats` completion within two hours (severity 2)
+- Failed, stopped, or suspended `certlc` lifecycle Automation jobs (severity 2)
+- Unhealthy statistics: `certlcstats` failed, stopped, or suspended without a later successful completion, or has no successful completion within two hours (severity 2)
 
-Action Group email receivers are configured per environment and use the common alert schema. The stale-statistics rule reports an unhealthy state when the hourly statistics schedule is disabled or has not completed successfully.
+Action Group email receivers are configured per environment and use the common alert schema. The statistics-health rule retains the resource name `alert-certlc-statistics-stale` and evaluates every five minutes over the last two hours. It remains unhealthy through missing data and created, queued, or running jobs; failure records aging out do not count as recovery. Only a recent `Completed` record strictly later than the latest failure makes it healthy. Azure then applies its stateful resolution delay (three healthy evaluation periods at this frequency), so recovery notification is not immediate. The rule also reports an unhealthy state when the hourly statistics schedule is disabled or has not completed successfully. Statistics jobs are excluded from the short-window lifecycle failure rule to avoid duplicate, cycling notifications. These source changes take effect only after deploying the alert updates.
+
+The lifecycle-failure rule (`alert-certlc-automation-failure`) temporarily has automatic resolution disabled. It is stateless: expiration of failure records from its ten-minute window no longer sends a recovery notification, and a later successful run does not resolve it either. Repeated firing notifications are possible while the condition is met. This setting does not affect the statistics-health rule's success-based recovery.
 
 ### Resilience
 
-The runbook's Key Vault REST reads for thumbprint discovery and exact secret retrieval, plus its LDAP template lookup, use a retry helper with up to four total attempts. It retries HTTP 408, 429, 500, 502, 503, and 504 responses and selected network, timeout, I/O, web, and COM exceptions. `Retry-After` takes precedence over exponential backoff with jitter, and delays are capped at 30 seconds. State-changing certificate creation/merge/update calls and CA enrollment/revocation calls are not passed through this retry helper, avoiding automatic duplicate side effects.
+The runbook's Key Vault REST reads for thumbprint discovery and exact secret retrieval, plus its LDAP template lookup, use a retry helper with up to four total attempts. It retries HTTP 408, 429, 500, 502, 503, and 504 responses and selected network, timeout, I/O, web, and COM exceptions. A positive `Retry-After` delta takes precedence and is capped at 30 seconds. Otherwise, the exponential base delay is capped at 30 seconds before jitter of less than `InitialDelayMs` (default 500 ms) is added. State-changing certificate creation/merge/update calls and CA enrollment/revocation calls are not passed through this retry helper, avoiding automatic duplicate side effects.
 
 The Function bridge acknowledges a queue message only when the Automation job reaches `Completed`. `Failed`, `Stopped`, `Suspended`, and `Blocked` fail the Function invocation so queue retry and poison-message handling remain active. Transitional states are polled for up to `RunbookPollingTimeoutMinutes` (25 minutes in the Bicep deployment); an unknown state or elapsed deadline fails closed. Automation output retrieval is best-effort and cannot turn an otherwise completed lifecycle operation into a duplicate queue retry.
 
@@ -163,7 +169,6 @@ CertLC/
 ├── Runbooks/                    # Automation runbooks
 │   ├── certlc.ps1              # Main certificate operations runbook
 │   ├── certlcstats.ps1         # Certificate statistics collection
-│   ├── certlc-jobid-test.ps1   # Retained Hybrid Worker job-identity diagnostic
 │   ├── normalnotification.html # Email template for successful operations
 │   └── errornotification.html  # Email template for failures
 ├── LogAnalytics/               # Custom table configuration
@@ -171,7 +176,7 @@ CertLC/
 ├── Workbooks/                  # Azure Monitor workbooks
 │   ├── certlcstats.workbook    # Tokenized production workbook deployed by Bicep
 │   ├── README.md              # Embedded-query index and maintenance guidance
-│   └── *.kql                   # 18 queries matching the production workbook
+│   └── *.kql                   # 35 queries matching the production workbook
 ├── Utilities/                  # Helper scripts
 │   ├── Export-PfxWithGroupProtection.ps1 # Export a Key Vault certificate as a SID-protected PFX
 │   ├── Extract-KeyCer.ps1      # Extract a certificate and private key from a PFX
@@ -180,7 +185,8 @@ CertLC/
 │   ├── testnewcertchain.ps1    # Validate full-chain creation and PFX export
 │   ├── testrenewcert.ps1       # Test certificate renewal
 │   └── testrevocationcert.ps1  # Test certificate revocation
-└── Tests/                      # Retained legacy Event Grid schema sample
+└── Tests/                      # Local helper/dispatcher checks and legacy schema sample
+  ├── certlc-refactoring.tests.ps1
   └── sample-eventgrideventschema.json
 ```
 
@@ -188,11 +194,15 @@ CertLC/
 
 Requests are sent as JSON messages to the Storage Queue using CloudEventSchema. The schema varies by operation type:
 
-The runbook validates `specversion` (`1.0`) and `type`, and reads optional top-level `id` and `source` for diagnostics and the [correlation rules](#request-correlation) below. It consumes the operation-specific fields identified below. Other envelope and `data` fields shown in the examples are retained for CloudEvent/Event Grid compatibility but are not read by the current dispatcher. The retained [Event Grid schema sample](Tests/sample-eventgrideventschema.json) shows the legacy `eventType`/`topic` envelope, not the CloudEvents input expected by the current dispatcher; use the request examples below for current inputs.
+The runbook validates `specversion` (`1.0`) and `type`, and reads optional top-level `id` and `source` for diagnostics and the [correlation rules](#request-correlation) below. It consumes the operation-specific fields identified below and `data.Id` for notification details. Other envelope and `data` fields shown in the examples are retained for CloudEvent/Event Grid compatibility but are not read by the current dispatcher. The retained [Event Grid schema sample](Tests/sample-eventgrideventschema.json) shows the legacy `eventType`/`topic` envelope, not the CloudEvents input expected by the current dispatcher; use the request examples below for current inputs.
 
 **Creation Request:**
 
 Consumed `data` fields: `VaultName`, `ObjectName`, `CertificateTemplate`, `CertificateSubject`, `CertificateDnsNames` (optional array), `Hostname`, `PfxProtectTo`, and `NotifyTo` (optional array). `CertificateTemplate` may be the template's internal name, display name, or OID; the runbook resolves and stores the internal name.
+
+`CertificateDnsNames` and `NotifyTo` may be omitted, `null`, or arrays (including `[]`). Non-null scalars, including empty strings, are rejected rather than silently converted to arrays. `data.Id` is optional in all three operations; when supplied it contributes notification details, not event correlation. The envelope's `specversion` is the CloudEvents contract version (`1.0`), not the runbook release version.
+
+The dispatcher normalizes JSON and native webhook objects to case-insensitive dictionaries before validation. The envelope and `data` must each be a single object; arrays, scalars, and ambiguous case-only duplicate fields are rejected. Required strings must be actual nonblank strings. Creation validates local fields, hostname syntax, and protection-principal normalization before Key Vault or AD lookups. Revocation reason codes still accept integers or integer strings, including `0`. These stricter checks may reject malformed inputs previously accepted through coercion; valid request shapes and correlation rules are unchanged.
 
 ```json
 {
@@ -220,6 +230,8 @@ Consumed `data` fields: `VaultName`, `ObjectName`, `CertificateTemplate`, `Certi
 **Renewal Request** (from Event Grid CertificateNearExpiry event):
 
 Consumed `data` fields: `VaultName` and `ObjectName`. The dispatcher deliberately reads the latest Key Vault version for that name and reconstructs the subject, SANs, template, export hostname, protection principals, and notification recipients from the certificate and its tags; the event's `Version`, `NBF`, and `EXP` values are not used.
+
+Renewal reads the SAN extension by numeric OID and enumerates only DNS names. IP, URI, and email SAN entries are not copied into the new request; DNS extraction does not depend on localized extension names or display formatting.
 
 ```json
 {
@@ -277,7 +289,9 @@ Consumed `data` fields: `VaultName`, `CertificateThumbprint`, and `RevocationRea
 
 `correlationId` represents only the top-level nonblank string event `id`, never `data.Id` or a job-ID fallback. The Function forwards only the unchanged `jsonRequestBody`; there is no separate runbook `CorrelationId` input. The runbook populates correlation after parsing this explicit JSON input path. Direct `WebhookData` calls omit correlation, including native, JSON, and legacy PowerShell webhook envelopes. This distinguishes input paths, not authenticated caller identity: any caller supplying `jsonRequestBody` receives the same behavior as the Function. Custom IDs need not be GUIDs; missing, null, empty, whitespace-only, or non-string IDs leave correlation omitted.
 
-The runbook checks Hybrid Worker execution, PowerShell 7.6+, and job identity before Azure authentication. Every custom log includes a separate `jobId` once discovered, including warnings, errors, verbose records, and serialization-failure records. Startup and payload-parsing failures omit `correlationId`. After explicit JSON parsing, validation and operation logs inherit the event ID when valid. `correlationIdSource` is no longer needed because the field never switches to execution identity. Nonblank logging-helper overrides are event IDs, not job IDs; they are not runbook inputs. Context cannot overwrite the reserved `jobId` or `correlationId` fields. These stream logs do not require Azure login, but module-loading failures and native cmdlet output are outside the custom logger contract. Early startup failures do not send SMTP notifications before notification configuration is available.
+The runbook checks Hybrid Worker execution and PowerShell 7.6+ before Azure authentication. It emits a random `identityMarker` through the existing JSON Output logger, authenticates with managed identity, then searches the configured runbook's Running jobs and full Output records through the Automation API. Only one exact marker match is accepted; missing or ambiguous identity stops processing before certificate operations. This replaces worker metadata and sandbox-trace discovery. Set the non-secret Automation variables `certlc-automationaccountid` (full account ARM resource ID) and `certlc-runbookname` (published lifecycle runbook name) before publishing this version; the setup template supplies both. The identity requires Reader access to that account, already included in the setup. Discovery allows up to eight scans and checks a 120-second budget between requests; this is not a hard per-request timeout.
+
+Every custom log includes a separate `jobId` once discovered, including warnings, errors, verbose records, and serialization-failure records. Startup marker/configuration/authentication failures have no verified `jobId`; startup and payload-parsing failures omit `correlationId`. After explicit JSON parsing, validation and operation logs inherit the event ID when valid. `correlationIdSource` is no longer needed because the field never switches to execution identity. Nonblank logging-helper overrides are event IDs, not job IDs; they are not runbook inputs. Context cannot overwrite the reserved `jobId` or `correlationId` fields. Emitting these stream logs does not require Azure login, but looking up their owning job does. Module-loading failures and native cmdlet output are outside the custom logger contract. Early startup failures do not send SMTP notifications before notification configuration is available.
 
 Event correlation is diagnostic metadata, not authorization or duplicate suppression. A retried event retains its correlation ID but receives a separate Function invocation and Automation job. `RenewedJobId`, `RevokedJobId`, and notification job references always use the actual Automation job ID. Event `source` is logged separately because IDs are unique within a producer's source, not necessarily across producers.
 
@@ -286,6 +300,22 @@ Every success and error email includes **Correlation ID** as the first row in it
 The Function preserves its workbook-sensitive plain-text messages and emits separate JSON `BridgeCorrelation` receipt/start association records in Application Insights trace messages. Missing event IDs remain omitted in both records; the started record independently includes the returned `jobId`. These can be joined to other traces using the platform `OperationId`; they are not automatic distributed tracing or custom properties. Reserved workbook-filter terms within association values are JSON-escaped and restored by JSON parsing. The runbook's JSON fields and streams remain compatible with Job History, which still groups by platform `JobId_g`. The independent stats runbook, its `SnapshotId`, ingestion schema, and existing workbook queries remain unchanged.
 
 When upgrading from the separate-input version, publish and verify the Function first so it stops forwarding `CorrelationId`, then publish the runbook that removes the parameter. Update any other callers that explicitly pass it. During this transition the old runbook may use job-ID correlation; certificate behavior is unchanged. Verify actual telemetry ingestion after deployment. Temporary development tests are not distributed.
+
+## Runbook Maintenance
+
+The lifecycle helpers receive the export root (`PfxRootFolder`) and revocation CA (`CA`) explicitly from the dispatcher. Creation and renewal use the same ordered notification-details helper, populated from the completed operation result. Keep the `[ref]` result contract when changing dispatcher calls: structured logs share the success stream, so capturing the entire function output as metadata would also capture log records.
+
+Long control-flow blocks should include concise comments explaining ownership, validation boundaries, ordering, or failure behavior. Preserve the comments around non-retried mutations, exact-version reads, chain checks, array shape, and native-resource cleanup. Comment-only edits can be verified by comparing PowerShell executable tokens before and after the change, in addition to syntax checks. Embedded templates and native declarations need their own format-appropriate documentation rather than injected PowerShell comments.
+
+Renewal selects Certificate Template Information by numeric extension OID `1.3.6.1.4.1.311.21.7` and decodes its DER sequence with `System.Formats.Asn1`. It does not depend on localized extension names or formatted text. Both notification outcomes share one embedded HTML layout with fixed success/error styling and an optional error section; renewal and revocation also share notification-tag parsing.
+
+Run the focused regression suite from the repository root with PowerShell 7.6 or later:
+
+```powershell
+./Tests/certlc-refactoring.tests.ps1
+```
+
+The suite extracts selected functions and the request-handling dispatcher using the PowerShell AST, mocks external operations, and creates temporary certificates only in memory. It does not execute runbook startup, authenticate to Azure, contact AD/AD CS, send email, or write PFX files. It covers request transports and validation, correlation, renewal/revocation routing, ASN.1 decoding, SMTP arguments, and notification rendering. Live Hybrid Worker certificate issuance and export remain separate integration checks.
 
 ## Workbook Maintenance
 

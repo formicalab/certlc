@@ -1,0 +1,1 @@
+Resources | where id =~ '{QueueStorage}' | project id=strcat(id, '/queueServices/default'), name=strcat(name, '/default')

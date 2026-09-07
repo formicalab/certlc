@@ -105,6 +105,81 @@
             "value": "__FUNCTION_APP_ID__"
           },
           {
+            "query": "Resources | where type =~ 'microsoft.eventgrid/systemtopics' | project id, name | order by name asc",
+            "queryType": 1,
+            "typeSettings": {
+              "additionalResourceOptions": []
+            },
+            "isRequired": true,
+            "type": 5,
+            "name": "EventGridTopic",
+            "crossComponentResources": [
+              "value::all"
+            ],
+            "id": "9fb6bbaa-8fb5-47b3-a7e6-b85a67ad4241",
+            "value": "__EVENT_GRID_TOPIC_ID__",
+            "resourceType": "microsoft.resourcegraph/resources",
+            "version": "KqlParameterItem/1.0",
+            "label": "Event Grid Topic"
+          },
+          {
+            "query": "Resources | where id =~ '{EventGridTopic}' | project value = tostring(properties.source), label = tostring(properties.source)",
+            "version": "KqlParameterItem/1.0",
+            "isHiddenWhenLocked": true,
+            "id": "d678a211-b7aa-4cd0-bce6-1a4ad3a58210",
+            "crossComponentResources": [
+              "value::all"
+            ],
+            "label": "Event Grid Source",
+            "name": "EventGridSource",
+            "typeSettings": {
+              "showDefault": false,
+              "additionalResourceOptions": []
+            },
+            "resourceType": "microsoft.resourcegraph/resources",
+            "value": "__EVENT_GRID_SOURCE_ID__",
+            "isRequired": true,
+            "queryType": 1,
+            "type": 2
+          },
+          {
+            "query": "Resources | where type =~ 'microsoft.storage/storageaccounts' | project id, name | order by name asc",
+            "queryType": 1,
+            "typeSettings": {
+              "additionalResourceOptions": []
+            },
+            "isRequired": true,
+            "type": 5,
+            "name": "QueueStorage",
+            "crossComponentResources": [
+              "value::all"
+            ],
+            "id": "26e6bb41-c88a-42ac-af5c-9b5f6725e825",
+            "value": "__QUEUE_STORAGE_ACCOUNT_ID__",
+            "resourceType": "microsoft.resourcegraph/resources",
+            "version": "KqlParameterItem/1.0",
+            "label": "Queue Storage"
+          },
+          {
+            "query": "Resources | where id =~ '{QueueStorage}' | project id=strcat(id, '/queueServices/default'), name=strcat(name, '/default')",
+            "version": "KqlParameterItem/1.0",
+            "isHiddenWhenLocked": true,
+            "id": "b993026c-34db-4029-87b7-a95c95d04191",
+            "crossComponentResources": [
+              "value::all"
+            ],
+            "label": "Queue Service",
+            "name": "QueueService",
+            "typeSettings": {
+              "additionalResourceOptions": []
+            },
+            "resourceType": "microsoft.resourcegraph/resources",
+            "value": "__QUEUE_SERVICE_ID__",
+            "isRequired": true,
+            "queryType": 1,
+            "type": 5
+          },
+          {
             "id": "a46ac1ec-5965-4af4-8750-49ace0d90f8d",
             "version": "KqlParameterItem/1.0",
             "name": "TimeRange",
@@ -197,10 +272,26 @@
             "linkTarget": "parameter"
           },
           {
+            "linkLabel": "EventGrid",
+            "id": "31a446e6-52fd-413c-8c2c-5e2c9e79175d",
+            "cellValue": "selectedTab",
+            "style": "link",
+            "subTarget": "5",
+            "linkTarget": "parameter"
+          },
+          {
+            "linkLabel": "Queue",
+            "id": "60963a1d-9b63-4e86-8fdf-a64ef0ec3ceb",
+            "cellValue": "selectedTab",
+            "style": "link",
+            "subTarget": "6",
+            "linkTarget": "parameter"
+          },
+          {
             "id": "9c94a5f2-b4c1-45fc-a223-0c6e42398b17",
             "cellValue": "selectedTab",
             "linkTarget": "parameter",
-            "linkLabel": "Job logs",
+            "linkLabel": "Job Logs",
             "subTarget": "2",
             "preText": "Tab 2",
             "style": "link"
@@ -209,7 +300,7 @@
             "id": "efc77831-cde8-47e2-b931-a0fa10a295df",
             "cellValue": "selectedTab",
             "linkTarget": "parameter",
-            "linkLabel": "Function bridge",
+            "linkLabel": "Function Bridge Logs",
             "subTarget": "3",
             "preText": "Tab 3",
             "style": "link"
@@ -468,6 +559,1267 @@
         "value": "1"
       },
       "name": "grpStats"
+    },
+    {
+      "name": "grpEventJourney",
+      "conditionalVisibility": {
+        "comparison": "isEqualTo",
+        "value": "4",
+        "parameterName": "selectedTab"
+      },
+      "content": {
+        "items": [
+          {
+            "name": "journey-parameters",
+            "content": {
+              "style": "formVertical",
+              "parameters": [
+                {
+                  "label": "Search events, certificates or message IDs",
+                  "value": "",
+                  "version": "KqlParameterItem/1.0",
+                  "description": "Event ID, certificate, queue message ID, queue name, job ID, Function invocation ID, event type or source. A match retains all observed attempts for the event.",
+                  "id": "bafbe95b-4eca-4487-82cb-e4be0b68894d",
+                  "name": "JourneySearch",
+                  "type": 1
+                }
+              ],
+              "version": "KqlParameterItem/1.0"
+            },
+            "type": 9
+          },
+          {
+            "name": "event-list",
+            "content": {
+              "query": "// Host trigger records expose actual dequeue count and insertion time; storage calls do not.\r\nlet QueueTraces = materialize(AppTraces\r\n| where TimeGenerated {TimeRange} and AppRoleName =~ '{FunctionApp:name}'\r\n| extend InvocationId = coalesce(tostring(Properties.InvocationId), extract(@'Id=([0-9a-fA-F-]{36})', 1, Message), OperationId)\r\n| where isnotempty(InvocationId));\r\nlet QueueInvocations = QueueTraces\r\n| where Message startswith \"Executing 'Functions.QueueHandler'\" and Message contains 'New queue message detected'\r\n| extend Queue = extract(@\"New queue message detected on '([^']+)'\", 1, Message)\r\n| where Queue in ('certlc', 'certlc-poison')\r\n| summarize Started=min(TimeGenerated) by InvocationId, Queue;\r\nlet QueueTriggerDetails = QueueTraces\r\n| where Message startswith 'Trigger Details:'\r\n| extend MessageId=extract(@'MessageId:\\s*([^,\\s]+)',1,Message),\r\n    DequeueCount=toint(extract(@'DequeueCount:\\s*(\\d+)',1,Message)),\r\n    InsertedOn=todatetime(extract(@'InsertedOn:\\s*([^,\\s]+)',1,Message))\r\n| summarize arg_min(TimeGenerated, *) by InvocationId\r\n| project InvocationId, MessageId, DequeueCount, InsertedOn;\r\nlet QueueCompletions = QueueTraces\r\n| where Message startswith \"Executed 'Functions.QueueHandler'\"\r\n| summarize arg_max(TimeGenerated, Message) by InvocationId\r\n| project InvocationId, Completed=TimeGenerated,\r\n    Result=case(Message contains '(Succeeded,', 'Succeeded', Message contains '(Failed,', 'Failed', 'Not parsed');\r\nlet QueueAttempts = QueueInvocations\r\n| join kind=leftouter QueueTriggerDetails on InvocationId\r\n| join kind=leftouter QueueCompletions on InvocationId\r\n| extend Result=coalesce(Result,'Completion not observed'),\r\n    AgeAtDequeueSeconds = datetime_diff('second', Started, InsertedOn)\r\n| project Started, Queue, MessageId, InsertedOn, DequeueCount, AgeAtDequeueSeconds, Result, Completed, InvocationId;\r\nlet JourneyQueueEvidence=QueueAttempts\r\n| order by Queue asc, MessageId asc, Started asc, InvocationId asc\r\n| serialize\r\n| extend RetryGapSeconds=iff(isnotempty(MessageId) and Queue == prev(Queue) and MessageId == prev(MessageId),\r\n    datetime_diff('millisecond',Started,prev(Started))/1000.0, real(null))\r\n| project AttemptId=InvocationId, Queue, QueueMessageId=MessageId, Dequeued=Started, InsertedOn, DequeueCount,\r\n    AgeAtDequeueSeconds, RetryGapSeconds, QueueResult=Result, QueueCompleted=Completed,\r\n    FunctionDurationSeconds=datetime_diff('millisecond',Completed,Started)/1000.0;\n// Scope every scan to the selected time and existing resources.\n// Reuse certlcstats resource selectors instead of pinning Journey to one deployment.\n// Match Job History: nested resource names may include the Automation account prefix.\nlet SelectedRunbookName = tostring(split('{Runbook:name}', '/')[-1]);\nlet Traces = materialize(AppTraces\n| where TimeGenerated {TimeRange}\n| where AppRoleName =~ '{FunctionApp:name}'\n| extend AttemptId = coalesce(tostring(Properties.InvocationId), extract(@'Id=([0-9a-fA-F-]{36})', 1, Message), OperationId)\n| where isnotempty(AttemptId));\nlet Bridge = Traces\n| where Message has 'BridgeCorrelation'\n| extend Entry = parse_json(extract(@'(\\{.*\\})', 1, Message))\n| where tostring(Entry.recordType) == 'BridgeCorrelation';\n// Only receipt records establish event identity. Older Started records used job fallback.\nlet Receipts = Bridge\n| where tostring(Entry.stage) == 'Received'\n| summarize arg_min(TimeGenerated, *) by AttemptId\n| project AttemptId, OperationId, Received = TimeGenerated,\n    CorrelationId = tostring(Entry.correlationId), EventSource = iff(tostring(Entry.eventSource) startswith '/subscriptions/', tolower(tostring(Entry.eventSource)), tostring(Entry.eventSource));\n// Keep each invocation/job association: repeated delivery must not erase earlier attempts.\nlet Links = Bridge\n| where tostring(Entry.stage) == 'Started' and isnotempty(tostring(Entry.jobId))\n| summarize Submitted = min(TimeGenerated) by AttemptId, JobId = tolower(tostring(Entry.jobId));\nlet Payloads = Traces\n| where Message contains 'CERTLC: full message received is:'\n| extend Payload = parse_json(extract(@'CERTLC: full message received is:\\s*(.*)$', 1, Message))\n| summarize arg_min(TimeGenerated, *) by AttemptId\n// Bracket notation preserves the CloudEvent field whose name is a KQL keyword.\n| project AttemptId, Certificate = coalesce(tostring(Payload.data.ObjectName), tostring(Payload.subject)),\n    EventType = tostring(Payload.type), EventTime = todatetime(Payload['time']);\nlet Streams = materialize(AzureDiagnostics\n| where TimeGenerated {TimeRange}\n| where Category == 'JobStreams' and Resource =~ '{AutomationAccount:name}' and RunbookName_s =~ SelectedRunbookName\n| extend JobId = tolower(tostring(JobId_g)), Raw = replace_regex(tostring(ResultDescription), @'\\x1B\\[[0-9;]*[A-Za-z]', '')\n| extend Entry = parse_json(extract(@'(\\{.*\\})', 1, Raw))\n| extend Message = coalesce(tostring(Entry.message), Raw), Section = coalesce(tostring(Entry.section), StreamType_s),\n    Level = coalesce(tostring(Entry.level), StreamType_s), LogTime = coalesce(todatetime(Entry.timestamp), TimeGenerated));\nlet Jobs = AzureDiagnostics\n| where TimeGenerated {TimeRange}\n| where Category == 'JobLogs' and Resource =~ '{AutomationAccount:name}' and RunbookName_s =~ SelectedRunbookName\n| summarize arg_max(TimeGenerated, ResultType) by JobId = tolower(tostring(JobId_g))\n| project JobId, JobStatus = ResultType, StatusObserved = TimeGenerated;\n// Operation outcome is not the same as Automation completion or SMTP delivery.\nlet Outcomes = Streams\n| summarize Warnings = countif(Level =~ 'Warning'), Errors = countif(Level =~ 'Error'),\n    Succeeded = countif(Section startswith 'Dispatcher.' and Message contains 'successfully'),\n    // Missing SMTP is not a skipped certificate operation.\n    Skipped = countif(Section == 'Dispatcher.Renewal' and Message startswith 'Skipping auto-renewal of certificate'),\n    EmailSent = countif(Section == 'Send-NotificationEmail' and Message startswith 'Notification email sent'),\n    EmailFailed = countif(Section == 'Send-NotificationEmail' and Level =~ 'Warning') by JobId;\nlet Exceptions = AppExceptions\n| where TimeGenerated {TimeRange}\n| where AppRoleName =~ '{FunctionApp:name}'\n| extend AttemptId = coalesce(tostring(Properties.InvocationId), extract(@'Id=([0-9a-fA-F-]{36})', 1, Message), OperationId)\n| summarize FunctionErrors = count() by AttemptId;\nlet BridgeAttempts = Receipts\n| join kind=leftouter JourneyQueueEvidence on AttemptId\n| join kind=leftouter Links on AttemptId\n| join kind=leftouter Payloads on AttemptId\n| join kind=leftouter Jobs on JobId\n| join kind=leftouter Outcomes on JobId\n| join kind=leftouter Exceptions on AttemptId\n// JSON tuple prevents ambiguous concatenation; unidentified receipts remain separate.\n| extend EventKey = tostring(pack_array(EventSource, CorrelationId, iff(isempty(CorrelationId), AttemptId, ''))),\n    JobStatus = coalesce(JobStatus, 'Not observed'),\n    OperationOutcome = case(Errors > 0, 'Error logged', Skipped > 0, 'Skipped', Succeeded > 0, 'Success logged', 'Not observed'),\n    Notification = case(EmailFailed > 0, 'Delivery warning', EmailSent > 0, 'Sent', 'Not observed'),\n    Warnings = coalesce(Warnings, 0), Errors = coalesce(Errors, 0), FunctionErrors = coalesce(FunctionErrors, 0);\n\n// Failure columns may not exist until diagnostic logging produces its first record.\n// Use the selected topic's actual source, never a job ID or an Event Grid systemId.\nlet EventGridFailures = materialize(AzureDiagnostics\n| where TimeGenerated {TimeRange}\n| where Category == 'DeliveryFailures' and _ResourceId =~ '{EventGridTopic}'\n| extend Extra = column_ifexists('AdditionalFields', dynamic({}))\n| extend Raw = coalesce(tostring(column_ifexists('message_s', '')), tostring(column_ifexists('Message', '')), tostring(Extra.message)),\n    EventSubscription = coalesce(tostring(column_ifexists('eventSubscriptionName_s', '')), tostring(Extra.eventSubscriptionName))\n| extend CorrelationId = extract(@'(?:^|[,;]\\s*|Message:)id=([^,;\\s]+)', 1, Raw),\n    FailureOutcome = extract(@'(?:^|[,;]\\s*|Message:)outcome=([^,;]+)', 1, Raw),\n    DeliveryCount = tolong(extract(@'(?:^|[,;]\\s*)deliveryCount=(\\d+)', 1, Raw)),\n    LatencyMs = todouble(extract(@'(?:^|[,;]\\s*)latencyInMs=([\\d.]+)', 1, Raw)),\n    EventType = extract(@'(?:^|[,;]\\s*)eventType=([^,;\\s]+)', 1, Raw),\n    EventTime = todatetime(extract(@'(?:^|[,;]\\s*)eventTime=([^,;]+)', 1, Raw)),\n    EventSource = tolower('{EventGridSource}')\n// Unknown identities stay isolated and still offer their raw diagnostic record.\n| extend EventKey = tostring(pack_array(EventSource, CorrelationId,\n    iff(isempty(CorrelationId), strcat('eventgrid:', hash_sha256(strcat(TimeGenerated, '|', EventSubscription, '|', Raw))), '')))\n| project TimeGenerated, EventKey, CorrelationId, EventSource, EventSubscription,\n    FailureOutcome = coalesce(FailureOutcome, 'Not parsed'), DeliveryCount, LatencyMs, EventType, EventTime, Raw);\nlet FailureSummary = EventGridFailures\n| summarize FirstFailure = min(TimeGenerated), LastFailure = max(TimeGenerated),\n    EventGridFailureCount = count(), FailureEventTypes = make_set(EventType), FailureEventTime = min(EventTime)\n    by EventKey, CorrelationId, EventSource;\n// A failed delivery is an observation, not a Function invocation or an Automation outcome.\nlet Attempts = union\n    (BridgeAttempts\n    | join kind=leftouter FailureSummary on EventKey\n    | extend FirstObserved = min_of(Received, FirstFailure),\n        StatusObserved = max_of(StatusObserved, Received, LastFailure),\n        EventGridFailureCount = coalesce(EventGridFailureCount, 0)),\n    (FailureSummary\n    | join kind=leftanti (BridgeAttempts | distinct EventKey) on EventKey\n    | project EventKey, CorrelationId, EventSource,\n        FirstObserved = FirstFailure, Received = datetime(null), StatusObserved = LastFailure,\n        AttemptId = '', OperationId = '', JobId = '', Certificate = '',\n        EventType = tostring(FailureEventTypes[0]), EventTime = FailureEventTime,\n        JobStatus = 'Not observed', OperationOutcome = 'Not observed', Notification = 'Not observed',\n        Warnings = tolong(0), Errors = tolong(0), FunctionErrors = tolong(0), EventGridFailureCount);\n// Workbook formatting encodes user input before KQL substitution, including quotes/newlines.\nlet JourneyQueueObservations = materialize(Attempts\r\n| where isnotempty(AttemptId) and isnotempty(QueueMessageId)\r\n| distinct EventKey, AttemptId, Queue, QueueMessageId, Dequeued, InsertedOn, DequeueCount,\r\n    AgeAtDequeueSeconds, RetryGapSeconds, QueueResult, QueueCompleted, FunctionDurationSeconds);\r\nlet JourneyMessages = JourneyQueueObservations\r\n| summarize arg_max(Dequeued, QueueResult), ObservedDequeues=count(), HighestDequeueCount=max(DequeueCount),\r\n    FailedDequeues=countif(QueueResult == 'Failed'), RetryObservations=countif(DequeueCount > 1)\r\n    by EventKey, Queue, QueueMessageId;\r\nlet JourneyQueueSummary = JourneyMessages\r\n| summarize QueueMessages=count(), ObservedDequeues=sum(ObservedDequeues), HighestDequeueCount=max(HighestDequeueCount),\r\n    FailedDequeues=sum(FailedDequeues), RetryObservations=sum(RetryObservations),\r\n    LatestSucceeded=countif(QueueResult == 'Succeeded'), LatestFailed=countif(QueueResult == 'Failed'),\r\n    LatestUnobserved=countif(QueueResult !in ('Succeeded','Failed')) by EventKey\r\n| extend QueueStatus=case(LatestFailed > 0, 'Latest processing failed', LatestUnobserved > 0, 'Completion not observed',\r\n    LatestSucceeded > 0, 'Latest processing succeeded', 'Not observed');\nlet SearchText = trim(@'\\s+', base64_decode_tostring('{JourneySearch:base64}'));\n// A matching job selects its whole event so search does not hide sibling retry attempts.\nlet MatchingEvents = Attempts\n| where isempty(SearchText) or CorrelationId contains SearchText or Certificate contains SearchText\n    or QueueMessageId contains SearchText or Queue contains SearchText or JobId contains SearchText or AttemptId contains SearchText or EventType contains SearchText or EventSource contains SearchText\n| distinct EventKey;\nAttempts\n| join kind=leftsemi MatchingEvents on EventKey\n// Group by the full event identity, while retaining counts and all observed outcomes.\n| summarize FirstReceipt = min(FirstObserved), LastObserved = max(StatusObserved),\n    // Empty join results do not represent an observed Automation job.\n    AttemptIds = make_set_if(AttemptId, isnotempty(AttemptId)), Jobs = make_set_if(JobId, isnotempty(JobId)), Certificates = make_set(Certificate), EventTypes = make_set(EventType),\n    JobStates = make_set(JobStatus), Outcomes = make_set(OperationOutcome), Notifications = make_set(Notification),\n    Warnings = sum(Warnings), Errors = sum(Errors), FunctionErrors = sum(FunctionErrors), EventGridFailureRecords = max(EventGridFailureCount)\n    by EventKey, CorrelationId, EventSource\n| extend Attempts = array_length(AttemptIds), JobCount = array_length(Jobs),\n    ObservedDuration = LastObserved - FirstReceipt\n// Compact display values avoid raw JSON arrays; retain all diagnostics for selection and export.\n| extend Certificate = strcat_array(Certificates, ', '),\n    EventType = replace_regex(strcat_array(EventTypes, ', '), @'(CertLC\\.|Microsoft\\.KeyVault\\.)', ''),\n    Outcome = strcat_array(Outcomes, ', '), JobStatus = strcat_array(JobStates, ', ')\n| extend EventGrid = case(EventGridFailureRecords > 0 and Attempts > 0, 'Failure logged; Function receipt observed',\n    EventGridFailureRecords > 0, 'Failure logged; no Function receipt observed', 'No failure records observed')\n| join kind=leftouter JourneyQueueSummary on EventKey\r\n| extend QueueMessages=coalesce(QueueMessages,0), ObservedDequeues=coalesce(ObservedDequeues,0),\r\n    FailedDequeues=coalesce(FailedDequeues,0), RetryObservations=coalesce(RetryObservations,0), QueueStatus=coalesce(QueueStatus,'Not observed')\r\n| project FirstReceipt, Certificate, EventType, EventGrid, QueueStatus, QueueMessages, ObservedDequeues,\r\n    HighestDequeueCount, FailedDequeues, RetryObservations, Outcome, JobStatus, Attempts, JobCount, EventGridFailureRecords,\n    CorrelationId, Certificates, EventTypes, JobStates, Outcomes, Notifications,\n    Warnings, Errors, FunctionErrors, ObservedDuration, EventSource, EventKey\n| order by FirstReceipt desc\n| take 500",
+              "visualization": "table",
+              "gridSettings": {
+                "filter": true,
+                "labelSettings": [
+                  {
+                    "columnId": "FirstReceipt",
+                    "label": "First observed"
+                  },
+                  {
+                    "columnId": "EventType",
+                    "label": "Event type"
+                  },
+                  {
+                    "columnId": "Outcome",
+                    "label": "Operation outcome"
+                  },
+                  {
+                    "columnId": "JobStatus",
+                    "label": "Job status"
+                  },
+                  {
+                    "columnId": "JobCount",
+                    "label": "Jobs"
+                  },
+                  {
+                    "columnId": "Attempts",
+                    "label": "Function attempts"
+                  },
+                  {
+                    "columnId": "QueueStatus",
+                    "label": "Queue processing"
+                  },
+                  {
+                    "columnId": "QueueMessages",
+                    "label": "Messages"
+                  },
+                  {
+                    "columnId": "ObservedDequeues",
+                    "label": "Dequeues"
+                  }
+                ],
+                "rowLimit": 500,
+                "formatters": [
+                  {
+                    "formatter": 5,
+                    "columnMatch": "CorrelationId"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "Certificates"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "EventTypes"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "JobStates"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "Outcomes"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "Notifications"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "Warnings"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "Errors"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "FunctionErrors"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "ObservedDuration"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "EventSource"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "EventKey"
+                  },
+                  {
+                    "formatOptions": {
+                      "customColumnWidthSetting": "26ch"
+                    },
+                    "columnMatch": "FirstReceipt",
+                    "formatter": 6
+                  },
+                  {
+                    "formatOptions": {
+                      "customColumnWidthSetting": "1fr"
+                    },
+                    "columnMatch": "Certificate",
+                    "formatter": 1
+                  },
+                  {
+                    "formatOptions": {
+                      "customColumnWidthSetting": "1fr"
+                    },
+                    "columnMatch": "EventType",
+                    "formatter": 1
+                  },
+                  {
+                    "formatOptions": {
+                      "customColumnWidthSetting": "1fr"
+                    },
+                    "columnMatch": "Outcome",
+                    "formatter": 1
+                  },
+                  {
+                    "formatOptions": {
+                      "customColumnWidthSetting": "1fr"
+                    },
+                    "columnMatch": "JobStatus",
+                    "formatter": 1
+                  },
+                  {
+                    "formatOptions": {
+                      "customColumnWidthSetting": "8ch"
+                    },
+                    "columnMatch": "Attempts",
+                    "formatter": 1
+                  },
+                  {
+                    "formatOptions": {
+                      "customColumnWidthSetting": "5ch"
+                    },
+                    "columnMatch": "JobCount",
+                    "formatter": 1
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "EventGridFailureRecords"
+                  },
+                  {
+                    "formatOptions": {
+                      "customColumnWidthSetting": "28ch"
+                    },
+                    "columnMatch": "EventGrid",
+                    "formatter": 1
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "HighestDequeueCount"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "FailedDequeues"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "RetryObservations"
+                  }
+                ]
+              },
+              "version": "KqlItem/1.0",
+              "exportToExcelOptions": "all",
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "showExportToExcel": true,
+              "timeContextFromParameter": "TimeRange",
+              "queryType": 0,
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ],
+              "title": "Found events (up to 500)",
+              "exportedParameters": [
+                {
+                  "parameterType": 1,
+                  "fieldName": "EventKey",
+                  "parameterName": "SelectedEvent"
+                }
+              ]
+            },
+            "type": 3
+          },
+          {
+            "name": "event-context",
+            "conditionalVisibility": {
+              "comparison": "isNotEqualTo",
+              "value": "",
+              "parameterName": "SelectedEvent"
+            },
+            "content": {
+              "query": "// Host trigger records expose actual dequeue count and insertion time; storage calls do not.\r\nlet QueueTraces = materialize(AppTraces\r\n| where TimeGenerated {TimeRange} and AppRoleName =~ '{FunctionApp:name}'\r\n| extend InvocationId = coalesce(tostring(Properties.InvocationId), extract(@'Id=([0-9a-fA-F-]{36})', 1, Message), OperationId)\r\n| where isnotempty(InvocationId));\r\nlet QueueInvocations = QueueTraces\r\n| where Message startswith \"Executing 'Functions.QueueHandler'\" and Message contains 'New queue message detected'\r\n| extend Queue = extract(@\"New queue message detected on '([^']+)'\", 1, Message)\r\n| where Queue in ('certlc', 'certlc-poison')\r\n| summarize Started=min(TimeGenerated) by InvocationId, Queue;\r\nlet QueueTriggerDetails = QueueTraces\r\n| where Message startswith 'Trigger Details:'\r\n| extend MessageId=extract(@'MessageId:\\s*([^,\\s]+)',1,Message),\r\n    DequeueCount=toint(extract(@'DequeueCount:\\s*(\\d+)',1,Message)),\r\n    InsertedOn=todatetime(extract(@'InsertedOn:\\s*([^,\\s]+)',1,Message))\r\n| summarize arg_min(TimeGenerated, *) by InvocationId\r\n| project InvocationId, MessageId, DequeueCount, InsertedOn;\r\nlet QueueCompletions = QueueTraces\r\n| where Message startswith \"Executed 'Functions.QueueHandler'\"\r\n| summarize arg_max(TimeGenerated, Message) by InvocationId\r\n| project InvocationId, Completed=TimeGenerated,\r\n    Result=case(Message contains '(Succeeded,', 'Succeeded', Message contains '(Failed,', 'Failed', 'Not parsed');\r\nlet QueueAttempts = QueueInvocations\r\n| join kind=leftouter QueueTriggerDetails on InvocationId\r\n| join kind=leftouter QueueCompletions on InvocationId\r\n| extend Result=coalesce(Result,'Completion not observed'),\r\n    AgeAtDequeueSeconds = datetime_diff('second', Started, InsertedOn)\r\n| project Started, Queue, MessageId, InsertedOn, DequeueCount, AgeAtDequeueSeconds, Result, Completed, InvocationId;\r\nlet JourneyQueueEvidence=QueueAttempts\r\n| order by Queue asc, MessageId asc, Started asc, InvocationId asc\r\n| serialize\r\n| extend RetryGapSeconds=iff(isnotempty(MessageId) and Queue == prev(Queue) and MessageId == prev(MessageId),\r\n    datetime_diff('millisecond',Started,prev(Started))/1000.0, real(null))\r\n| project AttemptId=InvocationId, Queue, QueueMessageId=MessageId, Dequeued=Started, InsertedOn, DequeueCount,\r\n    AgeAtDequeueSeconds, RetryGapSeconds, QueueResult=Result, QueueCompleted=Completed,\r\n    FunctionDurationSeconds=datetime_diff('millisecond',Completed,Started)/1000.0;\n// Scope every scan to the selected time and existing resources.\n// Reuse certlcstats resource selectors instead of pinning Journey to one deployment.\n// Match Job History: nested resource names may include the Automation account prefix.\nlet SelectedRunbookName = tostring(split('{Runbook:name}', '/')[-1]);\nlet Traces = materialize(AppTraces\n| where TimeGenerated {TimeRange}\n| where AppRoleName =~ '{FunctionApp:name}'\n| extend AttemptId = coalesce(tostring(Properties.InvocationId), extract(@'Id=([0-9a-fA-F-]{36})', 1, Message), OperationId)\n| where isnotempty(AttemptId));\nlet Bridge = Traces\n| where Message has 'BridgeCorrelation'\n| extend Entry = parse_json(extract(@'(\\{.*\\})', 1, Message))\n| where tostring(Entry.recordType) == 'BridgeCorrelation';\n// Only receipt records establish event identity. Older Started records used job fallback.\nlet Receipts = Bridge\n| where tostring(Entry.stage) == 'Received'\n| summarize arg_min(TimeGenerated, *) by AttemptId\n| project AttemptId, OperationId, Received = TimeGenerated,\n    CorrelationId = tostring(Entry.correlationId), EventSource = iff(tostring(Entry.eventSource) startswith '/subscriptions/', tolower(tostring(Entry.eventSource)), tostring(Entry.eventSource));\n// Keep each invocation/job association: repeated delivery must not erase earlier attempts.\nlet Links = Bridge\n| where tostring(Entry.stage) == 'Started' and isnotempty(tostring(Entry.jobId))\n| summarize Submitted = min(TimeGenerated) by AttemptId, JobId = tolower(tostring(Entry.jobId));\nlet Payloads = Traces\n| where Message contains 'CERTLC: full message received is:'\n| extend Payload = parse_json(extract(@'CERTLC: full message received is:\\s*(.*)$', 1, Message))\n| summarize arg_min(TimeGenerated, *) by AttemptId\n// Bracket notation preserves the CloudEvent field whose name is a KQL keyword.\n| project AttemptId, Certificate = coalesce(tostring(Payload.data.ObjectName), tostring(Payload.subject)),\n    EventType = tostring(Payload.type), EventTime = todatetime(Payload['time']);\nlet Streams = materialize(AzureDiagnostics\n| where TimeGenerated {TimeRange}\n| where Category == 'JobStreams' and Resource =~ '{AutomationAccount:name}' and RunbookName_s =~ SelectedRunbookName\n| extend JobId = tolower(tostring(JobId_g)), Raw = replace_regex(tostring(ResultDescription), @'\\x1B\\[[0-9;]*[A-Za-z]', '')\n| extend Entry = parse_json(extract(@'(\\{.*\\})', 1, Raw))\n| extend Message = coalesce(tostring(Entry.message), Raw), Section = coalesce(tostring(Entry.section), StreamType_s),\n    Level = coalesce(tostring(Entry.level), StreamType_s), LogTime = coalesce(todatetime(Entry.timestamp), TimeGenerated));\nlet Jobs = AzureDiagnostics\n| where TimeGenerated {TimeRange}\n| where Category == 'JobLogs' and Resource =~ '{AutomationAccount:name}' and RunbookName_s =~ SelectedRunbookName\n| summarize arg_max(TimeGenerated, ResultType) by JobId = tolower(tostring(JobId_g))\n| project JobId, JobStatus = ResultType, StatusObserved = TimeGenerated;\n// Operation outcome is not the same as Automation completion or SMTP delivery.\nlet Outcomes = Streams\n| summarize Warnings = countif(Level =~ 'Warning'), Errors = countif(Level =~ 'Error'),\n    Succeeded = countif(Section startswith 'Dispatcher.' and Message contains 'successfully'),\n    // Missing SMTP is not a skipped certificate operation.\n    Skipped = countif(Section == 'Dispatcher.Renewal' and Message startswith 'Skipping auto-renewal of certificate'),\n    EmailSent = countif(Section == 'Send-NotificationEmail' and Message startswith 'Notification email sent'),\n    EmailFailed = countif(Section == 'Send-NotificationEmail' and Level =~ 'Warning') by JobId;\nlet Exceptions = AppExceptions\n| where TimeGenerated {TimeRange}\n| where AppRoleName =~ '{FunctionApp:name}'\n| extend AttemptId = coalesce(tostring(Properties.InvocationId), extract(@'Id=([0-9a-fA-F-]{36})', 1, Message), OperationId)\n| summarize FunctionErrors = count() by AttemptId;\nlet BridgeAttempts = Receipts\n| join kind=leftouter JourneyQueueEvidence on AttemptId\n| join kind=leftouter Links on AttemptId\n| join kind=leftouter Payloads on AttemptId\n| join kind=leftouter Jobs on JobId\n| join kind=leftouter Outcomes on JobId\n| join kind=leftouter Exceptions on AttemptId\n// JSON tuple prevents ambiguous concatenation; unidentified receipts remain separate.\n| extend EventKey = tostring(pack_array(EventSource, CorrelationId, iff(isempty(CorrelationId), AttemptId, ''))),\n    JobStatus = coalesce(JobStatus, 'Not observed'),\n    OperationOutcome = case(Errors > 0, 'Error logged', Skipped > 0, 'Skipped', Succeeded > 0, 'Success logged', 'Not observed'),\n    Notification = case(EmailFailed > 0, 'Delivery warning', EmailSent > 0, 'Sent', 'Not observed'),\n    Warnings = coalesce(Warnings, 0), Errors = coalesce(Errors, 0), FunctionErrors = coalesce(FunctionErrors, 0);\n\n// Failure columns may not exist until diagnostic logging produces its first record.\n// Use the selected topic's actual source, never a job ID or an Event Grid systemId.\nlet EventGridFailures = materialize(AzureDiagnostics\n| where TimeGenerated {TimeRange}\n| where Category == 'DeliveryFailures' and _ResourceId =~ '{EventGridTopic}'\n| extend Extra = column_ifexists('AdditionalFields', dynamic({}))\n| extend Raw = coalesce(tostring(column_ifexists('message_s', '')), tostring(column_ifexists('Message', '')), tostring(Extra.message)),\n    EventSubscription = coalesce(tostring(column_ifexists('eventSubscriptionName_s', '')), tostring(Extra.eventSubscriptionName))\n| extend CorrelationId = extract(@'(?:^|[,;]\\s*|Message:)id=([^,;\\s]+)', 1, Raw),\n    FailureOutcome = extract(@'(?:^|[,;]\\s*|Message:)outcome=([^,;]+)', 1, Raw),\n    DeliveryCount = tolong(extract(@'(?:^|[,;]\\s*)deliveryCount=(\\d+)', 1, Raw)),\n    LatencyMs = todouble(extract(@'(?:^|[,;]\\s*)latencyInMs=([\\d.]+)', 1, Raw)),\n    EventType = extract(@'(?:^|[,;]\\s*)eventType=([^,;\\s]+)', 1, Raw),\n    EventTime = todatetime(extract(@'(?:^|[,;]\\s*)eventTime=([^,;]+)', 1, Raw)),\n    EventSource = tolower('{EventGridSource}')\n// Unknown identities stay isolated and still offer their raw diagnostic record.\n| extend EventKey = tostring(pack_array(EventSource, CorrelationId,\n    iff(isempty(CorrelationId), strcat('eventgrid:', hash_sha256(strcat(TimeGenerated, '|', EventSubscription, '|', Raw))), '')))\n| project TimeGenerated, EventKey, CorrelationId, EventSource, EventSubscription,\n    FailureOutcome = coalesce(FailureOutcome, 'Not parsed'), DeliveryCount, LatencyMs, EventType, EventTime, Raw);\nlet FailureSummary = EventGridFailures\n| summarize FirstFailure = min(TimeGenerated), LastFailure = max(TimeGenerated),\n    EventGridFailureCount = count(), FailureEventTypes = make_set(EventType), FailureEventTime = min(EventTime)\n    by EventKey, CorrelationId, EventSource;\n// A failed delivery is an observation, not a Function invocation or an Automation outcome.\nlet Attempts = union\n    (BridgeAttempts\n    | join kind=leftouter FailureSummary on EventKey\n    | extend FirstObserved = min_of(Received, FirstFailure),\n        StatusObserved = max_of(StatusObserved, Received, LastFailure),\n        EventGridFailureCount = coalesce(EventGridFailureCount, 0)),\n    (FailureSummary\n    | join kind=leftanti (BridgeAttempts | distinct EventKey) on EventKey\n    | project EventKey, CorrelationId, EventSource,\n        FirstObserved = FirstFailure, Received = datetime(null), StatusObserved = LastFailure,\n        AttemptId = '', OperationId = '', JobId = '', Certificate = '',\n        EventType = tostring(FailureEventTypes[0]), EventTime = FailureEventTime,\n        JobStatus = 'Not observed', OperationOutcome = 'Not observed', Notification = 'Not observed',\n        Warnings = tolong(0), Errors = tolong(0), FunctionErrors = tolong(0), EventGridFailureCount);\nlet JourneyQueueObservations = materialize(Attempts\r\n| where isnotempty(AttemptId) and isnotempty(QueueMessageId)\r\n| distinct EventKey, AttemptId, Queue, QueueMessageId, Dequeued, InsertedOn, DequeueCount,\r\n    AgeAtDequeueSeconds, RetryGapSeconds, QueueResult, QueueCompleted, FunctionDurationSeconds);\r\nlet JourneyMessages = JourneyQueueObservations\r\n| summarize arg_max(Dequeued, QueueResult), ObservedDequeues=count(), HighestDequeueCount=max(DequeueCount),\r\n    FailedDequeues=countif(QueueResult == 'Failed'), RetryObservations=countif(DequeueCount > 1)\r\n    by EventKey, Queue, QueueMessageId;\r\nlet JourneyQueueSummary = JourneyMessages\r\n| summarize QueueMessages=count(), ObservedDequeues=sum(ObservedDequeues), HighestDequeueCount=max(HighestDequeueCount),\r\n    FailedDequeues=sum(FailedDequeues), RetryObservations=sum(RetryObservations),\r\n    LatestSucceeded=countif(QueueResult == 'Succeeded'), LatestFailed=countif(QueueResult == 'Failed'),\r\n    LatestUnobserved=countif(QueueResult !in ('Succeeded','Failed')) by EventKey\r\n| extend QueueStatus=case(LatestFailed > 0, 'Latest processing failed', LatestUnobserved > 0, 'Completion not observed',\r\n    LatestSucceeded > 0, 'Latest processing succeeded', 'Not observed');\nlet SelectedKey=base64_decode_tostring('{SelectedEvent:base64}');\r\nAttempts\r\n| where isnotempty(SelectedKey) and EventKey == SelectedKey\r\n| summarize Certificates=make_set_if(Certificate,isnotempty(Certificate)), EventTypes=make_set_if(EventType,isnotempty(EventType)),\r\n    FailureRecords=max(EventGridFailureCount) by EventKey,CorrelationId,EventSource\r\n| join kind=leftouter JourneyQueueSummary on EventKey\r\n| project Details=pack_array(\r\n    pack('Field','Certificate','Value',strcat_array(Certificates,', ')),\r\n    pack('Field','Event type','Value',strcat_array(EventTypes,', ')),\r\n    pack('Field','Correlation ID','Value',CorrelationId),\r\n    pack('Field','Source','Value',EventSource),\r\n    pack('Field','Event Grid failure records','Value',tostring(FailureRecords)),\r\n    pack('Field','Queue messages / observed dequeues','Value',strcat(coalesce(QueueMessages,0),' / ',coalesce(ObservedDequeues,0))),\r\n    pack('Field','Highest observed dequeue count','Value',tostring(HighestDequeueCount)),\r\n    pack('Field','Retry / failed processing observations','Value',strcat(coalesce(RetryObservations,0),' / ',coalesce(FailedDequeues,0))),\r\n    pack('Field','Latest processing per message','Value',coalesce(QueueStatus,'Not observed')))\r\n| mv-expand Details\r\n| project Field=tostring(Details.Field),Value=coalesce(tostring(Details.Value),'Not observed')",
+              "visualization": "table",
+              "gridSettings": {
+                "rowLimit": 12,
+                "formatters": [
+                  {
+                    "formatOptions": {
+                      "customColumnWidthSetting": "38ch"
+                    },
+                    "columnMatch": "Field",
+                    "formatter": 1
+                  },
+                  {
+                    "formatOptions": {
+                      "customColumnWidthSetting": "1fr"
+                    },
+                    "columnMatch": "Value",
+                    "formatter": 1
+                  }
+                ]
+              },
+              "version": "KqlItem/1.0",
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "timeContextFromParameter": "TimeRange",
+              "queryType": 0,
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ],
+              "title": "Selected event"
+            },
+            "type": 3
+          },
+          {
+            "name": "event-timeline",
+            "conditionalVisibility": {
+              "comparison": "isNotEqualTo",
+              "value": "",
+              "parameterName": "SelectedEvent"
+            },
+            "content": {
+              "query": "// Host trigger records expose actual dequeue count and insertion time; storage calls do not.\r\nlet QueueTraces = materialize(AppTraces\r\n| where TimeGenerated {TimeRange} and AppRoleName =~ '{FunctionApp:name}'\r\n| extend InvocationId = coalesce(tostring(Properties.InvocationId), extract(@'Id=([0-9a-fA-F-]{36})', 1, Message), OperationId)\r\n| where isnotempty(InvocationId));\r\nlet QueueInvocations = QueueTraces\r\n| where Message startswith \"Executing 'Functions.QueueHandler'\" and Message contains 'New queue message detected'\r\n| extend Queue = extract(@\"New queue message detected on '([^']+)'\", 1, Message)\r\n| where Queue in ('certlc', 'certlc-poison')\r\n| summarize Started=min(TimeGenerated) by InvocationId, Queue;\r\nlet QueueTriggerDetails = QueueTraces\r\n| where Message startswith 'Trigger Details:'\r\n| extend MessageId=extract(@'MessageId:\\s*([^,\\s]+)',1,Message),\r\n    DequeueCount=toint(extract(@'DequeueCount:\\s*(\\d+)',1,Message)),\r\n    InsertedOn=todatetime(extract(@'InsertedOn:\\s*([^,\\s]+)',1,Message))\r\n| summarize arg_min(TimeGenerated, *) by InvocationId\r\n| project InvocationId, MessageId, DequeueCount, InsertedOn;\r\nlet QueueCompletions = QueueTraces\r\n| where Message startswith \"Executed 'Functions.QueueHandler'\"\r\n| summarize arg_max(TimeGenerated, Message) by InvocationId\r\n| project InvocationId, Completed=TimeGenerated,\r\n    Result=case(Message contains '(Succeeded,', 'Succeeded', Message contains '(Failed,', 'Failed', 'Not parsed');\r\nlet QueueAttempts = QueueInvocations\r\n| join kind=leftouter QueueTriggerDetails on InvocationId\r\n| join kind=leftouter QueueCompletions on InvocationId\r\n| extend Result=coalesce(Result,'Completion not observed'),\r\n    AgeAtDequeueSeconds = datetime_diff('second', Started, InsertedOn)\r\n| project Started, Queue, MessageId, InsertedOn, DequeueCount, AgeAtDequeueSeconds, Result, Completed, InvocationId;\r\nlet JourneyQueueEvidence=QueueAttempts\r\n| order by Queue asc, MessageId asc, Started asc, InvocationId asc\r\n| serialize\r\n| extend RetryGapSeconds=iff(isnotempty(MessageId) and Queue == prev(Queue) and MessageId == prev(MessageId),\r\n    datetime_diff('millisecond',Started,prev(Started))/1000.0, real(null))\r\n| project AttemptId=InvocationId, Queue, QueueMessageId=MessageId, Dequeued=Started, InsertedOn, DequeueCount,\r\n    AgeAtDequeueSeconds, RetryGapSeconds, QueueResult=Result, QueueCompleted=Completed,\r\n    FunctionDurationSeconds=datetime_diff('millisecond',Completed,Started)/1000.0;\n// Scope every scan to the selected time and existing resources.\n// Reuse certlcstats resource selectors instead of pinning Journey to one deployment.\n// Match Job History: nested resource names may include the Automation account prefix.\nlet SelectedRunbookName = tostring(split('{Runbook:name}', '/')[-1]);\nlet Traces = materialize(AppTraces\n| where TimeGenerated {TimeRange}\n| where AppRoleName =~ '{FunctionApp:name}'\n| extend AttemptId = coalesce(tostring(Properties.InvocationId), extract(@'Id=([0-9a-fA-F-]{36})', 1, Message), OperationId)\n| where isnotempty(AttemptId));\nlet Bridge = Traces\n| where Message has 'BridgeCorrelation'\n| extend Entry = parse_json(extract(@'(\\{.*\\})', 1, Message))\n| where tostring(Entry.recordType) == 'BridgeCorrelation';\n// Only receipt records establish event identity. Older Started records used job fallback.\nlet Receipts = Bridge\n| where tostring(Entry.stage) == 'Received'\n| summarize arg_min(TimeGenerated, *) by AttemptId\n| project AttemptId, OperationId, Received = TimeGenerated,\n    CorrelationId = tostring(Entry.correlationId), EventSource = iff(tostring(Entry.eventSource) startswith '/subscriptions/', tolower(tostring(Entry.eventSource)), tostring(Entry.eventSource));\n// Keep each invocation/job association: repeated delivery must not erase earlier attempts.\nlet Links = Bridge\n| where tostring(Entry.stage) == 'Started' and isnotempty(tostring(Entry.jobId))\n| summarize Submitted = min(TimeGenerated) by AttemptId, JobId = tolower(tostring(Entry.jobId));\nlet Payloads = Traces\n| where Message contains 'CERTLC: full message received is:'\n| extend Payload = parse_json(extract(@'CERTLC: full message received is:\\s*(.*)$', 1, Message))\n| summarize arg_min(TimeGenerated, *) by AttemptId\n// Bracket notation preserves the CloudEvent field whose name is a KQL keyword.\n| project AttemptId, Certificate = coalesce(tostring(Payload.data.ObjectName), tostring(Payload.subject)),\n    EventType = tostring(Payload.type), EventTime = todatetime(Payload['time']);\nlet Streams = materialize(AzureDiagnostics\n| where TimeGenerated {TimeRange}\n| where Category == 'JobStreams' and Resource =~ '{AutomationAccount:name}' and RunbookName_s =~ SelectedRunbookName\n| extend JobId = tolower(tostring(JobId_g)), Raw = replace_regex(tostring(ResultDescription), @'\\x1B\\[[0-9;]*[A-Za-z]', '')\n| extend Entry = parse_json(extract(@'(\\{.*\\})', 1, Raw))\n| extend Message = coalesce(tostring(Entry.message), Raw), Section = coalesce(tostring(Entry.section), StreamType_s),\n    Level = coalesce(tostring(Entry.level), StreamType_s), LogTime = coalesce(todatetime(Entry.timestamp), TimeGenerated));\nlet Jobs = AzureDiagnostics\n| where TimeGenerated {TimeRange}\n| where Category == 'JobLogs' and Resource =~ '{AutomationAccount:name}' and RunbookName_s =~ SelectedRunbookName\n| summarize arg_max(TimeGenerated, ResultType) by JobId = tolower(tostring(JobId_g))\n| project JobId, JobStatus = ResultType, StatusObserved = TimeGenerated;\n// Operation outcome is not the same as Automation completion or SMTP delivery.\nlet Outcomes = Streams\n| summarize Warnings = countif(Level =~ 'Warning'), Errors = countif(Level =~ 'Error'),\n    Succeeded = countif(Section startswith 'Dispatcher.' and Message contains 'successfully'),\n    // Missing SMTP is not a skipped certificate operation.\n    Skipped = countif(Section == 'Dispatcher.Renewal' and Message startswith 'Skipping auto-renewal of certificate'),\n    EmailSent = countif(Section == 'Send-NotificationEmail' and Message startswith 'Notification email sent'),\n    EmailFailed = countif(Section == 'Send-NotificationEmail' and Level =~ 'Warning') by JobId;\nlet Exceptions = AppExceptions\n| where TimeGenerated {TimeRange}\n| where AppRoleName =~ '{FunctionApp:name}'\n| extend AttemptId = coalesce(tostring(Properties.InvocationId), extract(@'Id=([0-9a-fA-F-]{36})', 1, Message), OperationId)\n| summarize FunctionErrors = count() by AttemptId;\nlet BridgeAttempts = Receipts\n| join kind=leftouter JourneyQueueEvidence on AttemptId\n| join kind=leftouter Links on AttemptId\n| join kind=leftouter Payloads on AttemptId\n| join kind=leftouter Jobs on JobId\n| join kind=leftouter Outcomes on JobId\n| join kind=leftouter Exceptions on AttemptId\n// JSON tuple prevents ambiguous concatenation; unidentified receipts remain separate.\n| extend EventKey = tostring(pack_array(EventSource, CorrelationId, iff(isempty(CorrelationId), AttemptId, ''))),\n    JobStatus = coalesce(JobStatus, 'Not observed'),\n    OperationOutcome = case(Errors > 0, 'Error logged', Skipped > 0, 'Skipped', Succeeded > 0, 'Success logged', 'Not observed'),\n    Notification = case(EmailFailed > 0, 'Delivery warning', EmailSent > 0, 'Sent', 'Not observed'),\n    Warnings = coalesce(Warnings, 0), Errors = coalesce(Errors, 0), FunctionErrors = coalesce(FunctionErrors, 0);\n\n// Failure columns may not exist until diagnostic logging produces its first record.\n// Use the selected topic's actual source, never a job ID or an Event Grid systemId.\nlet EventGridFailures = materialize(AzureDiagnostics\n| where TimeGenerated {TimeRange}\n| where Category == 'DeliveryFailures' and _ResourceId =~ '{EventGridTopic}'\n| extend Extra = column_ifexists('AdditionalFields', dynamic({}))\n| extend Raw = coalesce(tostring(column_ifexists('message_s', '')), tostring(column_ifexists('Message', '')), tostring(Extra.message)),\n    EventSubscription = coalesce(tostring(column_ifexists('eventSubscriptionName_s', '')), tostring(Extra.eventSubscriptionName))\n| extend CorrelationId = extract(@'(?:^|[,;]\\s*|Message:)id=([^,;\\s]+)', 1, Raw),\n    FailureOutcome = extract(@'(?:^|[,;]\\s*|Message:)outcome=([^,;]+)', 1, Raw),\n    DeliveryCount = tolong(extract(@'(?:^|[,;]\\s*)deliveryCount=(\\d+)', 1, Raw)),\n    LatencyMs = todouble(extract(@'(?:^|[,;]\\s*)latencyInMs=([\\d.]+)', 1, Raw)),\n    EventType = extract(@'(?:^|[,;]\\s*)eventType=([^,;\\s]+)', 1, Raw),\n    EventTime = todatetime(extract(@'(?:^|[,;]\\s*)eventTime=([^,;]+)', 1, Raw)),\n    EventSource = tolower('{EventGridSource}')\n// Unknown identities stay isolated and still offer their raw diagnostic record.\n| extend EventKey = tostring(pack_array(EventSource, CorrelationId,\n    iff(isempty(CorrelationId), strcat('eventgrid:', hash_sha256(strcat(TimeGenerated, '|', EventSubscription, '|', Raw))), '')))\n| project TimeGenerated, EventKey, CorrelationId, EventSource, EventSubscription,\n    FailureOutcome = coalesce(FailureOutcome, 'Not parsed'), DeliveryCount, LatencyMs, EventType, EventTime, Raw);\nlet FailureSummary = EventGridFailures\n| summarize FirstFailure = min(TimeGenerated), LastFailure = max(TimeGenerated),\n    EventGridFailureCount = count(), FailureEventTypes = make_set(EventType), FailureEventTime = min(EventTime)\n    by EventKey, CorrelationId, EventSource;\n// A failed delivery is an observation, not a Function invocation or an Automation outcome.\nlet Attempts = union\n    (BridgeAttempts\n    | join kind=leftouter FailureSummary on EventKey\n    | extend FirstObserved = min_of(Received, FirstFailure),\n        StatusObserved = max_of(StatusObserved, Received, LastFailure),\n        EventGridFailureCount = coalesce(EventGridFailureCount, 0)),\n    (FailureSummary\n    | join kind=leftanti (BridgeAttempts | distinct EventKey) on EventKey\n    | project EventKey, CorrelationId, EventSource,\n        FirstObserved = FirstFailure, Received = datetime(null), StatusObserved = LastFailure,\n        AttemptId = '', OperationId = '', JobId = '', Certificate = '',\n        EventType = tostring(FailureEventTypes[0]), EventTime = FailureEventTime,\n        JobStatus = 'Not observed', OperationOutcome = 'Not observed', Notification = 'Not observed',\n        Warnings = tolong(0), Errors = tolong(0), FunctionErrors = tolong(0), EventGridFailureCount);\n// Selection is an encoded source/id tuple, so equal IDs from different producers stay separate.\nlet JourneyQueueObservations = materialize(Attempts\r\n| where isnotempty(AttemptId) and isnotempty(QueueMessageId)\r\n| distinct EventKey, AttemptId, Queue, QueueMessageId, Dequeued, InsertedOn, DequeueCount,\r\n    AgeAtDequeueSeconds, RetryGapSeconds, QueueResult, QueueCompleted, FunctionDurationSeconds);\r\nlet JourneyMessages = JourneyQueueObservations\r\n| summarize arg_max(Dequeued, QueueResult), ObservedDequeues=count(), HighestDequeueCount=max(DequeueCount),\r\n    FailedDequeues=countif(QueueResult == 'Failed'), RetryObservations=countif(DequeueCount > 1)\r\n    by EventKey, Queue, QueueMessageId;\r\nlet JourneyQueueSummary = JourneyMessages\r\n| summarize QueueMessages=count(), ObservedDequeues=sum(ObservedDequeues), HighestDequeueCount=max(HighestDequeueCount),\r\n    FailedDequeues=sum(FailedDequeues), RetryObservations=sum(RetryObservations),\r\n    LatestSucceeded=countif(QueueResult == 'Succeeded'), LatestFailed=countif(QueueResult == 'Failed'),\r\n    LatestUnobserved=countif(QueueResult !in ('Succeeded','Failed')) by EventKey\r\n| extend QueueStatus=case(LatestFailed > 0, 'Latest processing failed', LatestUnobserved > 0, 'Completion not observed',\r\n    LatestSucceeded > 0, 'Latest processing succeeded', 'Not observed');\nlet SelectedKey = base64_decode_tostring('{SelectedEvent:base64}');\nlet Selected = materialize(Attempts | where isnotempty(SelectedKey) and EventKey == SelectedKey);\n// One parent per invocation, even if several job associations are observed for that invocation.\nlet SelectedInvocations = materialize(Selected | where isnotempty(AttemptId)\n| summarize Received=min(Received), FunctionErrors=max(FunctionErrors), Queue=take_any(Queue), QueueMessageId=take_any(QueueMessageId),\r\n    Dequeued=min(Dequeued), InsertedOn=min(InsertedOn), DequeueCount=max(DequeueCount), AgeAtDequeueSeconds=max(AgeAtDequeueSeconds),\r\n    RetryGapSeconds=max(RetryGapSeconds), QueueResult=take_any(QueueResult), QueueCompleted=max(QueueCompleted),\r\n    FunctionDurationSeconds=max(FunctionDurationSeconds) by AttemptId,OperationId\n| order by Received asc, AttemptId asc\n| serialize AttemptNumber = row_number());\nlet SelectedJobs = materialize(Selected | where isnotempty(JobId)\n| distinct AttemptId, JobId, Submitted, JobStatus, OperationOutcome, Notification);\n// Explicit parents mirror the native Id/ParentId tree used by the production Job History.\nlet SelectedFailures = materialize(EventGridFailures\n| where isnotempty(SelectedKey) and EventKey == SelectedKey);\nlet SelectedQueueMessages=materialize(SelectedInvocations\r\n| where isnotempty(QueueMessageId)\r\n| summarize InsertedOn=min(InsertedOn), FirstDequeue=min(Dequeued), ObservedDequeues=count(),\r\n    HighestDequeueCount=max(DequeueCount), FailedDequeues=countif(QueueResult == 'Failed'), arg_max(Dequeued,QueueResult)\r\n    by Queue,QueueMessageId\r\n| extend MessageNode=strcat('queue:',hash_sha256(tostring(pack_array(Queue,QueueMessageId)))));\r\nlet Parents = union\r\n    (SelectedQueueMessages\r\n        | project Id=MessageNode, ParentId='event', Name=strcat('Queue message / ',Queue), Time=coalesce(InsertedOn,FirstDequeue),\r\n            Component='Queue', Stage='Message', FinalResult=case(QueueResult == 'Failed','failed',QueueResult == 'Succeeded','success','info'),\r\n            Message=strcat('Message ID: ',QueueMessageId,'\\nHost-observed dequeues: ',ObservedDequeues,\r\n                '; highest dequeue count: ',HighestDequeueCount,'; failed attempts: ',FailedDequeues,\r\n                '\\nLatest observed processing: ',QueueResult,'\\nInsertion time is reported by the Function host. Deletion and poison movement are not established.'),\r\n            AttemptId='', JobId=''),\n    (SelectedFailures | summarize Time = min(TimeGenerated), FailureRecords = count()\n        | where FailureRecords > 0\n        | project Id = 'eventgrid', ParentId = 'event', Name = 'Event Grid delivery',\n            Time, Component = 'EventGrid', Stage = 'Delivery attempts', FinalResult = 'warning',\n            Message = strcat('Observed delivery-failure records: ', FailureRecords), AttemptId = '', JobId = ''),\n    // Keep identity in the context view; parent details retain source, notifications and diagnostics.\n    (Selected | summarize Time = min(FirstObserved), Notifications = make_set(Notification), Warnings = sum(Warnings), Errors = sum(Errors), FunctionErrors = sum(FunctionErrors) by CorrelationId, EventSource\n        | project Id = 'event', ParentId = '', Name = 'Event',\n            Time, Component = 'Event', Stage = 'Correlation', FinalResult = 'info',\n            Message = strcat('Source: ', EventSource, '\\nNotifications: ', strcat_array(Notifications, ', '), '\\nWarnings: ', Warnings, '; Runbook errors: ', Errors, '; Function errors: ', FunctionErrors), AttemptId = '', JobId = ''),\n    (SelectedInvocations\n        | project Id = strcat('attempt:', AttemptId),\r\n            ParentId=iff(isnotempty(QueueMessageId),strcat('queue:',hash_sha256(tostring(pack_array(Queue,QueueMessageId)))),'event'),\r\n            Name=iff(isnotnull(DequeueCount),strcat('Dequeue ',DequeueCount),strcat('Attempt ',AttemptNumber)),\n            Time = coalesce(Dequeued,Received), Component = 'Attempt', Stage = 'Receipt', FinalResult = case(QueueResult == 'Failed' or FunctionErrors > 0,'failed',QueueResult == 'Succeeded','success','info'),\n            Message = strcat('Function invocation: ',AttemptId,'\\nHost completion: ',coalesce(QueueResult,'Not observed')), AttemptId, JobId = ''),\n    (SelectedInvocations\n        | project Id = strcat('function:', AttemptId), ParentId = strcat('attempt:', AttemptId), Name = 'Function activity',\n            Time = Received, Component = 'Function', Stage = 'Invocation', FinalResult = iff(FunctionErrors > 0, 'failed', 'info'),\n            Message = strcat('Operation ID: ', OperationId), AttemptId, JobId = ''),\n    (SelectedJobs\n        // Show the full job ID once in parent details instead of repeating it across every leaf.\n        | project Id = strcat('job:', AttemptId, ':', JobId), ParentId = strcat('attempt:', AttemptId), Name = 'Automation job',\n            Time = Submitted, Component = 'Automation', Stage = 'Job',\n            FinalResult = case(JobStatus =~ 'Failed', 'failed', JobStatus in~ ('Stopped', 'Suspended'), 'warning', JobStatus =~ 'Completed', 'success', 'info'),\n            Message = strcat('Job ID: ', JobId, '\\nState: ', JobStatus, '; Operation: ', OperationOutcome, '; Notification: ', Notification), AttemptId, JobId);\n// Cap only leaf records. Parents remain present even when the detail stream is truncated.\nlet Records = union\r\n    (SelectedQueueMessages | where isnotnull(InsertedOn)\r\n        | project ParentId=MessageNode,Time=InsertedOn,Component='Queue',Stage='Insertion timestamp (host-reported)',Level='Information',\r\n            Message=strcat('Queue: ',Queue,'; Message ID: ',QueueMessageId),AttemptId='',JobId=''),\r\n    (SelectedInvocations | where isnotnull(Dequeued)\r\n        | project ParentId=strcat('attempt:',AttemptId),Time=Dequeued,Component='Queue',Stage='Dequeue observed by Function host',\r\n            Level=iff(DequeueCount > 1,'Warning','Information'),\r\n            Message=strcat('Message ID: ',QueueMessageId,'\\nDequeue count: ',DequeueCount,\r\n                '; age at dequeue (seconds, includes retries): ',coalesce(tostring(AgeAtDequeueSeconds),'Not observed'),\r\n                '\\nGap since previous observed dequeue (seconds): ',coalesce(tostring(RetryGapSeconds),'Not observed')),\r\n            AttemptId,JobId=''),\r\n    (SelectedInvocations | where isnotnull(QueueCompleted)\r\n        | project ParentId=strcat('function:',AttemptId),Time=QueueCompleted,Component='Function',Stage='Host completion',\r\n            Level=iff(QueueResult == 'Failed','Error','Information'),\r\n            Message=strcat('Result: ',QueueResult,'; Function duration (seconds): ',FunctionDurationSeconds,\r\n                '\\nFunction completion does not establish runbook success or queue deletion.'),AttemptId,JobId=''),\r\n    (Selected | where isnotempty(JobId) and isnotnull(Submitted)\r\n        | distinct AttemptId,JobId,Submitted,Dequeued\r\n        | project ParentId=strcat('job:',AttemptId,':',JobId),Time=Submitted,Component='Automation',Stage='Job submission',Level='Information',\r\n            Message=strcat('Seconds from observed dequeue to job submission: ',\r\n                coalesce(tostring(datetime_diff('millisecond',Submitted,Dequeued)/1000.0),'Not observed')),AttemptId,JobId),\n    (SelectedFailures\n        | project ParentId = 'eventgrid', Time = TimeGenerated, Component = 'EventGrid', Stage = FailureOutcome,\n            Level = 'Warning', Message = strcat('Subscription: ', EventSubscription, '\\n', Raw), AttemptId = '', JobId = ''),\n    (Selected | where isnotnull(EventTime) | distinct EventTime, EventType\n        | project ParentId = 'event', Time = EventTime, Component = 'Event payload', Stage = 'Producer timestamp (not delivery)',\n            Level = 'Information', Message = EventType, AttemptId = '', JobId = ''),\n    (Traces | where Message !startswith 'Trigger Details:' | join kind=inner SelectedInvocations on AttemptId\n        | project ParentId = strcat('function:', AttemptId), Time = TimeGenerated, Component = 'Function', Stage = tostring(Properties.Category),\n            Level = coalesce(tostring(Properties.LogLevel), 'Information'), Message, AttemptId, JobId = ''),\n    // Detail scans use the same shared resource parameters as the summary.\n    (AppExceptions | where TimeGenerated {TimeRange} | where AppRoleName =~ '{FunctionApp:name}'\n        | extend AttemptId = coalesce(tostring(Properties.InvocationId), extract(@'Id=([0-9a-fA-F-]{36})', 1, Message), OperationId)\n        | join kind=inner SelectedInvocations on AttemptId, OperationId\n        | project ParentId = strcat('function:', AttemptId), Time = TimeGenerated, Component = 'Function', Stage = 'Exception', Level = 'Error', Message = OuterMessage, AttemptId, JobId = ''),\n    (Streams | join kind=inner SelectedJobs on JobId\n        | project ParentId = strcat('job:', AttemptId, ':', JobId), Time = LogTime, Component = 'Runbook', Stage = Section, Level, Message, AttemptId, JobId),\n    (AzureDiagnostics | where TimeGenerated {TimeRange}\n        // Reuse the normalized leaf name so portal resource formatting cannot hide job children.\n        | where Category == 'JobLogs' and Resource =~ '{AutomationAccount:name}' and RunbookName_s =~ SelectedRunbookName\n        | extend JobId = tolower(tostring(JobId_g)) | join kind=inner SelectedJobs on JobId\n        | project ParentId = strcat('job:', AttemptId, ':', JobId), Time = TimeGenerated, Component = 'Automation', Stage = 'Job status',\n            Level = iff(ResultType in~ ('Failed', 'Stopped', 'Suspended'), 'Warning', 'Information'),\n            Message = ResultType, AttemptId, JobId)\n| order by Time asc, ParentId asc, Stage asc, Message asc\n| take 2000\n// Row numbers keep identical timestamps/messages distinct rather than colliding as tree IDs.\n| serialize RecordNumber = row_number()\n| project Id = strcat('record:', RecordNumber), ParentId,\n    // Time already has a dedicated column; use the node label for log origin instead.\n    Name = case(Component == 'Runbook', Stage, Component == 'Function', strcat('Function / ', Level), Stage),\n    Time, Component, Stage, FinalResult = case(Level =~ 'Error', 'failed', Level =~ 'Warning', 'warning', 'info'), Message, AttemptId, JobId;\nunion Parents, Records\n| order by Time asc, Id asc\n// Lead with the expandable result icon, keeping the node name beside it and IDs hidden.\n| project FinalResult, Name, Time, Component, Stage, Message, AttemptId, JobId, Id, ParentId",
+              "visualization": "table",
+              "gridSettings": {
+                "filter": true,
+                "formatters": [
+                  {
+                    "formatter": 5,
+                    "columnMatch": "Id"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "ParentId"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "AttemptId"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "JobId"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "Component"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "Stage"
+                  },
+                  {
+                    "formatter": 11,
+                    "columnMatch": "FinalResult"
+                  },
+                  {
+                    "formatOptions": {
+                      "customColumnWidthSetting": "22ch"
+                    },
+                    "columnMatch": "Name",
+                    "formatter": 1
+                  },
+                  {
+                    "dateFormat": {
+                      "formatName": "shortDateTimeNoMsPattern",
+                      "showUtcTime": null
+                    },
+                    "formatOptions": {
+                      "customColumnWidthSetting": "20ch"
+                    },
+                    "columnMatch": "Time",
+                    "formatter": 6
+                  },
+                  {
+                    "formatOptions": {
+                      "customColumnWidthSetting": "50%"
+                    },
+                    "columnMatch": "Message",
+                    "formatter": 1
+                  }
+                ],
+                "rowLimit": 10000,
+                "hierarchySettings": {
+                  "expandTopLevel": true,
+                  "treeType": 0,
+                  "expanderColumn": "FinalResult",
+                  "parentColumn": "ParentId",
+                  "idColumn": "Id"
+                }
+              },
+              "version": "KqlItem/1.0",
+              "exportToExcelOptions": "all",
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "showExportToExcel": true,
+              "timeContextFromParameter": "TimeRange",
+              "queryType": 0,
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ],
+              "showExpandCollapseGrid": true,
+              "title": "Selected event: execution tree (up to 2000 log records)"
+            },
+            "type": 3
+          }
+        ],
+        "groupType": "editable",
+        "version": "NotebookGroup/1.0"
+      },
+      "type": 12
+    },
+    {
+      "content": {
+        "items": [
+          {
+            "content": {
+              "chartId": "certlc-preview-eventgrid-summary",
+              "version": "MetricsItem/2.0",
+              "timeContextFromParameter": "TimeRange",
+              "resourceParameter": "EventGridTopic",
+              "showExportToExcel": true,
+              "resourceType": "microsoft.eventgrid/systemtopics",
+              "size": 3,
+              "metrics": [
+                {
+                  "namespace": "microsoft.eventgrid/systemtopics",
+                  "metric": "microsoft.eventgrid/systemtopics--PublishSuccessCount",
+                  "aggregation": 1
+                },
+                {
+                  "namespace": "microsoft.eventgrid/systemtopics",
+                  "metric": "microsoft.eventgrid/systemtopics--MatchedEventCount",
+                  "aggregation": 1
+                },
+                {
+                  "namespace": "microsoft.eventgrid/systemtopics",
+                  "metric": "microsoft.eventgrid/systemtopics--DeliverySuccessCount",
+                  "aggregation": 1
+                },
+                {
+                  "namespace": "microsoft.eventgrid/systemtopics",
+                  "metric": "microsoft.eventgrid/systemtopics--DeliveryAttemptFailCount",
+                  "aggregation": 1
+                },
+                {
+                  "namespace": "microsoft.eventgrid/systemtopics",
+                  "metric": "microsoft.eventgrid/systemtopics--DroppedEventCount",
+                  "aggregation": 1
+                },
+                {
+                  "namespace": "microsoft.eventgrid/systemtopics",
+                  "metric": "microsoft.eventgrid/systemtopics--DeadLetteredCount",
+                  "aggregation": 1
+                }
+              ],
+              "timeContext": {
+                "durationMs": 0
+              },
+              "resourceIds": [
+                "{EventGridTopic}"
+              ],
+              "chartType": 0,
+              "metricScope": 0,
+              "gridSettings": {
+                "formatters": [
+                  {
+                    "formatter": 5,
+                    "columnMatch": "Subscription"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "Segment"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "microsoft.eventgrid/systemtopics--PublishSuccessCount Timeline"
+                  },
+                  {
+                    "columnMatch": "microsoft.eventgrid/systemtopics--PublishSuccessCount",
+                    "numberFormat": {
+                      "options": {
+                        "style": "decimal",
+                        "maximumFractionDigits": 0
+                      },
+                      "unit": 0
+                    },
+                    "formatter": 1
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "microsoft.eventgrid/systemtopics--MatchedEventCount Timeline"
+                  },
+                  {
+                    "columnMatch": "microsoft.eventgrid/systemtopics--MatchedEventCount",
+                    "numberFormat": {
+                      "options": {
+                        "style": "decimal",
+                        "maximumFractionDigits": 0
+                      },
+                      "unit": 0
+                    },
+                    "formatter": 1
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "microsoft.eventgrid/systemtopics--DeliverySuccessCount Timeline"
+                  },
+                  {
+                    "columnMatch": "microsoft.eventgrid/systemtopics--DeliverySuccessCount",
+                    "numberFormat": {
+                      "options": {
+                        "style": "decimal",
+                        "maximumFractionDigits": 0
+                      },
+                      "unit": 0
+                    },
+                    "formatter": 1
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "microsoft.eventgrid/systemtopics--DeliveryAttemptFailCount Timeline"
+                  },
+                  {
+                    "columnMatch": "microsoft.eventgrid/systemtopics--DeliveryAttemptFailCount",
+                    "numberFormat": {
+                      "options": {
+                        "style": "decimal",
+                        "maximumFractionDigits": 0
+                      },
+                      "unit": 0
+                    },
+                    "formatter": 1
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "microsoft.eventgrid/systemtopics--DroppedEventCount Timeline"
+                  },
+                  {
+                    "columnMatch": "microsoft.eventgrid/systemtopics--DroppedEventCount",
+                    "numberFormat": {
+                      "options": {
+                        "style": "decimal",
+                        "maximumFractionDigits": 0
+                      },
+                      "unit": 0
+                    },
+                    "formatter": 1
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "microsoft.eventgrid/systemtopics--DeadLetteredCount Timeline"
+                  },
+                  {
+                    "columnMatch": "microsoft.eventgrid/systemtopics--DeadLetteredCount",
+                    "numberFormat": {
+                      "options": {
+                        "style": "decimal",
+                        "maximumFractionDigits": 0
+                      },
+                      "unit": 0
+                    },
+                    "formatter": 1
+                  }
+                ],
+                "labelSettings": [
+                  {
+                    "columnId": "microsoft.eventgrid/systemtopics--PublishSuccessCount",
+                    "label": "Published (all types)"
+                  },
+                  {
+                    "columnId": "microsoft.eventgrid/systemtopics--MatchedEventCount",
+                    "label": "Matched"
+                  },
+                  {
+                    "columnId": "microsoft.eventgrid/systemtopics--DeliverySuccessCount",
+                    "label": "Delivered to queue"
+                  },
+                  {
+                    "columnId": "microsoft.eventgrid/systemtopics--DeliveryAttemptFailCount",
+                    "label": "Failed delivery attempts"
+                  },
+                  {
+                    "columnId": "microsoft.eventgrid/systemtopics--DroppedEventCount",
+                    "label": "Dropped"
+                  },
+                  {
+                    "columnId": "microsoft.eventgrid/systemtopics--DeadLetteredCount",
+                    "label": "Dead-lettered"
+                  }
+                ],
+                "rowLimit": 100
+              },
+              "title": "Event Grid totals"
+            },
+            "type": 10,
+            "name": "eventgrid-summary"
+          },
+          {
+            "content": {
+              "chartId": "certlc-preview-eventgrid-delivery",
+              "version": "MetricsItem/1.0",
+              "timeContextFromParameter": "TimeRange",
+              "resourceParameter": "EventGridTopic",
+              "size": 0,
+              "metrics": [
+                {
+                  "namespace": "microsoft.eventgrid/systemtopics",
+                  "metric": "microsoft.eventgrid/systemtopics--MatchedEventCount",
+                  "splitBy": "EventSubscriptionName",
+                  "chartType": 2,
+                  "aggregation": 1
+                },
+                {
+                  "namespace": "microsoft.eventgrid/systemtopics",
+                  "metric": "microsoft.eventgrid/systemtopics--DeliverySuccessCount",
+                  "splitBy": "EventSubscriptionName",
+                  "chartType": 2,
+                  "aggregation": 1
+                }
+              ],
+              "resourceType": "microsoft.eventgrid/systemtopics",
+              "title": "Matched and delivered to queue"
+            },
+            "type": 10,
+            "name": "eventgrid-delivery",
+            "customWidth": "50"
+          },
+          {
+            "content": {
+              "chartId": "certlc-preview-eventgrid-delivery-errors",
+              "version": "MetricsItem/1.0",
+              "timeContextFromParameter": "TimeRange",
+              "resourceParameter": "EventGridTopic",
+              "size": 0,
+              "metrics": [
+                {
+                  "namespace": "microsoft.eventgrid/systemtopics",
+                  "metric": "microsoft.eventgrid/systemtopics--DeliveryAttemptFailCount",
+                  "splitBy": "EventSubscriptionName",
+                  "chartType": 2,
+                  "aggregation": 1
+                },
+                {
+                  "namespace": "microsoft.eventgrid/systemtopics",
+                  "metric": "microsoft.eventgrid/systemtopics--DroppedEventCount",
+                  "splitBy": "EventSubscriptionName",
+                  "chartType": 2,
+                  "aggregation": 1
+                },
+                {
+                  "namespace": "microsoft.eventgrid/systemtopics",
+                  "metric": "microsoft.eventgrid/systemtopics--DeadLetteredCount",
+                  "splitBy": "EventSubscriptionName",
+                  "chartType": 2,
+                  "aggregation": 1
+                }
+              ],
+              "resourceType": "microsoft.eventgrid/systemtopics",
+              "title": "Failed delivery attempts, dropped and dead-lettered events"
+            },
+            "type": 10,
+            "name": "eventgrid-delivery-errors",
+            "customWidth": "50"
+          },
+          {
+            "content": {
+              "parameters": [
+                {
+                  "value": "",
+                  "id": "fc384b69-dd7e-4977-bfbe-706cc14297dc",
+                  "name": "EventGridSearch",
+                  "version": "KqlParameterItem/1.0",
+                  "type": 1,
+                  "label": "Search delivery failures"
+                }
+              ],
+              "style": "formVertical",
+              "version": "KqlParameterItem/1.0"
+            },
+            "type": 9,
+            "name": "eventgrid-search"
+          },
+          {
+            "content": {
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "exportToExcelOptions": "all",
+              "query": "// Failure columns may not exist until diagnostic logging produces its first record.\r\n// Use the selected topic's actual source, never a job ID or an Event Grid systemId.\r\nlet EventGridFailures = materialize(AzureDiagnostics\r\n| where TimeGenerated {TimeRange}\r\n| where Category == 'DeliveryFailures' and _ResourceId =~ '{EventGridTopic}'\r\n| extend Extra = column_ifexists('AdditionalFields', dynamic({}))\r\n| extend Raw = coalesce(tostring(column_ifexists('message_s', '')), tostring(column_ifexists('Message', '')), tostring(Extra.message)),\r\n    EventSubscription = coalesce(tostring(column_ifexists('eventSubscriptionName_s', '')), tostring(Extra.eventSubscriptionName))\r\n| extend CorrelationId = extract(@'(?:^|[,;]\\s*|Message:)id=([^,;\\s]+)', 1, Raw),\r\n    FailureOutcome = extract(@'(?:^|[,;]\\s*|Message:)outcome=([^,;]+)', 1, Raw),\r\n    DeliveryCount = tolong(extract(@'(?:^|[,;]\\s*)deliveryCount=(\\d+)', 1, Raw)),\r\n    LatencyMs = todouble(extract(@'(?:^|[,;]\\s*)latencyInMs=([\\d.]+)', 1, Raw)),\r\n    EventType = extract(@'(?:^|[,;]\\s*)eventType=([^,;\\s]+)', 1, Raw),\r\n    EventTime = todatetime(extract(@'(?:^|[,;]\\s*)eventTime=([^,;]+)', 1, Raw)),\r\n    EventSource = tolower('{EventGridSource}')\r\n// Unknown identities stay isolated and still offer their raw diagnostic record.\r\n| extend EventKey = tostring(pack_array(EventSource, CorrelationId,\r\n    iff(isempty(CorrelationId), strcat('eventgrid:', hash_sha256(strcat(TimeGenerated, '|', EventSubscription, '|', Raw))), '')))\r\n| project TimeGenerated, EventKey, CorrelationId, EventSource, EventSubscription,\r\n    FailureOutcome = coalesce(FailureOutcome, 'Not parsed'), DeliveryCount, LatencyMs, EventType, EventTime, Raw);\r\n\r\nlet SearchText=trim(@'\\s+',base64_decode_tostring('{EventGridSearch:base64}'));\r\nEventGridFailures\r\n| where isempty(SearchText) or CorrelationId contains SearchText or EventSubscription contains SearchText\r\n    or FailureOutcome contains SearchText or Raw contains SearchText\r\n| summarize FailureRecords=count(), IdentifiedEvents=dcountif(CorrelationId,isnotempty(CorrelationId)), LastObserved=max(TimeGenerated)\r\n    by EventSubscription,FailureOutcome\r\n| order by FailureRecords desc",
+              "version": "KqlItem/1.0",
+              "showExportToExcel": true,
+              "queryType": 0,
+              "noDataMessage": "No delivery-failure records observed in the selected time range.",
+              "title": "Delivery failures by outcome",
+              "gridSettings": {
+                "rowLimit": 500,
+                "filter": true
+              },
+              "timeContextFromParameter": "TimeRange",
+              "visualization": "table",
+              "size": 3,
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ]
+            },
+            "type": 3,
+            "name": "eventgrid-failure-summary"
+          },
+          {
+            "content": {
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "exportedParameters": [
+                {
+                  "parameterName": "SelectedFailureEvent",
+                  "fieldName": "EventKey",
+                  "parameterType": 1
+                }
+              ],
+              "exportToExcelOptions": "all",
+              "query": "// Failure columns may not exist until diagnostic logging produces its first record.\r\n// Use the selected topic's actual source, never a job ID or an Event Grid systemId.\r\nlet EventGridFailures = materialize(AzureDiagnostics\r\n| where TimeGenerated {TimeRange}\r\n| where Category == 'DeliveryFailures' and _ResourceId =~ '{EventGridTopic}'\r\n| extend Extra = column_ifexists('AdditionalFields', dynamic({}))\r\n| extend Raw = coalesce(tostring(column_ifexists('message_s', '')), tostring(column_ifexists('Message', '')), tostring(Extra.message)),\r\n    EventSubscription = coalesce(tostring(column_ifexists('eventSubscriptionName_s', '')), tostring(Extra.eventSubscriptionName))\r\n| extend CorrelationId = extract(@'(?:^|[,;]\\s*|Message:)id=([^,;\\s]+)', 1, Raw),\r\n    FailureOutcome = extract(@'(?:^|[,;]\\s*|Message:)outcome=([^,;]+)', 1, Raw),\r\n    DeliveryCount = tolong(extract(@'(?:^|[,;]\\s*)deliveryCount=(\\d+)', 1, Raw)),\r\n    LatencyMs = todouble(extract(@'(?:^|[,;]\\s*)latencyInMs=([\\d.]+)', 1, Raw)),\r\n    EventType = extract(@'(?:^|[,;]\\s*)eventType=([^,;\\s]+)', 1, Raw),\r\n    EventTime = todatetime(extract(@'(?:^|[,;]\\s*)eventTime=([^,;]+)', 1, Raw)),\r\n    EventSource = tolower('{EventGridSource}')\r\n// Unknown identities stay isolated and still offer their raw diagnostic record.\r\n| extend EventKey = tostring(pack_array(EventSource, CorrelationId,\r\n    iff(isempty(CorrelationId), strcat('eventgrid:', hash_sha256(strcat(TimeGenerated, '|', EventSubscription, '|', Raw))), '')))\r\n| project TimeGenerated, EventKey, CorrelationId, EventSource, EventSubscription,\r\n    FailureOutcome = coalesce(FailureOutcome, 'Not parsed'), DeliveryCount, LatencyMs, EventType, EventTime, Raw);\r\nlet SearchText = trim(@'\\s+', base64_decode_tostring('{EventGridSearch:base64}'));\r\nEventGridFailures\r\n| where isempty(SearchText) or CorrelationId contains SearchText or EventSubscription contains SearchText\r\n    or FailureOutcome contains SearchText or Raw contains SearchText\r\n| project Time = TimeGenerated, EventSubscription, FailureOutcome, CorrelationId, DeliveryCount, LatencyMs, EventType, Raw, EventKey\r\n| order by Time desc\r\n| take 500",
+              "version": "KqlItem/1.0",
+              "showExportToExcel": true,
+              "queryType": 0,
+              "noDataMessage": "No delivery-failure records observed in the selected workspace and time range.",
+              "gridSettings": {
+                "formatters": [
+                  {
+                    "formatter": 5,
+                    "columnMatch": "EventKey"
+                  }
+                ],
+                "filter": true,
+                "rowLimit": 15
+              },
+              "timeContextFromParameter": "TimeRange",
+              "visualization": "table",
+              "title": "Delivery failure records",
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ],
+              "size": 3
+            },
+            "type": 3,
+            "name": "eventgrid-failures"
+          },
+          {
+            "content": {
+              "showExportToExcel": true,
+              "query": "// Failure columns may not exist until diagnostic logging produces its first record.\r\n// Use the selected topic's actual source, never a job ID or an Event Grid systemId.\r\nlet EventGridFailures = materialize(AzureDiagnostics\r\n| where TimeGenerated {TimeRange}\r\n| where Category == 'DeliveryFailures' and _ResourceId =~ '{EventGridTopic}'\r\n| extend Extra = column_ifexists('AdditionalFields', dynamic({}))\r\n| extend Raw = coalesce(tostring(column_ifexists('message_s', '')), tostring(column_ifexists('Message', '')), tostring(Extra.message)),\r\n    EventSubscription = coalesce(tostring(column_ifexists('eventSubscriptionName_s', '')), tostring(Extra.eventSubscriptionName))\r\n| extend CorrelationId = extract(@'(?:^|[,;]\\s*|Message:)id=([^,;\\s]+)', 1, Raw),\r\n    FailureOutcome = extract(@'(?:^|[,;]\\s*|Message:)outcome=([^,;]+)', 1, Raw),\r\n    DeliveryCount = tolong(extract(@'(?:^|[,;]\\s*)deliveryCount=(\\d+)', 1, Raw)),\r\n    LatencyMs = todouble(extract(@'(?:^|[,;]\\s*)latencyInMs=([\\d.]+)', 1, Raw)),\r\n    EventType = extract(@'(?:^|[,;]\\s*)eventType=([^,;\\s]+)', 1, Raw),\r\n    EventTime = todatetime(extract(@'(?:^|[,;]\\s*)eventTime=([^,;]+)', 1, Raw)),\r\n    EventSource = tolower('{EventGridSource}')\r\n// Unknown identities stay isolated and still offer their raw diagnostic record.\r\n| extend EventKey = tostring(pack_array(EventSource, CorrelationId,\r\n    iff(isempty(CorrelationId), strcat('eventgrid:', hash_sha256(strcat(TimeGenerated, '|', EventSubscription, '|', Raw))), '')))\r\n| project TimeGenerated, EventKey, CorrelationId, EventSource, EventSubscription,\r\n    FailureOutcome = coalesce(FailureOutcome, 'Not parsed'), DeliveryCount, LatencyMs, EventType, EventTime, Raw);\r\nlet SelectedKey = base64_decode_tostring('{SelectedFailureEvent:base64}');\r\nEventGridFailures\r\n| where isnotempty(SelectedKey) and EventKey == SelectedKey\r\n| project Time = TimeGenerated, EventSubscription, FailureOutcome, CorrelationId, DeliveryCount, LatencyMs, EventType, Raw\r\n| order by Time asc\r\n| take 500",
+              "title": "Selected event: delivery failure details",
+              "gridSettings": {
+                "rowLimit": 15,
+                "filter": true
+              },
+              "exportToExcelOptions": "all",
+              "queryType": 0,
+              "timeContextFromParameter": "TimeRange",
+              "visualization": "table",
+              "version": "KqlItem/1.0",
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ],
+              "size": 3
+            },
+            "type": 3,
+            "name": "eventgrid-failure-details",
+            "conditionalVisibility": {
+              "parameterName": "SelectedFailureEvent",
+              "comparison": "isNotEqualTo",
+              "value": ""
+            }
+          },
+          {
+            "content": {
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "exportToExcelOptions": "all",
+              "query": "// Receipt evidence comes from the Function, not an Event Grid success-log feed.\r\nlet ReceiptTraces=materialize(AppTraces\r\n| where TimeGenerated {TimeRange} and AppRoleName =~ '{FunctionApp:name}'\r\n| extend InvocationId=coalesce(tostring(Properties.InvocationId),OperationId)\r\n| where isnotempty(InvocationId));\r\nlet ReceiptIdentity=ReceiptTraces\r\n| where Message has 'BridgeCorrelation'\r\n| extend Entry=parse_json(extract(@'(\\{.*\\})',1,Message))\r\n| where tostring(Entry.recordType) == 'BridgeCorrelation' and tostring(Entry.stage) == 'Received'\r\n| where tostring(Entry.eventSource) =~ '{EventGridSource}'\r\n| summarize arg_min(TimeGenerated,*) by InvocationId\r\n| project Received=TimeGenerated,InvocationId,CorrelationId=tostring(Entry.correlationId);\r\nlet ReceiptPayload=ReceiptTraces\r\n| where Message contains 'CERTLC: full message received is:'\r\n| extend Payload=parse_json(extract(@'CERTLC: full message received is:\\s*(.*)$',1,Message))\r\n| where tostring(Payload.type) == 'Microsoft.KeyVault.CertificateNearExpiry'\r\n| summarize arg_min(TimeGenerated,*) by InvocationId\r\n| project InvocationId,Certificate=coalesce(tostring(Payload.data.ObjectName),tostring(Payload.subject)),\r\n    EventTime=todatetime(Payload['time']);\r\nlet SearchText=trim(@'\\s+',base64_decode_tostring('{EventGridSearch:base64}'));\r\nReceiptIdentity\r\n| join kind=inner ReceiptPayload on InvocationId\r\n| where isempty(SearchText) or Certificate contains SearchText or CorrelationId contains SearchText or InvocationId contains SearchText\r\n| project Received,Certificate,EventTime,CorrelationId,InvocationId\r\n| order by Received desc | take 500",
+              "version": "KqlItem/1.0",
+              "showExportToExcel": true,
+              "queryType": 0,
+              "noDataMessage": "No matching near-expiry receipt records observed at the selected Function.",
+              "title": "Near-expiry events observed at Function (receipt evidence)",
+              "gridSettings": {
+                "filter": true,
+                "rowLimit": 15
+              },
+              "timeContextFromParameter": "TimeRange",
+              "visualization": "table",
+              "size": 3,
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ]
+            },
+            "type": 3,
+            "name": "eventgrid-observed-receipts"
+          },
+          {
+            "content": {
+              "chartId": "certlc-preview-eventgrid-published",
+              "version": "MetricsItem/1.0",
+              "timeContextFromParameter": "TimeRange",
+              "resourceParameter": "EventGridTopic",
+              "size": 0,
+              "metrics": [
+                {
+                  "namespace": "microsoft.eventgrid/systemtopics",
+                  "metric": "microsoft.eventgrid/systemtopics--PublishSuccessCount",
+                  "splitBy": null,
+                  "chartType": 2,
+                  "aggregation": 1
+                }
+              ],
+              "resourceType": "microsoft.eventgrid/systemtopics",
+              "title": "Published events (all source event types)"
+            },
+            "type": 10,
+            "name": "eventgrid-published",
+            "customWidth": "50"
+          },
+          {
+            "content": {
+              "chartId": "certlc-preview-eventgrid-latency",
+              "version": "MetricsItem/1.0",
+              "timeContextFromParameter": "TimeRange",
+              "resourceParameter": "EventGridTopic",
+              "size": 0,
+              "metrics": [
+                {
+                  "namespace": "microsoft.eventgrid/systemtopics",
+                  "metric": "microsoft.eventgrid/systemtopics--DestinationProcessingDurationInMs",
+                  "splitBy": "EventSubscriptionName",
+                  "chartType": 2,
+                  "aggregation": 4
+                }
+              ],
+              "resourceType": "microsoft.eventgrid/systemtopics",
+              "title": "Destination processing duration (average milliseconds)"
+            },
+            "type": 10,
+            "name": "eventgrid-latency",
+            "customWidth": "50"
+          }
+        ],
+        "groupType": "editable",
+        "version": "NotebookGroup/1.0"
+      },
+      "type": 12,
+      "name": "grpEventGrid",
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "5"
+      }
+    },
+    {
+      "content": {
+        "items": [
+          {
+            "content": {
+              "resourceType": "microsoft.resourcegraph/resources",
+              "exportToExcelOptions": "all",
+              "query": "{\r\n  \"headers\": [],\r\n  \"method\": \"GET\",\r\n  \"transformers\": [\r\n    {\r\n      \"settings\": {\r\n        \"tablePath\": \"$\",\r\n        \"columns\": [\r\n          {\r\n            \"columnid\": \"Queue\",\r\n            \"path\": \"$.name\"\r\n          },\r\n          {\r\n            \"columnid\": \"Approximate messages\",\r\n            \"path\": \"$.properties.approximateMessageCount\",\r\n            \"columnType\": \"long\"\r\n          }\r\n        ]\r\n      },\r\n      \"type\": \"jsonpath\"\r\n    }\r\n  ],\r\n  \"path\": \"{QueueService}/queues/certlc\",\r\n  \"version\": \"ARMEndpoint/1.0\",\r\n  \"batchDisabled\": false,\r\n  \"urlParams\": [\r\n    {\r\n      \"value\": \"2023-05-01\",\r\n      \"key\": \"api-version\"\r\n    }\r\n  ]\r\n}",
+              "version": "KqlItem/1.0",
+              "showExportToExcel": true,
+              "queryType": 12,
+              "title": "Main queue: current backlog",
+              "gridSettings": {
+                "rowLimit": 1
+              },
+              "timeContextFromParameter": "TimeRange",
+              "visualization": "table",
+              "size": 3,
+              "crossComponentResources": []
+            },
+            "type": 3,
+            "name": "queue-live-main",
+            "customWidth": "50"
+          },
+          {
+            "content": {
+              "resourceType": "microsoft.resourcegraph/resources",
+              "exportToExcelOptions": "all",
+              "query": "{\r\n  \"headers\": [],\r\n  \"method\": \"GET\",\r\n  \"transformers\": [\r\n    {\r\n      \"settings\": {\r\n        \"tablePath\": \"$\",\r\n        \"columns\": [\r\n          {\r\n            \"columnid\": \"Queue\",\r\n            \"path\": \"$.name\"\r\n          },\r\n          {\r\n            \"columnid\": \"Approximate messages\",\r\n            \"path\": \"$.properties.approximateMessageCount\",\r\n            \"columnType\": \"long\"\r\n          }\r\n        ]\r\n      },\r\n      \"type\": \"jsonpath\"\r\n    }\r\n  ],\r\n  \"path\": \"{QueueService}/queues/certlc-poison\",\r\n  \"version\": \"ARMEndpoint/1.0\",\r\n  \"batchDisabled\": false,\r\n  \"urlParams\": [\r\n    {\r\n      \"value\": \"2023-05-01\",\r\n      \"key\": \"api-version\"\r\n    }\r\n  ]\r\n}",
+              "version": "KqlItem/1.0",
+              "showExportToExcel": true,
+              "queryType": 12,
+              "title": "Poison queue: current backlog",
+              "gridSettings": {
+                "rowLimit": 1
+              },
+              "timeContextFromParameter": "TimeRange",
+              "visualization": "table",
+              "size": 3,
+              "crossComponentResources": []
+            },
+            "type": 3,
+            "name": "queue-live-poison",
+            "customWidth": "50"
+          },
+          {
+            "content": {
+              "json": "**Coverage:** Request logs reflect enabled diagnostic categories, not every queue operation. Missing records do not establish successful deletion or an empty queue. Host observations are scoped to the selected Function; age at dequeue includes retry delay."
+            },
+            "type": 1,
+            "name": "queue-coverage"
+          },
+          {
+            "content": {
+              "parameters": [
+                {
+                  "version": "KqlParameterItem/1.0",
+                  "jsonData": "[{\"value\":\"all\",\"label\":\"Both queues\"},{\"value\":\"certlc\",\"label\":\"certlc\"},{\"value\":\"certlc-poison\",\"label\":\"certlc-poison\"}]",
+                  "label": "Queue",
+                  "name": "QueueFilter",
+                  "typeSettings": {
+                    "showDefault": false,
+                    "additionalResourceOptions": []
+                  },
+                  "value": "all",
+                  "type": 2,
+                  "id": "2ee2f53d-f75e-4282-a572-46978778e3d3"
+                },
+                {
+                  "value": "",
+                  "id": "4f51dfd6-1e0b-4859-a39d-7f846e7164a8",
+                  "name": "QueueSearch",
+                  "version": "KqlParameterItem/1.0",
+                  "type": 1,
+                  "description": "Searchable values:\n- Storage operation: PutMessage, GetMessage, UpdateMessage, DeleteMessage.\n- Storage status text: Success, ServerBusy, AuthenticationFailed.\n- Request ID, client request ID, or request path: /certlc/messages.\n- Processing attempt: message ID, Function invocation ID, or result (Failed, Succeeded, Completion not observed).\n\nEnter one value or part of a value. Matching is case-insensitive; commas and wildcards are treated literally. Each view searches its own fields, so some views may have no matches. Clear the field to show all logs for the selected queue and time range. Message contents, backlog counts and service-wide metrics are not searched.",
+                  "label": "Search queue logs"
+                }
+              ],
+              "style": "pills",
+              "version": "KqlParameterItem/1.0"
+            },
+            "type": 9,
+            "name": "queue-search"
+          },
+          {
+            "content": {
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "exportedParameters": [
+                {
+                  "parameterName": "SelectedQueueOperation",
+                  "fieldName": "OperationKey",
+                  "parameterType": 1
+                }
+              ],
+              "exportToExcelOptions": "all",
+              "query": "// Queue operations are requests, not unique messages. Never infer backlog from request totals.\r\nlet QueueOperations = materialize(StorageQueueLogs\r\n| where TimeGenerated {TimeRange}\r\n| where _ResourceId =~ '{QueueService}'\r\n| extend ParsedUri = parse_url(Uri)\r\n| extend Queue = tostring(split(tostring(ParsedUri.Path), '/')[1])\r\n| where Queue in ('certlc', 'certlc-poison')\r\n| extend HttpStatus = toint(StatusCode),\r\n    RequestId = tostring(column_ifexists('RequestIdHeader', '')),\r\n    ClientRequestId = tostring(column_ifexists('ClientRequestId', '')),\r\n    Authentication = tostring(column_ifexists('AuthenticationType', '')),\r\n    Caller = tostring(column_ifexists('RequesterObjectId', ''))\r\n// Exclude URI query strings: pop receipts and signatures must not appear in workbook exports.\r\n| extend RequestPath = tostring(ParsedUri.Path), IsFailure = HttpStatus >= 400,\r\n    OperationKey = tostring(pack_array(TimeGenerated, RequestId, ClientRequestId, OperationName, tostring(ParsedUri.Path), StatusCode))\r\n| project TimeGenerated, Queue, OperationName, HttpStatus, StatusText, IsFailure,\r\n    DurationMs, ServerLatencyMs, RequestId, ClientRequestId, Authentication, Caller, RequestPath, OperationKey);\r\nlet QueueSelection=base64_decode_tostring('{QueueFilter:base64}');\r\nlet SearchText=trim(@'\\s+',base64_decode_tostring('{QueueSearch:base64}'));\r\nlet FilteredQueueOperations=QueueOperations\r\n| where QueueSelection == 'all' or Queue == QueueSelection\r\n| where isempty(SearchText) or OperationName contains SearchText or StatusText contains SearchText\r\n    or RequestId contains SearchText or ClientRequestId contains SearchText or RequestPath contains SearchText;\r\nFilteredQueueOperations\r\n| where IsFailure\r\n| project Time=TimeGenerated, Queue, OperationName, HttpStatus, StatusText, DurationMs, RequestId, RequestPath, OperationKey\r\n| order by Time desc | take 200",
+              "version": "KqlItem/1.0",
+              "showExportToExcel": true,
+              "queryType": 0,
+              "noDataMessage": "No failed queue requests observed in the available logs.",
+              "title": "Queue request failures",
+              "gridSettings": {
+                "formatters": [
+                  {
+                    "formatter": 5,
+                    "columnMatch": "OperationKey"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "RequestPath"
+                  }
+                ],
+                "filter": true,
+                "rowLimit": 10
+              },
+              "timeContextFromParameter": "TimeRange",
+              "visualization": "table",
+              "size": 3,
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ]
+            },
+            "type": 3,
+            "name": "queue-failures"
+          },
+          {
+            "content": {
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "exportedParameters": [
+                {
+                  "parameterName": "SelectedQueueMessage",
+                  "fieldName": "MessageId",
+                  "parameterType": 1
+                }
+              ],
+              "exportToExcelOptions": "all",
+              "query": "// Host trigger records expose actual dequeue count and insertion time; storage calls do not.\r\nlet QueueTraces = materialize(AppTraces\r\n| where TimeGenerated {TimeRange} and AppRoleName =~ '{FunctionApp:name}'\r\n| extend InvocationId = coalesce(tostring(Properties.InvocationId), extract(@'Id=([0-9a-fA-F-]{36})', 1, Message), OperationId)\r\n| where isnotempty(InvocationId));\r\nlet QueueInvocations = QueueTraces\r\n| where Message startswith \"Executing 'Functions.QueueHandler'\" and Message contains 'New queue message detected'\r\n| extend Queue = extract(@\"New queue message detected on '([^']+)'\", 1, Message)\r\n| where Queue in ('certlc', 'certlc-poison')\r\n| summarize Started=min(TimeGenerated) by InvocationId, Queue;\r\nlet QueueTriggerDetails = QueueTraces\r\n| where Message startswith 'Trigger Details:'\r\n| extend MessageId=extract(@'MessageId:\\s*([^,\\s]+)',1,Message),\r\n    DequeueCount=toint(extract(@'DequeueCount:\\s*(\\d+)',1,Message)),\r\n    InsertedOn=todatetime(extract(@'InsertedOn:\\s*([^,\\s]+)',1,Message))\r\n| summarize arg_min(TimeGenerated, *) by InvocationId\r\n| project InvocationId, MessageId, DequeueCount, InsertedOn;\r\nlet QueueCompletions = QueueTraces\r\n| where Message startswith \"Executed 'Functions.QueueHandler'\"\r\n| summarize arg_max(TimeGenerated, Message) by InvocationId\r\n| project InvocationId, Completed=TimeGenerated,\r\n    Result=case(Message contains '(Succeeded,', 'Succeeded', Message contains '(Failed,', 'Failed', 'Not parsed');\r\nlet QueueAttempts = QueueInvocations\r\n| join kind=leftouter QueueTriggerDetails on InvocationId\r\n| join kind=leftouter QueueCompletions on InvocationId\r\n| extend Result=coalesce(Result,'Completion not observed'),\r\n    AgeAtDequeueSeconds = datetime_diff('second', Started, InsertedOn)\r\n| project Started, Queue, MessageId, DequeueCount, AgeAtDequeueSeconds, Result, Completed, InvocationId;\r\nlet QueueSelection=base64_decode_tostring('{QueueFilter:base64}');\r\nlet SearchText=trim(@'\\s+',base64_decode_tostring('{QueueSearch:base64}'));\r\nQueueAttempts\r\n| where QueueSelection == 'all' or Queue == QueueSelection\r\n| where isempty(SearchText) or MessageId contains SearchText or InvocationId contains SearchText or Result contains SearchText\r\n| where DequeueCount > 1 or Result == 'Failed'\r\n| project Started, Queue, MessageId, DequeueCount, AgeAtDequeueSeconds, Result, InvocationId\r\n| order by Started desc | take 200",
+              "version": "KqlItem/1.0",
+              "showExportToExcel": true,
+              "queryType": 0,
+              "noDataMessage": "No retry or failed-completion observations in the selected Function and time range.",
+              "title": "Observed message retries and failed processing",
+              "gridSettings": {
+                "filter": true,
+                "rowLimit": 10
+              },
+              "timeContextFromParameter": "TimeRange",
+              "visualization": "table",
+              "size": 3,
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ]
+            },
+            "type": 3,
+            "name": "queue-retry-summary"
+          },
+          {
+            "content": {
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "exportToExcelOptions": "all",
+              "query": "// Queue operations are requests, not unique messages. Never infer backlog from request totals.\r\nlet QueueOperations = materialize(StorageQueueLogs\r\n| where TimeGenerated {TimeRange}\r\n| where _ResourceId =~ '{QueueService}'\r\n| extend ParsedUri = parse_url(Uri)\r\n| extend Queue = tostring(split(tostring(ParsedUri.Path), '/')[1])\r\n| where Queue in ('certlc', 'certlc-poison')\r\n| extend HttpStatus = toint(StatusCode),\r\n    RequestId = tostring(column_ifexists('RequestIdHeader', '')),\r\n    ClientRequestId = tostring(column_ifexists('ClientRequestId', '')),\r\n    Authentication = tostring(column_ifexists('AuthenticationType', '')),\r\n    Caller = tostring(column_ifexists('RequesterObjectId', ''))\r\n// Exclude URI query strings: pop receipts and signatures must not appear in workbook exports.\r\n| extend RequestPath = tostring(ParsedUri.Path), IsFailure = HttpStatus >= 400,\r\n    OperationKey = tostring(pack_array(TimeGenerated, RequestId, ClientRequestId, OperationName, tostring(ParsedUri.Path), StatusCode))\r\n| project TimeGenerated, Queue, OperationName, HttpStatus, StatusText, IsFailure,\r\n    DurationMs, ServerLatencyMs, RequestId, ClientRequestId, Authentication, Caller, RequestPath, OperationKey);\r\nlet QueueSelection=base64_decode_tostring('{QueueFilter:base64}');\r\nlet SearchText=trim(@'\\s+',base64_decode_tostring('{QueueSearch:base64}'));\r\nlet FilteredQueueOperations=QueueOperations\r\n| where QueueSelection == 'all' or Queue == QueueSelection\r\n| where isempty(SearchText) or OperationName contains SearchText or StatusText contains SearchText\r\n    or RequestId contains SearchText or ClientRequestId contains SearchText or RequestPath contains SearchText;\r\nFilteredQueueOperations\r\n| summarize Requests=count(), FailedRequests=countif(IsFailure), P95DurationMs=percentile(DurationMs,95), LastObserved=max(TimeGenerated)\r\n    by Queue, OperationName\r\n| order by Queue asc, Requests desc",
+              "version": "KqlItem/1.0",
+              "showExportToExcel": true,
+              "queryType": 0,
+              "noDataMessage": "No queue operation records observed for these filters and time range.",
+              "title": "Recorded queue requests",
+              "gridSettings": {
+                "filter": true,
+                "rowLimit": 12
+              },
+              "timeContextFromParameter": "TimeRange",
+              "visualization": "table",
+              "size": 3,
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ]
+            },
+            "type": 3,
+            "name": "queue-operation-summary"
+          },
+          {
+            "content": {
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "exportToExcelOptions": "all",
+              "query": "// Queue operations are requests, not unique messages. Never infer backlog from request totals.\r\nlet QueueOperations = materialize(StorageQueueLogs\r\n| where TimeGenerated {TimeRange}\r\n| where _ResourceId =~ '{QueueService}'\r\n| extend ParsedUri = parse_url(Uri)\r\n| extend Queue = tostring(split(tostring(ParsedUri.Path), '/')[1])\r\n| where Queue in ('certlc', 'certlc-poison')\r\n| extend HttpStatus = toint(StatusCode),\r\n    RequestId = tostring(column_ifexists('RequestIdHeader', '')),\r\n    ClientRequestId = tostring(column_ifexists('ClientRequestId', '')),\r\n    Authentication = tostring(column_ifexists('AuthenticationType', '')),\r\n    Caller = tostring(column_ifexists('RequesterObjectId', ''))\r\n// Exclude URI query strings: pop receipts and signatures must not appear in workbook exports.\r\n| extend RequestPath = tostring(ParsedUri.Path), IsFailure = HttpStatus >= 400,\r\n    OperationKey = tostring(pack_array(TimeGenerated, RequestId, ClientRequestId, OperationName, tostring(ParsedUri.Path), StatusCode))\r\n| project TimeGenerated, Queue, OperationName, HttpStatus, StatusText, IsFailure,\r\n    DurationMs, ServerLatencyMs, RequestId, ClientRequestId, Authentication, Caller, RequestPath, OperationKey);\r\nlet QueueSelection=base64_decode_tostring('{QueueFilter:base64}');\r\nlet SearchText=trim(@'\\s+',base64_decode_tostring('{QueueSearch:base64}'));\r\nlet FilteredQueueOperations=QueueOperations\r\n| where QueueSelection == 'all' or Queue == QueueSelection\r\n| where isempty(SearchText) or OperationName contains SearchText or StatusText contains SearchText\r\n    or RequestId contains SearchText or ClientRequestId contains SearchText or RequestPath contains SearchText;\r\nFilteredQueueOperations\r\n| summarize Requests=count() by Time=bin(TimeGenerated,5m), Operation=strcat(Queue,' / ',OperationName)\r\n| order by Time asc",
+              "version": "KqlItem/1.0",
+              "showExportToExcel": true,
+              "queryType": 0,
+              "title": "Recorded queue request volume",
+              "gridSettings": {
+                "rowLimit": 500,
+                "filter": true
+              },
+              "timeContextFromParameter": "TimeRange",
+              "visualization": "timechart",
+              "size": 3,
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ]
+            },
+            "type": 3,
+            "name": "queue-request-trend",
+            "customWidth": "50"
+          },
+          {
+            "content": {
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "exportToExcelOptions": "all",
+              "query": "// Queue operations are requests, not unique messages. Never infer backlog from request totals.\r\nlet QueueOperations = materialize(StorageQueueLogs\r\n| where TimeGenerated {TimeRange}\r\n| where _ResourceId =~ '{QueueService}'\r\n| extend ParsedUri = parse_url(Uri)\r\n| extend Queue = tostring(split(tostring(ParsedUri.Path), '/')[1])\r\n| where Queue in ('certlc', 'certlc-poison')\r\n| extend HttpStatus = toint(StatusCode),\r\n    RequestId = tostring(column_ifexists('RequestIdHeader', '')),\r\n    ClientRequestId = tostring(column_ifexists('ClientRequestId', '')),\r\n    Authentication = tostring(column_ifexists('AuthenticationType', '')),\r\n    Caller = tostring(column_ifexists('RequesterObjectId', ''))\r\n// Exclude URI query strings: pop receipts and signatures must not appear in workbook exports.\r\n| extend RequestPath = tostring(ParsedUri.Path), IsFailure = HttpStatus >= 400,\r\n    OperationKey = tostring(pack_array(TimeGenerated, RequestId, ClientRequestId, OperationName, tostring(ParsedUri.Path), StatusCode))\r\n| project TimeGenerated, Queue, OperationName, HttpStatus, StatusText, IsFailure,\r\n    DurationMs, ServerLatencyMs, RequestId, ClientRequestId, Authentication, Caller, RequestPath, OperationKey);\r\nlet QueueSelection=base64_decode_tostring('{QueueFilter:base64}');\r\nlet SearchText=trim(@'\\s+',base64_decode_tostring('{QueueSearch:base64}'));\r\nlet FilteredQueueOperations=QueueOperations\r\n| where QueueSelection == 'all' or Queue == QueueSelection\r\n| where isempty(SearchText) or OperationName contains SearchText or StatusText contains SearchText\r\n    or RequestId contains SearchText or ClientRequestId contains SearchText or RequestPath contains SearchText;\r\nFilteredQueueOperations\r\n| summarize P95DurationMs=percentile(DurationMs,95) by Time=bin(TimeGenerated,5m),Queue\r\n| order by Time asc",
+              "version": "KqlItem/1.0",
+              "showExportToExcel": true,
+              "queryType": 0,
+              "title": "Recorded request duration (P95 milliseconds)",
+              "gridSettings": {
+                "rowLimit": 500,
+                "filter": true
+              },
+              "timeContextFromParameter": "TimeRange",
+              "visualization": "timechart",
+              "size": 3,
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ]
+            },
+            "type": 3,
+            "name": "queue-duration-trend",
+            "customWidth": "50"
+          },
+          {
+            "content": {
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "exportedParameters": [
+                {
+                  "parameterName": "SelectedQueueOperation",
+                  "fieldName": "OperationKey",
+                  "parameterType": 1
+                }
+              ],
+              "exportToExcelOptions": "all",
+              "query": "// Queue operations are requests, not unique messages. Never infer backlog from request totals.\r\nlet QueueOperations = materialize(StorageQueueLogs\r\n| where TimeGenerated {TimeRange}\r\n| where _ResourceId =~ '{QueueService}'\r\n| extend ParsedUri = parse_url(Uri)\r\n| extend Queue = tostring(split(tostring(ParsedUri.Path), '/')[1])\r\n| where Queue in ('certlc', 'certlc-poison')\r\n| extend HttpStatus = toint(StatusCode),\r\n    RequestId = tostring(column_ifexists('RequestIdHeader', '')),\r\n    ClientRequestId = tostring(column_ifexists('ClientRequestId', '')),\r\n    Authentication = tostring(column_ifexists('AuthenticationType', '')),\r\n    Caller = tostring(column_ifexists('RequesterObjectId', ''))\r\n// Exclude URI query strings: pop receipts and signatures must not appear in workbook exports.\r\n| extend RequestPath = tostring(ParsedUri.Path), IsFailure = HttpStatus >= 400,\r\n    OperationKey = tostring(pack_array(TimeGenerated, RequestId, ClientRequestId, OperationName, tostring(ParsedUri.Path), StatusCode))\r\n| project TimeGenerated, Queue, OperationName, HttpStatus, StatusText, IsFailure,\r\n    DurationMs, ServerLatencyMs, RequestId, ClientRequestId, Authentication, Caller, RequestPath, OperationKey);\r\nlet QueueSelection=base64_decode_tostring('{QueueFilter:base64}');\r\nlet SearchText=trim(@'\\s+',base64_decode_tostring('{QueueSearch:base64}'));\r\nlet FilteredQueueOperations=QueueOperations\r\n| where QueueSelection == 'all' or Queue == QueueSelection\r\n| where isempty(SearchText) or OperationName contains SearchText or StatusText contains SearchText\r\n    or RequestId contains SearchText or ClientRequestId contains SearchText or RequestPath contains SearchText;\r\nFilteredQueueOperations\r\n| project Time=TimeGenerated, Queue, OperationName, HttpStatus, StatusText, DurationMs, Authentication, RequestId, RequestPath, OperationKey\r\n| order by Time desc | take 500",
+              "version": "KqlItem/1.0",
+              "showExportToExcel": true,
+              "queryType": 0,
+              "title": "Queue operation logs",
+              "gridSettings": {
+                "formatters": [
+                  {
+                    "formatter": 5,
+                    "columnMatch": "OperationKey"
+                  },
+                  {
+                    "formatter": 5,
+                    "columnMatch": "RequestPath"
+                  }
+                ],
+                "filter": true,
+                "rowLimit": 15
+              },
+              "timeContextFromParameter": "TimeRange",
+              "visualization": "table",
+              "size": 3,
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ]
+            },
+            "type": 3,
+            "name": "queue-operations"
+          },
+          {
+            "content": {
+              "showExportToExcel": true,
+              "query": "// Queue operations are requests, not unique messages. Never infer backlog from request totals.\r\nlet QueueOperations = materialize(StorageQueueLogs\r\n| where TimeGenerated {TimeRange}\r\n| where _ResourceId =~ '{QueueService}'\r\n| extend ParsedUri = parse_url(Uri)\r\n| extend Queue = tostring(split(tostring(ParsedUri.Path), '/')[1])\r\n| where Queue in ('certlc', 'certlc-poison')\r\n| extend HttpStatus = toint(StatusCode),\r\n    RequestId = tostring(column_ifexists('RequestIdHeader', '')),\r\n    ClientRequestId = tostring(column_ifexists('ClientRequestId', '')),\r\n    Authentication = tostring(column_ifexists('AuthenticationType', '')),\r\n    Caller = tostring(column_ifexists('RequesterObjectId', ''))\r\n// Exclude URI query strings: pop receipts and signatures must not appear in workbook exports.\r\n| extend RequestPath = tostring(ParsedUri.Path), IsFailure = HttpStatus >= 400,\r\n    OperationKey = tostring(pack_array(TimeGenerated, RequestId, ClientRequestId, OperationName, tostring(ParsedUri.Path), StatusCode))\r\n| project TimeGenerated, Queue, OperationName, HttpStatus, StatusText, IsFailure,\r\n    DurationMs, ServerLatencyMs, RequestId, ClientRequestId, Authentication, Caller, RequestPath, OperationKey);\r\nlet QueueSelection=base64_decode_tostring('{QueueFilter:base64}');\r\nlet SearchText=trim(@'\\s+',base64_decode_tostring('{QueueSearch:base64}'));\r\nlet FilteredQueueOperations=QueueOperations\r\n| where QueueSelection == 'all' or Queue == QueueSelection\r\n| where isempty(SearchText) or OperationName contains SearchText or StatusText contains SearchText\r\n    or RequestId contains SearchText or ClientRequestId contains SearchText or RequestPath contains SearchText;\r\nlet Selection=base64_decode_tostring('{SelectedQueueOperation:base64}');\r\nFilteredQueueOperations | where isnotempty(Selection) and OperationKey == Selection\r\n| project Time=TimeGenerated, Queue, OperationName, HttpStatus, StatusText, DurationMs, ServerLatencyMs,\r\n    RequestId, ClientRequestId, Authentication, Caller, RequestPath\r\n| take 20",
+              "title": "Selected queue request",
+              "gridSettings": {
+                "rowLimit": 500,
+                "filter": true
+              },
+              "exportToExcelOptions": "all",
+              "queryType": 0,
+              "timeContextFromParameter": "TimeRange",
+              "size": 3,
+              "visualization": "table",
+              "version": "KqlItem/1.0",
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ]
+            },
+            "type": 3,
+            "name": "queue-operation-detail",
+            "conditionalVisibility": {
+              "parameterName": "SelectedQueueOperation",
+              "comparison": "isNotEqualTo",
+              "value": ""
+            }
+          },
+          {
+            "content": {
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "exportedParameters": [
+                {
+                  "parameterName": "SelectedQueueMessage",
+                  "fieldName": "MessageId",
+                  "parameterType": 1
+                }
+              ],
+              "exportToExcelOptions": "all",
+              "query": "// Host trigger records expose actual dequeue count and insertion time; storage calls do not.\r\nlet QueueTraces = materialize(AppTraces\r\n| where TimeGenerated {TimeRange} and AppRoleName =~ '{FunctionApp:name}'\r\n| extend InvocationId = coalesce(tostring(Properties.InvocationId), extract(@'Id=([0-9a-fA-F-]{36})', 1, Message), OperationId)\r\n| where isnotempty(InvocationId));\r\nlet QueueInvocations = QueueTraces\r\n| where Message startswith \"Executing 'Functions.QueueHandler'\" and Message contains 'New queue message detected'\r\n| extend Queue = extract(@\"New queue message detected on '([^']+)'\", 1, Message)\r\n| where Queue in ('certlc', 'certlc-poison')\r\n| summarize Started=min(TimeGenerated) by InvocationId, Queue;\r\nlet QueueTriggerDetails = QueueTraces\r\n| where Message startswith 'Trigger Details:'\r\n| extend MessageId=extract(@'MessageId:\\s*([^,\\s]+)',1,Message),\r\n    DequeueCount=toint(extract(@'DequeueCount:\\s*(\\d+)',1,Message)),\r\n    InsertedOn=todatetime(extract(@'InsertedOn:\\s*([^,\\s]+)',1,Message))\r\n| summarize arg_min(TimeGenerated, *) by InvocationId\r\n| project InvocationId, MessageId, DequeueCount, InsertedOn;\r\nlet QueueCompletions = QueueTraces\r\n| where Message startswith \"Executed 'Functions.QueueHandler'\"\r\n| summarize arg_max(TimeGenerated, Message) by InvocationId\r\n| project InvocationId, Completed=TimeGenerated,\r\n    Result=case(Message contains '(Succeeded,', 'Succeeded', Message contains '(Failed,', 'Failed', 'Not parsed');\r\nlet QueueAttempts = QueueInvocations\r\n| join kind=leftouter QueueTriggerDetails on InvocationId\r\n| join kind=leftouter QueueCompletions on InvocationId\r\n| extend Result=coalesce(Result,'Completion not observed'),\r\n    AgeAtDequeueSeconds = datetime_diff('second', Started, InsertedOn)\r\n| project Started, Queue, MessageId, DequeueCount, AgeAtDequeueSeconds, Result, Completed, InvocationId;\r\nlet QueueSelection=base64_decode_tostring('{QueueFilter:base64}');\r\nlet SearchText=trim(@'\\s+',base64_decode_tostring('{QueueSearch:base64}'));\r\nQueueAttempts\r\n| where QueueSelection == 'all' or Queue == QueueSelection\r\n| where isempty(SearchText) or MessageId contains SearchText or InvocationId contains SearchText or Result contains SearchText\r\n| order by Started desc | take 500",
+              "version": "KqlItem/1.0",
+              "showExportToExcel": true,
+              "queryType": 0,
+              "noDataMessage": "No matching queue-trigger observations in the selected Function and time range.",
+              "title": "Queue processing attempts (Function host observations)",
+              "gridSettings": {
+                "filter": true,
+                "rowLimit": 15
+              },
+              "timeContextFromParameter": "TimeRange",
+              "visualization": "table",
+              "size": 3,
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ]
+            },
+            "type": 3,
+            "name": "queue-attempts"
+          },
+          {
+            "content": {
+              "showExportToExcel": true,
+              "query": "// Host trigger records expose actual dequeue count and insertion time; storage calls do not.\r\nlet QueueTraces = materialize(AppTraces\r\n| where TimeGenerated {TimeRange} and AppRoleName =~ '{FunctionApp:name}'\r\n| extend InvocationId = coalesce(tostring(Properties.InvocationId), extract(@'Id=([0-9a-fA-F-]{36})', 1, Message), OperationId)\r\n| where isnotempty(InvocationId));\r\nlet QueueInvocations = QueueTraces\r\n| where Message startswith \"Executing 'Functions.QueueHandler'\" and Message contains 'New queue message detected'\r\n| extend Queue = extract(@\"New queue message detected on '([^']+)'\", 1, Message)\r\n| where Queue in ('certlc', 'certlc-poison')\r\n| summarize Started=min(TimeGenerated) by InvocationId, Queue;\r\nlet QueueTriggerDetails = QueueTraces\r\n| where Message startswith 'Trigger Details:'\r\n| extend MessageId=extract(@'MessageId:\\s*([^,\\s]+)',1,Message),\r\n    DequeueCount=toint(extract(@'DequeueCount:\\s*(\\d+)',1,Message)),\r\n    InsertedOn=todatetime(extract(@'InsertedOn:\\s*([^,\\s]+)',1,Message))\r\n| summarize arg_min(TimeGenerated, *) by InvocationId\r\n| project InvocationId, MessageId, DequeueCount, InsertedOn;\r\nlet QueueCompletions = QueueTraces\r\n| where Message startswith \"Executed 'Functions.QueueHandler'\"\r\n| summarize arg_max(TimeGenerated, Message) by InvocationId\r\n| project InvocationId, Completed=TimeGenerated,\r\n    Result=case(Message contains '(Succeeded,', 'Succeeded', Message contains '(Failed,', 'Failed', 'Not parsed');\r\nlet QueueAttempts = QueueInvocations\r\n| join kind=leftouter QueueTriggerDetails on InvocationId\r\n| join kind=leftouter QueueCompletions on InvocationId\r\n| extend Result=coalesce(Result,'Completion not observed'),\r\n    AgeAtDequeueSeconds = datetime_diff('second', Started, InsertedOn)\r\n| project Started, Queue, MessageId, DequeueCount, AgeAtDequeueSeconds, Result, Completed, InvocationId;\r\nlet Selection=base64_decode_tostring('{SelectedQueueMessage:base64}');\r\nlet QueueSelection=base64_decode_tostring('{QueueFilter:base64}');\r\nQueueAttempts\r\n| where isnotempty(Selection) and MessageId == Selection\r\n| where QueueSelection == 'all' or Queue == QueueSelection\r\n| order by Started asc | take 500",
+              "title": "Selected message: observed processing attempts",
+              "gridSettings": {
+                "filter": true,
+                "rowLimit": 15
+              },
+              "exportToExcelOptions": "all",
+              "queryType": 0,
+              "timeContextFromParameter": "TimeRange",
+              "size": 3,
+              "visualization": "table",
+              "version": "KqlItem/1.0",
+              "resourceType": "microsoft.operationalinsights/workspaces",
+              "crossComponentResources": [
+                "{LogAnalyticsWorkspace}"
+              ]
+            },
+            "type": 3,
+            "name": "queue-message-detail",
+            "conditionalVisibility": {
+              "parameterName": "SelectedQueueMessage",
+              "comparison": "isNotEqualTo",
+              "value": ""
+            }
+          },
+          {
+            "content": {
+              "chartId": "certlc-flow-queue-service-transactions",
+              "version": "MetricsItem/1.0",
+              "timeContextFromParameter": "TimeRange",
+              "resourceParameter": "QueueService",
+              "size": 0,
+              "metrics": [
+                {
+                  "namespace": "microsoft.storage/storageaccounts/queueservices",
+                  "metric": "microsoft.storage/storageaccounts/queueservices--Transactions",
+                  "splitBy": "ResponseType",
+                  "chartType": 2,
+                  "aggregation": 1
+                }
+              ],
+              "resourceType": "microsoft.storage/storageaccounts/queueservices",
+              "title": "Queue service requests by response (all account queues)"
+            },
+            "customWidth": "50",
+            "type": 10,
+            "name": "queue-service-transactions"
+          },
+          {
+            "content": {
+              "chartId": "certlc-flow-queue-service-latency",
+              "version": "MetricsItem/1.0",
+              "timeContextFromParameter": "TimeRange",
+              "resourceParameter": "QueueService",
+              "size": 0,
+              "metrics": [
+                {
+                  "namespace": "microsoft.storage/storageaccounts/queueservices",
+                  "metric": "microsoft.storage/storageaccounts/queueservices--SuccessE2ELatency",
+                  "splitBy": null,
+                  "chartType": 2,
+                  "aggregation": 4
+                },
+                {
+                  "namespace": "microsoft.storage/storageaccounts/queueservices",
+                  "metric": "microsoft.storage/storageaccounts/queueservices--SuccessServerLatency",
+                  "splitBy": null,
+                  "chartType": 2,
+                  "aggregation": 4
+                }
+              ],
+              "resourceType": "microsoft.storage/storageaccounts/queueservices",
+              "title": "Queue service successful latency (all account queues, ms)"
+            },
+            "customWidth": "50",
+            "type": 10,
+            "name": "queue-service-latency"
+          },
+          {
+            "content": {
+              "chartId": "certlc-flow-queue-service-backlog",
+              "version": "MetricsItem/1.0",
+              "timeContextFromParameter": "TimeRange",
+              "resourceParameter": "QueueService",
+              "size": 0,
+              "metrics": [
+                {
+                  "namespace": "microsoft.storage/storageaccounts/queueservices",
+                  "metric": "microsoft.storage/storageaccounts/queueservices--QueueMessageCount",
+                  "splitBy": null,
+                  "chartType": 2,
+                  "aggregation": 4
+                }
+              ],
+              "resourceType": "microsoft.storage/storageaccounts/queueservices",
+              "title": "Queue service message count (all account queues, hourly)"
+            },
+            "customWidth": "50",
+            "type": 10,
+            "name": "queue-service-backlog"
+          },
+          {
+            "content": {
+              "chartId": "certlc-flow-queue-service-availability",
+              "version": "MetricsItem/1.0",
+              "timeContextFromParameter": "TimeRange",
+              "resourceParameter": "QueueService",
+              "size": 0,
+              "metrics": [
+                {
+                  "namespace": "microsoft.storage/storageaccounts/queueservices",
+                  "metric": "microsoft.storage/storageaccounts/queueservices--Availability",
+                  "splitBy": null,
+                  "chartType": 2,
+                  "aggregation": 4
+                }
+              ],
+              "resourceType": "microsoft.storage/storageaccounts/queueservices",
+              "title": "Queue service availability (all account queues, %)"
+            },
+            "customWidth": "50",
+            "type": 10,
+            "name": "queue-service-availability"
+          }
+        ],
+        "groupType": "editable",
+        "version": "NotebookGroup/1.0"
+      },
+      "type": 12,
+      "name": "grpQueue",
+      "conditionalVisibility": {
+        "parameterName": "selectedTab",
+        "comparison": "isEqualTo",
+        "value": "6"
+      }
     },
     {
       "type": 12,
@@ -769,320 +2121,6 @@
         "value": "3"
       },
       "name": "grpFunctionBridge"
-    },
-    {
-      "name": "grpEventJourney",
-      "conditionalVisibility": {
-        "comparison": "isEqualTo",
-        "value": "4",
-        "parameterName": "selectedTab"
-      },
-      "content": {
-        "items": [
-          {
-            "name": "journey-parameters",
-            "content": {
-              "style": "formVertical",
-              "parameters": [
-                {
-                  "label": "Search events/certificates",
-                  "value": "",
-                  "version": "KqlParameterItem/1.0",
-                  "description": "Correlation ID, certificate, job ID, invocation ID, event type or source.",
-                  "id": "bafbe95b-4eca-4487-82cb-e4be0b68894d",
-                  "name": "JourneySearch",
-                  "type": 1
-                }
-              ],
-              "version": "KqlParameterItem/1.0"
-            },
-            "type": 9
-          },
-          {
-            "name": "event-list",
-            "content": {
-              "query": "// Test workbook only. Scope every scan to the selected time and existing resources.\r\n// Reuse certlcstats resource selectors instead of pinning Journey to one deployment.\r\n// Match Job History: nested resource names may include the Automation account prefix.\r\nlet SelectedRunbookName = tostring(split('{Runbook:name}', '/')[-1]);\r\nlet Traces = materialize(AppTraces\r\n| where TimeGenerated {TimeRange}\r\n| where AppRoleName =~ '{FunctionApp:name}'\r\n| extend AttemptId = coalesce(tostring(Properties.InvocationId), OperationId)\r\n| where isnotempty(AttemptId));\r\nlet Bridge = Traces\r\n| where Message has 'BridgeCorrelation'\r\n| extend Entry = parse_json(extract(@'(\\{.*\\})', 1, Message))\r\n| where tostring(Entry.recordType) == 'BridgeCorrelation';\r\n// Only receipt records establish event identity. Older Started records used job fallback.\r\nlet Receipts = Bridge\r\n| where tostring(Entry.stage) == 'Received'\r\n| summarize arg_min(TimeGenerated, *) by AttemptId\r\n| project AttemptId, OperationId, Received = TimeGenerated,\r\n    CorrelationId = tostring(Entry.correlationId), EventSource = tostring(Entry.eventSource);\r\n// Keep each invocation/job association: repeated delivery must not erase earlier attempts.\r\nlet Links = Bridge\r\n| where tostring(Entry.stage) == 'Started' and isnotempty(tostring(Entry.jobId))\r\n| summarize Submitted = min(TimeGenerated) by AttemptId, JobId = tolower(tostring(Entry.jobId));\r\nlet Payloads = Traces\r\n| where Message contains 'CERTLC: full message received is:'\r\n| extend Payload = parse_json(extract(@'CERTLC: full message received is:\\s*(.*)$', 1, Message))\r\n| summarize arg_min(TimeGenerated, *) by AttemptId\r\n// Bracket notation preserves the CloudEvent field whose name is a KQL keyword.\r\n| project AttemptId, Certificate = coalesce(tostring(Payload.data.ObjectName), tostring(Payload.subject)),\r\n    EventType = tostring(Payload.type), EventTime = todatetime(Payload['time']);\r\nlet Streams = materialize(AzureDiagnostics\r\n| where TimeGenerated {TimeRange}\r\n| where Category == 'JobStreams' and Resource =~ '{AutomationAccount:name}' and RunbookName_s =~ SelectedRunbookName\r\n| extend JobId = tolower(tostring(JobId_g)), Raw = replace_regex(tostring(ResultDescription), @'\\x1B\\[[0-9;]*[A-Za-z]', '')\r\n| extend Entry = parse_json(extract(@'(\\{.*\\})', 1, Raw))\r\n| extend Message = coalesce(tostring(Entry.message), Raw), Section = coalesce(tostring(Entry.section), StreamType_s),\r\n    Level = coalesce(tostring(Entry.level), StreamType_s), LogTime = coalesce(todatetime(Entry.timestamp), TimeGenerated));\r\nlet Jobs = AzureDiagnostics\r\n| where TimeGenerated {TimeRange}\r\n| where Category == 'JobLogs' and Resource =~ '{AutomationAccount:name}' and RunbookName_s =~ SelectedRunbookName\r\n| summarize arg_max(TimeGenerated, ResultType) by JobId = tolower(tostring(JobId_g))\r\n| project JobId, JobStatus = ResultType, StatusObserved = TimeGenerated;\r\n// Operation outcome is not the same as Automation completion or SMTP delivery.\r\nlet Outcomes = Streams\r\n| summarize Warnings = countif(Level =~ 'Warning'), Errors = countif(Level =~ 'Error'),\r\n    Succeeded = countif(Section startswith 'Dispatcher.' and Message contains 'successfully'),\r\n    // Missing SMTP is not a skipped certificate operation.\r\n    Skipped = countif(Section == 'Dispatcher.Renewal' and Message startswith 'Skipping auto-renewal of certificate'),\r\n    EmailSent = countif(Section == 'Send-NotificationEmail' and Message startswith 'Notification email sent'),\r\n    EmailFailed = countif(Section == 'Send-NotificationEmail' and Level =~ 'Warning') by JobId;\r\nlet Exceptions = AppExceptions\r\n| where TimeGenerated {TimeRange}\r\n| where AppRoleName =~ '{FunctionApp:name}'\r\n| extend AttemptId = coalesce(tostring(Properties.InvocationId), OperationId)\r\n| summarize FunctionErrors = count() by AttemptId;\r\nlet Attempts = Receipts\r\n| join kind=leftouter Links on AttemptId\r\n| join kind=leftouter Payloads on AttemptId\r\n| join kind=leftouter Jobs on JobId\r\n| join kind=leftouter Outcomes on JobId\r\n| join kind=leftouter Exceptions on AttemptId\r\n// JSON tuple prevents ambiguous concatenation; unidentified receipts remain separate.\r\n| extend EventKey = tostring(pack_array(EventSource, CorrelationId, iff(isempty(CorrelationId), AttemptId, ''))),\r\n    JobStatus = coalesce(JobStatus, 'Not observed'),\r\n    OperationOutcome = case(Errors > 0, 'Error logged', Skipped > 0, 'Skipped', Succeeded > 0, 'Success logged', 'Not observed'),\r\n    Notification = case(EmailFailed > 0, 'Delivery warning', EmailSent > 0, 'Sent', 'Not observed'),\r\n    Warnings = coalesce(Warnings, 0), Errors = coalesce(Errors, 0), FunctionErrors = coalesce(FunctionErrors, 0);\n// Workbook formatting encodes user input before KQL substitution, including quotes/newlines.\r\nlet SearchText = trim(@'\\s+', base64_decode_tostring('{JourneySearch:base64}'));\r\n// A matching job selects its whole event so search does not hide sibling retry attempts.\r\nlet MatchingEvents = Attempts\r\n| where isempty(SearchText) or CorrelationId contains SearchText or Certificate contains SearchText\r\n    or JobId contains SearchText or AttemptId contains SearchText or EventType contains SearchText or EventSource contains SearchText\r\n| distinct EventKey;\r\nAttempts\r\n| join kind=leftsemi MatchingEvents on EventKey\r\n// Group by the full event identity, while retaining counts and all observed outcomes.\r\n| summarize FirstReceipt = min(Received), LastObserved = max(StatusObserved),\r\n    // Empty join results do not represent an observed Automation job.\r\n    AttemptIds = make_set(AttemptId), Jobs = make_set_if(JobId, isnotempty(JobId)), Certificates = make_set(Certificate), EventTypes = make_set(EventType),\r\n    JobStates = make_set(JobStatus), Outcomes = make_set(OperationOutcome), Notifications = make_set(Notification),\r\n    Warnings = sum(Warnings), Errors = sum(Errors), FunctionErrors = sum(FunctionErrors)\r\n    by EventKey, CorrelationId, EventSource\r\n| extend Attempts = array_length(AttemptIds), JobCount = array_length(Jobs),\r\n    ObservedDuration = LastObserved - FirstReceipt\r\n// Compact display values avoid raw JSON arrays; retain all diagnostics for selection and export.\r\n| extend Certificate = strcat_array(Certificates, ', '),\r\n    EventType = replace_regex(strcat_array(EventTypes, ', '), @'(CertLC\\.|Microsoft\\.KeyVault\\.)', ''),\r\n    Outcome = strcat_array(Outcomes, ', '), JobStatus = strcat_array(JobStates, ', ')\r\n| project FirstReceipt, Certificate, EventType, Outcome, JobStatus, Attempts, JobCount,\r\n    CorrelationId, Certificates, EventTypes, JobStates, Outcomes, Notifications,\r\n    Warnings, Errors, FunctionErrors, ObservedDuration, EventSource, EventKey\r\n| order by FirstReceipt desc\r\n| take 500",
-              "visualization": "table",
-              "gridSettings": {
-                "filter": true,
-                "labelSettings": [
-                  {
-                    "columnId": "FirstReceipt",
-                    "label": "Received"
-                  },
-                  {
-                    "columnId": "EventType",
-                    "label": "Event type"
-                  },
-                  {
-                    "columnId": "Outcome",
-                    "label": "Operation outcome"
-                  },
-                  {
-                    "columnId": "JobStatus",
-                    "label": "Job status"
-                  },
-                  {
-                    "columnId": "JobCount",
-                    "label": "Jobs"
-                  }
-                ],
-                "rowLimit": 500,
-                "formatters": [
-                  {
-                    "formatter": 5,
-                    "columnMatch": "CorrelationId"
-                  },
-                  {
-                    "formatter": 5,
-                    "columnMatch": "Certificates"
-                  },
-                  {
-                    "formatter": 5,
-                    "columnMatch": "EventTypes"
-                  },
-                  {
-                    "formatter": 5,
-                    "columnMatch": "JobStates"
-                  },
-                  {
-                    "formatter": 5,
-                    "columnMatch": "Outcomes"
-                  },
-                  {
-                    "formatter": 5,
-                    "columnMatch": "Notifications"
-                  },
-                  {
-                    "formatter": 5,
-                    "columnMatch": "Warnings"
-                  },
-                  {
-                    "formatter": 5,
-                    "columnMatch": "Errors"
-                  },
-                  {
-                    "formatter": 5,
-                    "columnMatch": "FunctionErrors"
-                  },
-                  {
-                    "formatter": 5,
-                    "columnMatch": "ObservedDuration"
-                  },
-                  {
-                    "formatter": 5,
-                    "columnMatch": "EventSource"
-                  },
-                  {
-                    "formatter": 5,
-                    "columnMatch": "EventKey"
-                  },
-                  {
-                    "formatOptions": {
-                      "customColumnWidthSetting": "26ch"
-                    },
-                    "columnMatch": "FirstReceipt",
-                    "formatter": 6
-                  },
-                  {
-                    "formatOptions": {
-                      "customColumnWidthSetting": "1fr"
-                    },
-                    "columnMatch": "Certificate",
-                    "formatter": 1
-                  },
-                  {
-                    "formatOptions": {
-                      "customColumnWidthSetting": "1fr"
-                    },
-                    "columnMatch": "EventType",
-                    "formatter": 1
-                  },
-                  {
-                    "formatOptions": {
-                      "customColumnWidthSetting": "1fr"
-                    },
-                    "columnMatch": "Outcome",
-                    "formatter": 1
-                  },
-                  {
-                    "formatOptions": {
-                      "customColumnWidthSetting": "1fr"
-                    },
-                    "columnMatch": "JobStatus",
-                    "formatter": 1
-                  },
-                  {
-                    "formatOptions": {
-                      "customColumnWidthSetting": "8ch"
-                    },
-                    "columnMatch": "Attempts",
-                    "formatter": 1
-                  },
-                  {
-                    "formatOptions": {
-                      "customColumnWidthSetting": "5ch"
-                    },
-                    "columnMatch": "JobCount",
-                    "formatter": 1
-                  }
-                ]
-              },
-              "version": "KqlItem/1.0",
-              "exportToExcelOptions": "all",
-              "resourceType": "microsoft.operationalinsights/workspaces",
-              "showExportToExcel": true,
-              "timeContextFromParameter": "TimeRange",
-              "queryType": 0,
-              "crossComponentResources": [
-                "{LogAnalyticsWorkspace}"
-              ],
-              "title": "Found events (up to 500)",
-              "exportedParameters": [
-                {
-                  "parameterType": 1,
-                  "fieldName": "EventKey",
-                  "parameterName": "SelectedEvent"
-                }
-              ]
-            },
-            "type": 3
-          },
-          {
-            "name": "event-context",
-            "conditionalVisibility": {
-              "comparison": "isNotEqualTo",
-              "value": "",
-              "parameterName": "SelectedEvent"
-            },
-            "content": {
-              "query": "// Test workbook only. Scope every scan to the selected time and existing resources.\r\n// Reuse certlcstats resource selectors instead of pinning Journey to one deployment.\r\n// Match Job History: nested resource names may include the Automation account prefix.\r\nlet SelectedRunbookName = tostring(split('{Runbook:name}', '/')[-1]);\r\nlet Traces = materialize(AppTraces\r\n| where TimeGenerated {TimeRange}\r\n| where AppRoleName =~ '{FunctionApp:name}'\r\n| extend AttemptId = coalesce(tostring(Properties.InvocationId), OperationId)\r\n| where isnotempty(AttemptId));\r\nlet Bridge = Traces\r\n| where Message has 'BridgeCorrelation'\r\n| extend Entry = parse_json(extract(@'(\\{.*\\})', 1, Message))\r\n| where tostring(Entry.recordType) == 'BridgeCorrelation';\r\n// Only receipt records establish event identity. Older Started records used job fallback.\r\nlet Receipts = Bridge\r\n| where tostring(Entry.stage) == 'Received'\r\n| summarize arg_min(TimeGenerated, *) by AttemptId\r\n| project AttemptId, OperationId, Received = TimeGenerated,\r\n    CorrelationId = tostring(Entry.correlationId), EventSource = tostring(Entry.eventSource);\r\n// Keep each invocation/job association: repeated delivery must not erase earlier attempts.\r\nlet Links = Bridge\r\n| where tostring(Entry.stage) == 'Started' and isnotempty(tostring(Entry.jobId))\r\n| summarize Submitted = min(TimeGenerated) by AttemptId, JobId = tolower(tostring(Entry.jobId));\r\nlet Payloads = Traces\r\n| where Message contains 'CERTLC: full message received is:'\r\n| extend Payload = parse_json(extract(@'CERTLC: full message received is:\\s*(.*)$', 1, Message))\r\n| summarize arg_min(TimeGenerated, *) by AttemptId\r\n// Bracket notation preserves the CloudEvent field whose name is a KQL keyword.\r\n| project AttemptId, Certificate = coalesce(tostring(Payload.data.ObjectName), tostring(Payload.subject)),\r\n    EventType = tostring(Payload.type), EventTime = todatetime(Payload['time']);\r\nlet Streams = materialize(AzureDiagnostics\r\n| where TimeGenerated {TimeRange}\r\n| where Category == 'JobStreams' and Resource =~ '{AutomationAccount:name}' and RunbookName_s =~ SelectedRunbookName\r\n| extend JobId = tolower(tostring(JobId_g)), Raw = replace_regex(tostring(ResultDescription), @'\\x1B\\[[0-9;]*[A-Za-z]', '')\r\n| extend Entry = parse_json(extract(@'(\\{.*\\})', 1, Raw))\r\n| extend Message = coalesce(tostring(Entry.message), Raw), Section = coalesce(tostring(Entry.section), StreamType_s),\r\n    Level = coalesce(tostring(Entry.level), StreamType_s), LogTime = coalesce(todatetime(Entry.timestamp), TimeGenerated));\r\nlet Jobs = AzureDiagnostics\r\n| where TimeGenerated {TimeRange}\r\n| where Category == 'JobLogs' and Resource =~ '{AutomationAccount:name}' and RunbookName_s =~ SelectedRunbookName\r\n| summarize arg_max(TimeGenerated, ResultType) by JobId = tolower(tostring(JobId_g))\r\n| project JobId, JobStatus = ResultType, StatusObserved = TimeGenerated;\r\n// Operation outcome is not the same as Automation completion or SMTP delivery.\r\nlet Outcomes = Streams\r\n| summarize Warnings = countif(Level =~ 'Warning'), Errors = countif(Level =~ 'Error'),\r\n    Succeeded = countif(Section startswith 'Dispatcher.' and Message contains 'successfully'),\r\n    // Missing SMTP is not a skipped certificate operation.\r\n    Skipped = countif(Section == 'Dispatcher.Renewal' and Message startswith 'Skipping auto-renewal of certificate'),\r\n    EmailSent = countif(Section == 'Send-NotificationEmail' and Message startswith 'Notification email sent'),\r\n    EmailFailed = countif(Section == 'Send-NotificationEmail' and Level =~ 'Warning') by JobId;\r\nlet Exceptions = AppExceptions\r\n| where TimeGenerated {TimeRange}\r\n| where AppRoleName =~ '{FunctionApp:name}'\r\n| extend AttemptId = coalesce(tostring(Properties.InvocationId), OperationId)\r\n| summarize FunctionErrors = count() by AttemptId;\r\nlet Attempts = Receipts\r\n| join kind=leftouter Links on AttemptId\r\n| join kind=leftouter Payloads on AttemptId\r\n| join kind=leftouter Jobs on JobId\r\n| join kind=leftouter Outcomes on JobId\r\n| join kind=leftouter Exceptions on AttemptId\r\n// JSON tuple prevents ambiguous concatenation; unidentified receipts remain separate.\r\n| extend EventKey = tostring(pack_array(EventSource, CorrelationId, iff(isempty(CorrelationId), AttemptId, ''))),\r\n    JobStatus = coalesce(JobStatus, 'Not observed'),\r\n    OperationOutcome = case(Errors > 0, 'Error logged', Skipped > 0, 'Skipped', Succeeded > 0, 'Success logged', 'Not observed'),\r\n    Notification = case(EmailFailed > 0, 'Delivery warning', EmailSent > 0, 'Sent', 'Not observed'),\r\n    Warnings = coalesce(Warnings, 0), Errors = coalesce(Errors, 0), FunctionErrors = coalesce(FunctionErrors, 0);\n// Query the exact selected event; render values as table text, never interpolated Markdown.\r\nlet SelectedKey = base64_decode_tostring('{SelectedEvent:base64}');\r\nAttempts\r\n| where isnotempty(SelectedKey) and EventKey == SelectedKey\r\n| summarize Certificates = make_set_if(Certificate, isnotempty(Certificate)), EventTypes = make_set_if(EventType, isnotempty(EventType)) by CorrelationId\r\n| project Details = pack_array(\r\n    pack('Field', 'Certificate', 'Value', strcat_array(Certificates, ', ')),\r\n    pack('Field', 'Event type', 'Value', strcat_array(EventTypes, ', ')),\r\n    pack('Field', 'Correlation ID', 'Value', CorrelationId))\r\n| mv-expand Details\r\n| project Field = tostring(Details.Field), Value = coalesce(tostring(Details.Value), 'Not observed')",
-              "visualization": "table",
-              "gridSettings": {
-                "rowLimit": 3,
-                "formatters": [
-                  {
-                    "formatOptions": {
-                      "customColumnWidthSetting": "16ch"
-                    },
-                    "columnMatch": "Field",
-                    "formatter": 1
-                  },
-                  {
-                    "formatOptions": {
-                      "customColumnWidthSetting": "1fr"
-                    },
-                    "columnMatch": "Value",
-                    "formatter": 1
-                  }
-                ]
-              },
-              "version": "KqlItem/1.0",
-              "resourceType": "microsoft.operationalinsights/workspaces",
-              "timeContextFromParameter": "TimeRange",
-              "queryType": 0,
-              "crossComponentResources": [
-                "{LogAnalyticsWorkspace}"
-              ],
-              "title": "Selected event"
-            },
-            "type": 3
-          },
-          {
-            "name": "event-timeline",
-            "conditionalVisibility": {
-              "comparison": "isNotEqualTo",
-              "value": "",
-              "parameterName": "SelectedEvent"
-            },
-            "content": {
-              "query": "// Test workbook only. Scope every scan to the selected time and existing resources.\r\n// Reuse certlcstats resource selectors instead of pinning Journey to one deployment.\r\n// Match Job History: nested resource names may include the Automation account prefix.\r\nlet SelectedRunbookName = tostring(split('{Runbook:name}', '/')[-1]);\r\nlet Traces = materialize(AppTraces\r\n| where TimeGenerated {TimeRange}\r\n| where AppRoleName =~ '{FunctionApp:name}'\r\n| extend AttemptId = coalesce(tostring(Properties.InvocationId), OperationId)\r\n| where isnotempty(AttemptId));\r\nlet Bridge = Traces\r\n| where Message has 'BridgeCorrelation'\r\n| extend Entry = parse_json(extract(@'(\\{.*\\})', 1, Message))\r\n| where tostring(Entry.recordType) == 'BridgeCorrelation';\r\n// Only receipt records establish event identity. Older Started records used job fallback.\r\nlet Receipts = Bridge\r\n| where tostring(Entry.stage) == 'Received'\r\n| summarize arg_min(TimeGenerated, *) by AttemptId\r\n| project AttemptId, OperationId, Received = TimeGenerated,\r\n    CorrelationId = tostring(Entry.correlationId), EventSource = tostring(Entry.eventSource);\r\n// Keep each invocation/job association: repeated delivery must not erase earlier attempts.\r\nlet Links = Bridge\r\n| where tostring(Entry.stage) == 'Started' and isnotempty(tostring(Entry.jobId))\r\n| summarize Submitted = min(TimeGenerated) by AttemptId, JobId = tolower(tostring(Entry.jobId));\r\nlet Payloads = Traces\r\n| where Message contains 'CERTLC: full message received is:'\r\n| extend Payload = parse_json(extract(@'CERTLC: full message received is:\\s*(.*)$', 1, Message))\r\n| summarize arg_min(TimeGenerated, *) by AttemptId\r\n// Bracket notation preserves the CloudEvent field whose name is a KQL keyword.\r\n| project AttemptId, Certificate = coalesce(tostring(Payload.data.ObjectName), tostring(Payload.subject)),\r\n    EventType = tostring(Payload.type), EventTime = todatetime(Payload['time']);\r\nlet Streams = materialize(AzureDiagnostics\r\n| where TimeGenerated {TimeRange}\r\n| where Category == 'JobStreams' and Resource =~ '{AutomationAccount:name}' and RunbookName_s =~ SelectedRunbookName\r\n| extend JobId = tolower(tostring(JobId_g)), Raw = replace_regex(tostring(ResultDescription), @'\\x1B\\[[0-9;]*[A-Za-z]', '')\r\n| extend Entry = parse_json(extract(@'(\\{.*\\})', 1, Raw))\r\n| extend Message = coalesce(tostring(Entry.message), Raw), Section = coalesce(tostring(Entry.section), StreamType_s),\r\n    Level = coalesce(tostring(Entry.level), StreamType_s), LogTime = coalesce(todatetime(Entry.timestamp), TimeGenerated));\r\nlet Jobs = AzureDiagnostics\r\n| where TimeGenerated {TimeRange}\r\n| where Category == 'JobLogs' and Resource =~ '{AutomationAccount:name}' and RunbookName_s =~ SelectedRunbookName\r\n| summarize arg_max(TimeGenerated, ResultType) by JobId = tolower(tostring(JobId_g))\r\n| project JobId, JobStatus = ResultType, StatusObserved = TimeGenerated;\r\n// Operation outcome is not the same as Automation completion or SMTP delivery.\r\nlet Outcomes = Streams\r\n| summarize Warnings = countif(Level =~ 'Warning'), Errors = countif(Level =~ 'Error'),\r\n    Succeeded = countif(Section startswith 'Dispatcher.' and Message contains 'successfully'),\r\n    // Missing SMTP is not a skipped certificate operation.\r\n    Skipped = countif(Section == 'Dispatcher.Renewal' and Message startswith 'Skipping auto-renewal of certificate'),\r\n    EmailSent = countif(Section == 'Send-NotificationEmail' and Message startswith 'Notification email sent'),\r\n    EmailFailed = countif(Section == 'Send-NotificationEmail' and Level =~ 'Warning') by JobId;\r\nlet Exceptions = AppExceptions\r\n| where TimeGenerated {TimeRange}\r\n| where AppRoleName =~ '{FunctionApp:name}'\r\n| extend AttemptId = coalesce(tostring(Properties.InvocationId), OperationId)\r\n| summarize FunctionErrors = count() by AttemptId;\r\nlet Attempts = Receipts\r\n| join kind=leftouter Links on AttemptId\r\n| join kind=leftouter Payloads on AttemptId\r\n| join kind=leftouter Jobs on JobId\r\n| join kind=leftouter Outcomes on JobId\r\n| join kind=leftouter Exceptions on AttemptId\r\n// JSON tuple prevents ambiguous concatenation; unidentified receipts remain separate.\r\n| extend EventKey = tostring(pack_array(EventSource, CorrelationId, iff(isempty(CorrelationId), AttemptId, ''))),\r\n    JobStatus = coalesce(JobStatus, 'Not observed'),\r\n    OperationOutcome = case(Errors > 0, 'Error logged', Skipped > 0, 'Skipped', Succeeded > 0, 'Success logged', 'Not observed'),\r\n    Notification = case(EmailFailed > 0, 'Delivery warning', EmailSent > 0, 'Sent', 'Not observed'),\r\n    Warnings = coalesce(Warnings, 0), Errors = coalesce(Errors, 0), FunctionErrors = coalesce(FunctionErrors, 0);\n// Selection is an encoded source/id tuple, so equal IDs from different producers stay separate.\r\nlet SelectedKey = base64_decode_tostring('{SelectedEvent:base64}');\r\nlet Selected = materialize(Attempts | where isnotempty(SelectedKey) and EventKey == SelectedKey);\r\n// One parent per invocation, even if several job associations are observed for that invocation.\r\nlet SelectedInvocations = materialize(Selected\r\n| summarize Received = min(Received), FunctionErrors = max(FunctionErrors) by AttemptId, OperationId\r\n| order by Received asc, AttemptId asc\r\n| serialize AttemptNumber = row_number());\r\nlet SelectedJobs = materialize(Selected | where isnotempty(JobId)\r\n| distinct AttemptId, JobId, Submitted, JobStatus, OperationOutcome, Notification);\r\n// Explicit parents mirror the native Id/ParentId tree used by the production Job History.\r\nlet Parents = union\r\n    // Keep identity in the context view; parent details retain source, notifications and diagnostics.\r\n    (Selected | summarize Time = min(Received), Notifications = make_set(Notification), Warnings = sum(Warnings), Errors = sum(Errors), FunctionErrors = sum(FunctionErrors) by CorrelationId, EventSource\r\n        | project Id = 'event', ParentId = '', Name = 'Event',\r\n            Time, Component = 'Event', Stage = 'Correlation', FinalResult = 'info',\r\n            Message = strcat('Source: ', EventSource, '\\nNotifications: ', strcat_array(Notifications, ', '), '\\nWarnings: ', Warnings, '; Runbook errors: ', Errors, '; Function errors: ', FunctionErrors), AttemptId = '', JobId = ''),\r\n    (SelectedInvocations\r\n        | project Id = strcat('attempt:', AttemptId), ParentId = 'event', Name = strcat('Attempt ', AttemptNumber),\r\n            Time = Received, Component = 'Attempt', Stage = 'Receipt', FinalResult = iff(FunctionErrors > 0, 'failed', 'info'),\r\n            Message = strcat('Function invocation: ', AttemptId), AttemptId, JobId = ''),\r\n    (SelectedInvocations\r\n        | project Id = strcat('function:', AttemptId), ParentId = strcat('attempt:', AttemptId), Name = 'Function activity',\r\n            Time = Received, Component = 'Function', Stage = 'Invocation', FinalResult = iff(FunctionErrors > 0, 'failed', 'info'),\r\n            Message = strcat('Operation ID: ', OperationId), AttemptId, JobId = ''),\r\n    (SelectedJobs\r\n        // Show the full job ID once in parent details instead of repeating it across every leaf.\r\n        | project Id = strcat('job:', AttemptId, ':', JobId), ParentId = strcat('attempt:', AttemptId), Name = 'Automation job',\r\n            Time = Submitted, Component = 'Automation', Stage = 'Job',\r\n            FinalResult = case(JobStatus =~ 'Failed', 'failed', JobStatus in~ ('Stopped', 'Suspended'), 'warning', JobStatus =~ 'Completed', 'success', 'info'),\r\n            Message = strcat('Job ID: ', JobId, '\\nState: ', JobStatus, '; Operation: ', OperationOutcome, '; Notification: ', Notification), AttemptId, JobId);\r\n// Cap only leaf records. Parents remain present even when the detail stream is truncated.\r\nlet Records = union\r\n    (Selected | where isnotnull(EventTime) | distinct EventTime, EventType\r\n        | project ParentId = 'event', Time = EventTime, Component = 'Event payload', Stage = 'Producer timestamp (not delivery)',\r\n            Level = 'Information', Message = EventType, AttemptId = '', JobId = ''),\r\n    (Traces | join kind=inner SelectedInvocations on AttemptId, OperationId\r\n        | project ParentId = strcat('function:', AttemptId), Time = TimeGenerated, Component = 'Function', Stage = tostring(Properties.Category),\r\n            Level = coalesce(tostring(Properties.LogLevel), 'Information'), Message, AttemptId, JobId = ''),\r\n    // Detail scans use the same shared resource parameters as the summary.\r\n    (AppExceptions | where TimeGenerated {TimeRange} | where AppRoleName =~ '{FunctionApp:name}'\r\n        | extend AttemptId = coalesce(tostring(Properties.InvocationId), OperationId)\r\n        | join kind=inner SelectedInvocations on AttemptId, OperationId\r\n        | project ParentId = strcat('function:', AttemptId), Time = TimeGenerated, Component = 'Function', Stage = 'Exception', Level = 'Error', Message = OuterMessage, AttemptId, JobId = ''),\r\n    (Streams | join kind=inner SelectedJobs on JobId\r\n        | project ParentId = strcat('job:', AttemptId, ':', JobId), Time = LogTime, Component = 'Runbook', Stage = Section, Level, Message, AttemptId, JobId),\r\n    (AzureDiagnostics | where TimeGenerated {TimeRange}\r\n        // Reuse the normalized leaf name so portal resource formatting cannot hide job children.\r\n        | where Category == 'JobLogs' and Resource =~ '{AutomationAccount:name}' and RunbookName_s =~ SelectedRunbookName\r\n        | extend JobId = tolower(tostring(JobId_g)) | join kind=inner SelectedJobs on JobId\r\n        | project ParentId = strcat('job:', AttemptId, ':', JobId), Time = TimeGenerated, Component = 'Automation', Stage = 'Job status',\r\n            Level = iff(ResultType in~ ('Failed', 'Stopped', 'Suspended'), 'Warning', 'Information'),\r\n            Message = ResultType, AttemptId, JobId)\r\n| order by Time asc, ParentId asc, Stage asc, Message asc\r\n| take 2000\r\n// Row numbers keep identical timestamps/messages distinct rather than colliding as tree IDs.\r\n| serialize RecordNumber = row_number()\r\n| project Id = strcat('record:', RecordNumber), ParentId,\r\n    // Time already has a dedicated column; use the node label for log origin instead.\r\n    Name = case(Component == 'Runbook', Stage, Component == 'Function', strcat('Function / ', Level), Stage),\r\n    Time, Component, Stage, FinalResult = case(Level =~ 'Error', 'failed', Level =~ 'Warning', 'warning', 'info'), Message, AttemptId, JobId;\r\nunion Parents, Records\r\n| order by Time asc, Id asc\r\n// Lead with the expandable result icon, keeping the node name beside it and IDs hidden.\r\n| project FinalResult, Name, Time, Component, Stage, Message, AttemptId, JobId, Id, ParentId",
-              "visualization": "table",
-              "gridSettings": {
-                "filter": true,
-                "formatters": [
-                  {
-                    "formatter": 5,
-                    "columnMatch": "Id"
-                  },
-                  {
-                    "formatter": 5,
-                    "columnMatch": "ParentId"
-                  },
-                  {
-                    "formatter": 5,
-                    "columnMatch": "AttemptId"
-                  },
-                  {
-                    "formatter": 5,
-                    "columnMatch": "JobId"
-                  },
-                  {
-                    "formatter": 5,
-                    "columnMatch": "Component"
-                  },
-                  {
-                    "formatter": 5,
-                    "columnMatch": "Stage"
-                  },
-                  {
-                    "formatter": 11,
-                    "columnMatch": "FinalResult"
-                  },
-                  {
-                    "formatOptions": {
-                      "customColumnWidthSetting": "22ch"
-                    },
-                    "columnMatch": "Name",
-                    "formatter": 1
-                  },
-                  {
-                    "dateFormat": {
-                      "formatName": "shortDateTimeNoMsPattern",
-                      "showUtcTime": null
-                    },
-                    "formatOptions": {
-                      "customColumnWidthSetting": "20ch"
-                    },
-                    "columnMatch": "Time",
-                    "formatter": 6
-                  },
-                  {
-                    "formatOptions": {
-                      "customColumnWidthSetting": "50%"
-                    },
-                    "columnMatch": "Message",
-                    "formatter": 1
-                  }
-                ],
-                "rowLimit": 10000,
-                "hierarchySettings": {
-                  "expandTopLevel": true,
-                  "treeType": 0,
-                  "expanderColumn": "FinalResult",
-                  "parentColumn": "ParentId",
-                  "idColumn": "Id"
-                }
-              },
-              "version": "KqlItem/1.0",
-              "exportToExcelOptions": "all",
-              "resourceType": "microsoft.operationalinsights/workspaces",
-              "showExportToExcel": true,
-              "timeContextFromParameter": "TimeRange",
-              "queryType": 0,
-              "crossComponentResources": [
-                "{LogAnalyticsWorkspace}"
-              ],
-              "showExpandCollapseGrid": true,
-              "title": "Selected event: execution tree (up to 2000 log records)"
-            },
-            "type": 3
-          }
-        ],
-        "groupType": "editable",
-        "version": "NotebookGroup/1.0"
-      },
-      "type": 12
     }
   ],
   "fallbackResourceIds": [

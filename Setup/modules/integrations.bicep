@@ -11,6 +11,7 @@ param automationPrincipalId string
 param functionAppPrincipalId string
 param dataCollectionRuleName string
 param applicationInsightsName string
+param logAnalyticsWorkspaceId string
 param tags object
 
 // Built-in role IDs are centralized here because this module owns every cross-service assignment.
@@ -61,6 +62,21 @@ resource eventGridSystemTopic 'Microsoft.EventGrid/systemTopics@2025-02-15' = {
     topicType: 'Microsoft.KeyVault.Vaults'
   }
   tags: tags
+}
+
+// Failure logs complement native metrics; successful deliveries are correlated at the Function.
+resource eventGridDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
+  name: 'diag-${eventGridSystemTopic.name}'
+  scope: eventGridSystemTopic
+  properties: {
+    workspaceId: logAnalyticsWorkspaceId
+    logs: [
+      {
+        category: 'DeliveryFailures'
+        enabled: true
+      }
+    ]
+  }
 }
 
 // Resolve runtime principal IDs by literal keys so loop collections remain deployment-start safe.

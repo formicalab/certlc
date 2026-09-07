@@ -43,7 +43,15 @@ resource queueDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-prev
     logAnalyticsDestinationType: 'Dedicated'
     logs: [
       {
+        category: 'StorageRead'
+        enabled: true
+      }
+      {
         category: 'StorageWrite'
+        enabled: true
+      }
+      {
+        category: 'StorageDelete'
         enabled: true
       }
     ]
@@ -126,19 +134,23 @@ var automationFailureQuery = join([
   'AzureDiagnostics'
   '| where _ResourceId =~ "${automationAccountId}"'
   '| where Category == "JobLogs"'
-  '| where RunbookName_s in~ ("${runbookName}", "certlcstats")'
+  // Statistics have their own success-based recovery condition, not an event-count alert.
+  '| where RunbookName_s =~ "${runbookName}"'
   '| summarize arg_max(TimeGenerated, ResultType) by JobId_g'
   '| where ResultType in~ ("Failed", "Stopped", "Suspended")'
 ], '\n')
 
 var staleStatisticsQuery = join([
   'AzureDiagnostics'
+  '| where TimeGenerated > ago(2h)'
   '| where _ResourceId =~ "${automationAccountId}"'
   '| where Category == "JobLogs"'
   '| where RunbookName_s =~ "certlcstats"'
-  '| where ResultType =~ "Completed"'
-  '| summarize LastSuccess = max(TimeGenerated)'
-  '| extend AggregatedValue = iff(isnull(LastSuccess) or LastSuccess < ago(2h), 1, 0)'
+  // Ignore transitional states. Only a strictly later completion clears a failure.
+  '| summarize LastSuccess = maxif(TimeGenerated, ResultType =~ "Completed"), LastFailure = maxif(TimeGenerated, ResultType in~ ("Failed", "Stopped", "Suspended"))'
+  // Ungrouped summarize returns a row even with no input: missing data must remain unhealthy.
+  // As a failure ages out, any earlier success is already outside the same window.
+  '| extend AggregatedValue = iff(isnull(LastSuccess) or LastSuccess < ago(2h) or (isnotnull(LastFailure) and LastFailure >= LastSuccess), 1, 0)'
   '| where AggregatedValue > 0'
 ], '\n')
 
@@ -157,7 +169,7 @@ var scheduledQueryAlertDefinitions = [
   {
     key: 'automation-failure'
     displayName: 'CertLC Automation job failed'
-    description: 'A CertLC lifecycle or statistics runbook ended in a failed, stopped, or suspended state.'
+    description: 'A CertLC lifecycle runbook ended in a failed, stopped, or suspended state. Statistics are monitored separately with success-based recovery.'
     query: automationFailureQuery
     severity: 2
     evaluationFrequency: 'PT5M'
@@ -166,12 +178,13 @@ var scheduledQueryAlertDefinitions = [
     timeAggregation: 'Count'
   }
   {
+    // Preserve the existing resource identity while broadening it to statistics health.
     key: 'statistics-stale'
-    displayName: 'CertLC statistics are stale'
-    description: 'The certlcstats runbook has not completed successfully within two hours.'
+    displayName: 'CertLC statistics are unhealthy'
+    description: 'The certlcstats runbook failed, stopped, or suspended without a later successful completion, or has no successful completion within two hours. Recovery requires a later successful run.'
     query: staleStatisticsQuery
     severity: 2
-    evaluationFrequency: 'PT15M'
+    evaluationFrequency: 'PT5M'
     windowSize: 'PT2H'
     metricMeasureColumn: 'AggregatedValue'
     timeAggregation: 'Maximum'
@@ -208,7 +221,8 @@ module scheduledQueryAlerts 'br/public:avm/res/insights/scheduled-query-rule:0.6
     evaluationFrequency: definition.evaluationFrequency
     windowSize: definition.windowSize
     severity: definition.severity
-    autoMitigate: true
+    // Lifecycle failures are stateless for now: window expiry must not report recovery.
+    autoMitigate: definition.key != 'automation-failure'
     // Fresh workspaces may not expose these tables until their first diagnostic record arrives.
     skipQueryValidation: true
     tags: tags

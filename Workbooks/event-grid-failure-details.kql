@@ -1,0 +1,26 @@
+// Failure columns may not exist until diagnostic logging produces its first record.
+// Use the selected topic's actual source, never a job ID or an Event Grid systemId.
+let EventGridFailures = materialize(AzureDiagnostics
+| where TimeGenerated {TimeRange}
+| where Category == 'DeliveryFailures' and _ResourceId =~ '{EventGridTopic}'
+| extend Extra = column_ifexists('AdditionalFields', dynamic({}))
+| extend Raw = coalesce(tostring(column_ifexists('message_s', '')), tostring(column_ifexists('Message', '')), tostring(Extra.message)),
+    EventSubscription = coalesce(tostring(column_ifexists('eventSubscriptionName_s', '')), tostring(Extra.eventSubscriptionName))
+| extend CorrelationId = extract(@'(?:^|[,;]\s*|Message:)id=([^,;\s]+)', 1, Raw),
+    FailureOutcome = extract(@'(?:^|[,;]\s*|Message:)outcome=([^,;]+)', 1, Raw),
+    DeliveryCount = tolong(extract(@'(?:^|[,;]\s*)deliveryCount=(\d+)', 1, Raw)),
+    LatencyMs = todouble(extract(@'(?:^|[,;]\s*)latencyInMs=([\d.]+)', 1, Raw)),
+    EventType = extract(@'(?:^|[,;]\s*)eventType=([^,;\s]+)', 1, Raw),
+    EventTime = todatetime(extract(@'(?:^|[,;]\s*)eventTime=([^,;]+)', 1, Raw)),
+    EventSource = tolower('{EventGridSource}')
+// Unknown identities stay isolated and still offer their raw diagnostic record.
+| extend EventKey = tostring(pack_array(EventSource, CorrelationId,
+    iff(isempty(CorrelationId), strcat('eventgrid:', hash_sha256(strcat(TimeGenerated, '|', EventSubscription, '|', Raw))), '')))
+| project TimeGenerated, EventKey, CorrelationId, EventSource, EventSubscription,
+    FailureOutcome = coalesce(FailureOutcome, 'Not parsed'), DeliveryCount, LatencyMs, EventType, EventTime, Raw);
+let SelectedKey = base64_decode_tostring('{SelectedFailureEvent:base64}');
+EventGridFailures
+| where isnotempty(SelectedKey) and EventKey == SelectedKey
+| project Time = TimeGenerated, EventSubscription, FailureOutcome, CorrelationId, DeliveryCount, LatencyMs, EventType, Raw
+| order by Time asc
+| take 500

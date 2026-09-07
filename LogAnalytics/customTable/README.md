@@ -9,7 +9,7 @@ This folder contains an example payload and the **KQL transformation** applied t
 | File | Purpose |
 |------|---------|
 | `certstats-schema.json` | Example records documenting the ingestion payload |
-| `certlcstats.transformation` | KQL transformation applied by the Data Collection Rule to incoming records (parses string dates and sets `TimeGenerated`) |
+| `certlcstats.transformation` | Reference copy of the DCR transformation (parses string dates and sets `TimeGenerated`); keep it aligned with the inline Bicep definition |
 
 ## What the Bicep deployment creates
 
@@ -17,7 +17,7 @@ This folder contains an example payload and the **KQL transformation** applied t
 - **Data Collection Endpoint** (DCE) for log ingestion
 - **Data Collection Rule** (DCR) with:
   - Stream declaration `Custom-certlcstats_CL` *(case-sensitive)*
-  - The transformation from `certlcstats.transformation`
+  - The inline transformation in `Setup/modules/observability.bicep`, mirrored by `certlcstats.transformation`
   - Destination: the custom table in the Log Analytics workspace
 - **Role assignment** `Monitoring Metrics Publisher` on the DCR for the Automation Account's managed identity
 - **Automation variables** read by `certlcstats.ps1`:
@@ -38,8 +38,8 @@ certlcstats_CL
 | project TimeGenerated, Name, Thumbprint, Subject, Template, Expires
 ```
 
-The Statistics tab in [`Workbooks/certlcstats.workbook`](../../Workbooks/certlcstats.workbook) consumes this table to render the certificate inventory dashboard. Event Journey, Job logs and Function bridge use existing operational telemetry instead (`AppTraces`, `AppExceptions` and `AzureDiagnostics`); adding Journey does not change this table, its schema or ingestion. The Bicep deployment resolves the workbook's resource-ID tokens and publishes the complete workbook. See the [query index](../../Workbooks/README.md) for the standalone queries matching each view.
+The Statistics tab in [`Workbooks/certlcstats.workbook`](../../Workbooks/certlcstats.workbook) consumes this table to render the certificate inventory dashboard. Event Journey, Job Logs and Function Bridge Logs use operational telemetry (`AppTraces`, `AppExceptions` and `AzureDiagnostics`). EventGrid adds native metrics, delivery-failure logs and labeled Function receipt evidence. Queue combines `StorageQueueLogs`, Function-host attempts, live approximate backlog and account-wide native metrics. Journey correlates host message/dequeue observations by invocation ID alongside Event Grid failures and Automation jobs. These views do not change this table, its schema or ingestion. Bicep resolves nine resource-ID placeholders and the fallback workspace scope; queue read/write/delete logs are enabled by the alerts module and are not backfilled. See the [query index](../../Workbooks/README.md) for the 35 standalone queries matching the workbook.
 
 ## Modifying schema or transformation
 
-Edit the JSON / KQL files in this folder, then redeploy `Setup/certlc.bicep`. Do **not** edit the table or DCR directly in the portal &mdash; the next Bicep deployment will overwrite portal changes.
+Edit the shared `certlcDataColumns` schema and/or inline `transformKql` in [Setup/modules/observability.bicep](../../Setup/modules/observability.bicep). Update the sample JSON and reference transformation in this folder to match, and adjust [Runbooks/certlcstats.ps1](../../Runbooks/certlcstats.ps1) and affected workbook queries when the payload changes. Validate and redeploy the infrastructure after reviewing the changes. The reference JSON and KQL files are not loaded by Bicep, so editing them alone does not alter the deployed table or DCR. Do **not** edit the table or DCR directly in the portal &mdash; the next Bicep deployment will overwrite portal changes.

@@ -223,6 +223,7 @@ module integrations './modules/integrations.bicep' = {
     functionAppPrincipalId: functionApp.outputs.principalId
     dataCollectionRuleName: dataCollectionRuleName
     applicationInsightsName: applicationInsightsName
+    logAnalyticsWorkspaceId: observability.outputs.logAnalyticsWorkspaceId
     tags: commonTags
   }
 }
@@ -235,6 +236,9 @@ module workbook './modules/workbook.bicep' = {
     automationAccountId: automation.outputs.id
     runbookName: runbookName
     functionAppId: functionApp.outputs.id
+    eventGridSystemTopicId: integrations.outputs.eventGridSystemTopicId
+    eventGridSourceId: keyVault.outputs.id
+    queueStorageAccountId: storage.outputs.storageAccountId
     tags: commonTags
   }
 }

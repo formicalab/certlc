@@ -1,8 +1,9 @@
-# Keep the event sample; exclude temporary test scripts and artifacts.
+# Keep the event sample and maintained regression suite; exclude temporary artifacts.
 Tests/
 !Tests/
 Tests/*
 !Tests/sample-eventgrideventschema.json
+!Tests/certlc-refactoring.tests.ps1
 # Ignore all .vscode folders and their contents
 .vscode/
 # Local Azure validation, deployment plans and resource snapshots are not release source.

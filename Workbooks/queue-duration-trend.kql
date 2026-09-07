@@ -1,0 +1,26 @@
+// Queue operations are requests, not unique messages. Never infer backlog from request totals.
+let QueueOperations = materialize(StorageQueueLogs
+| where TimeGenerated {TimeRange}
+| where _ResourceId =~ '{QueueService}'
+| extend ParsedUri = parse_url(Uri)
+| extend Queue = tostring(split(tostring(ParsedUri.Path), '/')[1])
+| where Queue in ('certlc', 'certlc-poison')
+| extend HttpStatus = toint(StatusCode),
+    RequestId = tostring(column_ifexists('RequestIdHeader', '')),
+    ClientRequestId = tostring(column_ifexists('ClientRequestId', '')),
+    Authentication = tostring(column_ifexists('AuthenticationType', '')),
+    Caller = tostring(column_ifexists('RequesterObjectId', ''))
+// Exclude URI query strings: pop receipts and signatures must not appear in workbook exports.
+| extend RequestPath = tostring(ParsedUri.Path), IsFailure = HttpStatus >= 400,
+    OperationKey = tostring(pack_array(TimeGenerated, RequestId, ClientRequestId, OperationName, tostring(ParsedUri.Path), StatusCode))
+| project TimeGenerated, Queue, OperationName, HttpStatus, StatusText, IsFailure,
+    DurationMs, ServerLatencyMs, RequestId, ClientRequestId, Authentication, Caller, RequestPath, OperationKey);
+let QueueSelection=base64_decode_tostring('{QueueFilter:base64}');
+let SearchText=trim(@'\s+',base64_decode_tostring('{QueueSearch:base64}'));
+let FilteredQueueOperations=QueueOperations
+| where QueueSelection == 'all' or Queue == QueueSelection
+| where isempty(SearchText) or OperationName contains SearchText or StatusText contains SearchText
+    or RequestId contains SearchText or ClientRequestId contains SearchText or RequestPath contains SearchText;
+FilteredQueueOperations
+| summarize P95DurationMs=percentile(DurationMs,95) by Time=bin(TimeGenerated,5m),Queue
+| order by Time asc
