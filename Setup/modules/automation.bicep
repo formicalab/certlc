@@ -7,7 +7,6 @@ param hybridWorkerGroupName string
 param runbookName string
 param runtimeEnvironmentName string
 param scheduleStartTime string
-param enableStatsSchedule bool
 param ca string
 param pfxRootFolder string
 param smtpFrom string
@@ -82,11 +81,11 @@ resource automationAccount 'Microsoft.Automation/automationAccounts@2024-10-23' 
     tags: tags
   }
 
-  // Keep the schedule resource available even when an environment disables its runbook link.
+  // Link this schedule manually only after publishing certlcstats and preparing the Hybrid Worker.
   resource scheduleCertLCStats 'schedules@2024-10-23' = {
     name: 'schedule-certlcstats-hourly'
     properties: {
-      description: 'Runs certlcstats every hour to collect certificate statistics'
+      description: 'Hourly certificate statistics schedule; link to certlcstats after publishing the runbook'
       startTime: scheduleStartTime
       frequency: 'Hour'
       interval: 1
@@ -94,18 +93,6 @@ resource automationAccount 'Microsoft.Automation/automationAccounts@2024-10-23' 
     }
   }
 
-  resource jobScheduleCertLCStats 'jobSchedules@2024-10-23' = if (enableStatsSchedule) {
-    name: guid(automationAccount.id, 'certlcstats-schedule')
-    properties: {
-      runbook: {
-        name: runbookCertLCStats.name
-      }
-      schedule: {
-        name: scheduleCertLCStats.name
-      }
-      runOn: hybridWorkerGroup.name
-    }
-  }
 }
 
 // Values are JSON-string encoded because the Automation variables API expects quoted string payloads.

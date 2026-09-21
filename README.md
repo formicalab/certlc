@@ -51,7 +51,7 @@ CertLC is an event-driven certificate lifecycle management solution that integra
 |-----------|----------------|
 | Event Grid and Storage Queue | Event Grid sends Key Vault near-expiry events to the queue; external callers place custom creation and revocation requests on the same queue |
 | Function App (`CertLCBridge`) | Serialize each queue message and start the configured Automation runbook directly with `Start-AzAutomationRunbook`; includes `OutboundTester` for connectivity checks |
-| Automation Account | Host `certlc.ps1` for creation, renewal, and revocation, `certlcstats.ps1` for inventory collection, and its linked hourly statistics schedule |
+| Automation Account | Host `certlc.ps1` for creation, renewal, and revocation, `certlcstats.ps1` for inventory collection, and an hourly schedule linked manually after runbook publication |
 | Hybrid Worker | Run the PowerShell 7.6 runbooks with network access to Azure private endpoints, Active Directory, the Enterprise CA, and the PFX file location |
 | Enterprise CA | Issue complete certificate chains and process enrollment and revocation requests through AD CS RPC/DCOM interfaces |
 | Key Vault | Hold versioned certificates, private keys, complete certificate chains, and lifecycle tags |
