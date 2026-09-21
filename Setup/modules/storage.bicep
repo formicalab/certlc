@@ -59,6 +59,10 @@ resource storageAccount 'Microsoft.Storage/storageAccounts@2026-04-01' = {
       name: 'certlc'
       properties: {}
     }
+    resource poisonQueue 'queues' = {
+      name: 'certlc-poison'
+      properties: {}
+    }
   }
   tags: tags
 }

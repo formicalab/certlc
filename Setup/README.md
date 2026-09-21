@@ -21,7 +21,10 @@ Before deploying, ensure you have:
 4. **Hybrid Worker VM**: A Windows Azure VM configured as an extension-based Hybrid Runbook Worker and registered in the configured worker group. Azure Arc-enabled and non-Azure machines have not been tested and are not supported by this solution. The VM requires:
     - At least 2 CPU cores and 4 GB of RAM
     - A system-assigned managed identity; enable it before adding the VM to the Hybrid Worker Group
-    - PowerShell 7.6 installed and available to the Hybrid Worker
+    - PowerShell 7.6 installed and available to the Hybrid Worker:
+      - On the VM, open **System Properties > Advanced > Environment Variables** and, under **System variables** (not **User variables**), create `powershell_7_6_path` with the value `C:\Program Files\PowerShell\7\pwsh.exe`.
+      - Verify that `pwsh.exe` exists at that path. If PowerShell is installed elsewhere, use its actual full executable path instead.
+      - If the Hybrid Worker service is already installed, restart **HybridWorkerService** after setting the variable and before testing runbooks so it picks up the change. Restart the VM if the service still does not pick up the updated environment.
     - Az PowerShell 15.1.0 available to PowerShell 7.6. Both runbooks directly import `Az.Accounts` and `Az.KeyVault`; the main runbook no longer directly imports `Az.Storage` or `Az.Resources`. The deployment still provisions the full default Az package
     - Domain membership (or an equivalent trust and identity configuration) with DNS, Kerberos, and LDAP connectivity to Active Directory; the runbooks query certificate templates through LDAP and resolve domain principals used to protect exported PFX files
     - RPC connectivity to the issuing Enterprise CA for certificate enrollment and revocation: TCP 135 for the RPC endpoint mapper and the dynamic RPC port range configured on the CA (TCP 49152-65535 by default on current Windows Server versions)
@@ -48,6 +51,7 @@ Before deploying, ensure you have:
     ```powershell
     # Register the providers used by the templates and verify each registration completes.
     @(
+      'Microsoft.AlertsManagement'
       'Microsoft.Automation'
       'Microsoft.EventGrid'
       'Microsoft.Insights'
@@ -399,6 +403,8 @@ workbook-only upgrade. Historical telemetry is not rewritten by either deploymen
 #### Function Queue Retry and Poison Handling
 
 Event Grid delivery retries end once an event reaches the `certlc` queue. From that point, the Function queue trigger owns retry behavior. The deployed [host.json](../Functions/CertLCBridge/host.json) allows five processing attempts (`maxDequeueCount: 5`) with a 30-second delay between unsuccessful Function invocations (`visibilityTimeout: 00:00:30`). Each attempt starts a separate Automation job. After the fifth failure, the Functions host moves the message to the automatically named `certlc-poison` queue and stops retrying it.
+
+The storage template creates both `certlc` and `certlc-poison` up front, so the workbook can show an empty poison queue before any message exhausts its retries instead of displaying `QueueNotFound`. This does not change retry behavior or clear existing messages. For an existing deployment where `certlc-poison` is absent, create that queue in the deployed Storage Account under **Data storage > Queues > + Queue**, or deploy the updated storage template, then refresh the workbook.
 
 Change these defaults in `host.json` before publishing the Function, or override them per environment with Function App settings:
 
