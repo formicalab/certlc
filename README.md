@@ -169,8 +169,8 @@ CertLC/
 ├── Runbooks/                    # Automation runbooks
 │   ├── certlc.ps1              # Main certificate operations runbook
 │   ├── certlcstats.ps1         # Certificate statistics collection
-│   ├── normalnotification.html # Email template for successful operations
-│   └── errornotification.html  # Email template for failures
+│   ├── normalnotification.html # Success email reference only; not used live
+│   └── errornotification.html  # Error email reference only; not used live
 ├── LogAnalytics/               # Custom table configuration
 │   └── customTable/            # Schema and transformation for certlcstats_CL table
 ├── Workbooks/                  # Azure Monitor workbooks

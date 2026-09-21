@@ -199,10 +199,6 @@ $script:CertificateNotificationContext = [ordered]@{}
 
 #region ### Write-CertLCLog ###
 
-###############################
-# FUNCTIONS - Write-CertLCLog #
-###############################
-
 <#
 
 .SYNOPSIS
@@ -228,11 +224,8 @@ $script:CertificateNotificationContext = [ordered]@{}
 .PARAMETER Context
     An optional hashtable of additional context to include in the log entry.
 
-.PARAMETER JsonDepth
-    The maximum depth for JSON serialization of the log entry. Default is 5.
-
 .EXAMPLE
-    Write-CertLCLog -Message "Certificate created successfully" -Level "Information" -Section "Create-Certificate" -CorrelationId $correlationId -Context @{ certName = $certName; vaultName = $vaultName } -JsonDepth 3
+    Write-CertLCLog -Message "Certificate created successfully" -Level "Information" -Section "Create-Certificate" -CorrelationId $correlationId -Context @{ certName = $certName; vaultName = $vaultName }
 
 .NOTES
     The log entry is a single-line JSON object with the following fields:
@@ -257,8 +250,7 @@ function Write-CertLCLog {
         [Parameter()][ValidateSet('Information', 'Warning', 'Error', 'Verbose')][string]$Level = 'Information',
         [Parameter(Mandatory)][string]$Section,
         [Parameter()][string]$CorrelationId,
-        [Parameter()][hashtable]$Context,
-        [Parameter()][int]$JsonDepth = 5
+        [Parameter()][hashtable]$Context
     )
 
     # Execution identity is owned by the runbook, not caller-supplied log context.
@@ -300,10 +292,10 @@ function Write-CertLCLog {
         }
     }
 
-    try { $json = $entry | ConvertTo-Json -Compress -Depth $JsonDepth }
+    try { $json = $entry | ConvertTo-Json -Compress -Depth 5 }
     catch {
         # Drop the problematic context but preserve workbook fields and known correlation.
-        # Serialize only scalar strings here, independently of the caller's requested depth.
+        # Serialize only scalar strings here so the fallback cannot repeat the context failure.
         $fallbackEntry = [ordered]@{
             timestamp = (Get-Date).ToString('o')
             level = 'Error'
@@ -687,15 +679,13 @@ function New-CertLCNotificationBody {
 .PARAMETER JobId
     Optional Automation job identifier included in the message footer.
 
-.NOTES
-    BodyText remains an alias for Summary so existing callers are backward compatible.
 #>
 function Send-SuccessNotification {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Section,
         [Parameter(Mandatory)][string]$Subject,
-        [Parameter(Mandatory)][Alias('BodyText')][string]$Summary,
+        [Parameter(Mandatory)][string]$Summary,
         [Parameter()][System.Collections.IDictionary]$Details,
         [Parameter()][string]$JobId,
         [Parameter()][string[]]$NotifyTo,
@@ -902,15 +892,16 @@ function Write-CertLCLogAndThrow {
     Log section, propagated to Write-CertLCLog. Defaults to 'Invoke-WithRetry'.
 
 .PARAMETER MaxAttempts
-    Total attempts including the first one. Defaults to 4 (initial + 3 retries).
+    Positive total attempts including the first one. Defaults to 4 (initial + 3 retries).
 
 .PARAMETER InitialDelayMs
-    Base delay (ms) before the first retry. Subsequent delays grow exponentially with jitter,
+    Base delay (1-30000 ms) before the first retry. Subsequent delays grow exponentially with jitter,
     capped at 30 seconds. Defaults to 500.
 
 .NOTES
     Retry-After response headers (sent by Key Vault and other Azure services on 429 / 503) are
-    honoured when present and take precedence over the computed backoff.
+    accepted as a delta or HTTP date and take precedence over computed backoff, capped at 30s.
+    Known HTTP status codes take precedence over exception-type retry classification.
 #>
 function Invoke-WithRetry {
     [CmdletBinding()]
@@ -918,8 +909,8 @@ function Invoke-WithRetry {
         [Parameter(Mandatory)][scriptblock]$ScriptBlock,
         [Parameter(Mandatory)][string]$OperationName,
         [Parameter()][string]$Section = 'Invoke-WithRetry',
-        [Parameter()][int]$MaxAttempts = 4,
-        [Parameter()][int]$InitialDelayMs = 500
+        [Parameter()][ValidateRange(1, [int]::MaxValue)][int]$MaxAttempts = 4,
+        [Parameter()][ValidateRange(1, 30000)][int]$InitialDelayMs = 500
     )
 
     # HTTP status codes considered transient.
@@ -939,21 +930,31 @@ function Invoke-WithRetry {
             $retryAfterMs = $null
             $respProp = $ex.PSObject.Properties['Response']
             if ($null -ne $respProp -and $null -ne $respProp.Value) {
-                try { $statusCode = [int]$respProp.Value.StatusCode } catch { $statusCode = $null }
+                try {
+                    if ($null -ne $respProp.Value.StatusCode) { $statusCode = [int]$respProp.Value.StatusCode }
+                }
+                catch { $statusCode = $null }
                 # Retry-After is optional; malformed headers must not mask the original error.
                 try {
                     $ra = $respProp.Value.Headers.RetryAfter
                     if ($null -ne $ra -and $null -ne $ra.Delta) {
-                        $retryAfterMs = [int]$ra.Delta.TotalMilliseconds
+                        $retryAfterMs = $ra.Delta.TotalMilliseconds
+                    }
+                    elseif ($null -ne $ra -and $null -ne $ra.Date) {
+                        $retryAfterMs = [Math]::Max(0.0, ($ra.Date - [DateTimeOffset]::UtcNow).TotalMilliseconds)
                     }
                 }
                 catch { $retryAfterMs = $null }
             }
 
-            # Decide whether this exception is worth retrying.
+            if ($null -eq $statusCode -and $ex -is [System.Net.Http.HttpRequestException] -and $null -ne $ex.StatusCode) {
+                $statusCode = [int]$ex.StatusCode
+            }
+
+            # A known HTTP status is authoritative; classify by exception only without one.
             $shouldRetry = $false
-            if ($null -ne $statusCode -and $retryableHttp -contains $statusCode) {
-                $shouldRetry = $true
+            if ($null -ne $statusCode) {
+                $shouldRetry = $retryableHttp -contains $statusCode
             }
             elseif ($ex -is [System.Net.Http.HttpRequestException] -or
                 $ex -is [System.TimeoutException] -or
@@ -968,13 +969,13 @@ function Invoke-WithRetry {
                 throw
             }
 
-            # Cap a positive Retry-After at 30s; otherwise cap the exponential base before jitter.
-            if ($null -ne $retryAfterMs -and $retryAfterMs -gt 0) {
+            # Zero or past Retry-After permits an immediate retry; cap all delays after jitter.
+            if ($null -ne $retryAfterMs -and $retryAfterMs -ge 0) {
                 $delayMs = [Math]::Min($retryAfterMs, 30000)
             }
             else {
                 $delayMs = [Math]::Min(30000, $InitialDelayMs * [Math]::Pow(2, $attempt - 1))
-                $delayMs += (Get-Random -Minimum 0 -Maximum $InitialDelayMs)
+                $delayMs = [Math]::Min(30000, $delayMs + (Get-Random -Minimum 0 -Maximum $InitialDelayMs))
             }
 
             # Emit the selected delay before sleeping so retry latency remains diagnosable.
@@ -1912,7 +1913,6 @@ function Export-PfxWithGroupProtection {
         [string]$PfxFile
     )
 
-    # Add native interop helpers
     # .NET's managed export API supports password-protected PKCS#12 but not Windows SID
     # protection. These declarations bridge to NCrypt for the protection descriptor and to
     # Crypt32 for importing and exporting a native certificate store. BLOB is the unmanaged
@@ -1958,13 +1958,11 @@ function Export-PfxWithGroupProtection {
     # one of the validated user or group SIDs rather than requiring every identity to match.
     $rule = ($ProtectionSids | ForEach-Object { "SID=$($_.Value)" }) -join ' OR '
 
-    # create protection descriptor
     $hDesc = [IntPtr]::Zero
     $hr = [CertLCPfxNative]::NCryptCreateProtectionDescriptor($rule, 0, [ref]$hDesc)
     if ($hr) {
         throw 'Export-PfxWithGroupProtection: NCryptCreateProtectionDescriptor failed: 0x{0:X}' -f $hr
     }
-    Write-CertLCLog -Section 'Export-PfxWithGroupProtection' -Message "Protection descriptor handle: $hDesc"
 
     $sourcePfxBytes = $null
     $sourcePfxBuffer = [IntPtr]::Zero
@@ -1990,7 +1988,6 @@ function Export-PfxWithGroupProtection {
         if ($store -eq [IntPtr]::Zero) {
             throw 'Export-PfxWithGroupProtection: PFXImportCertStore failed: 0x{0:X}' -f [Runtime.InteropServices.Marshal]::GetLastWin32Error()
         }
-        Write-CertLCLog -Section 'Export-PfxWithGroupProtection' -Message "Private-key PFX imported into native memory store: $store"
 
         try {
             Write-CertLCLog -Section 'Export-PfxWithGroupProtection' -Message "$($Certificates.Count) certificate(s) imported into native memory store."
@@ -2027,7 +2024,6 @@ function Export-PfxWithGroupProtection {
 
                     $password = $null  # Release this reference; the managed string is not erased.
 
-                    # save the file
                     # Allocate the same zero-filled byte buffer using its typed constructor.
                     $bytes = [byte[]]::new($blob.cbData)
                     [Runtime.InteropServices.Marshal]::Copy($blob.pbData, $bytes, 0, $blob.cbData)
@@ -2308,10 +2304,6 @@ function Get-RecoverableKeyVaultCertificateOperation {
 
 #region ### New-CertificateCreationRequest ###
 
-##############################################
-# FUNCTIONS - New-CertificateCreationRequest #
-##############################################
-
 <#
 .SYNOPSIS
     Create a Key Vault certificate request, merge the complete CA chain, and export a root-excluded PFX protected to specified users/groups.
@@ -2352,8 +2344,12 @@ function Get-RecoverableKeyVaultCertificateOperation {
 .PARAMETER NotifyTo
     An optional array of email addresses to notify about the certificate request status.
 
+.PARAMETER Result
+    Required reference populated with completed operation metadata; Output contains logs only.
+
 .EXAMPLE
-    $result = New-CertificateCreationRequest -VaultName "MyKeyVault" -CertificateName "MyCertificate" -CertificateTemplateName "WebServer" -CertificateSubject "CN=www.example.com" -CertificateDnsNames @("www.example.com","example.com") -CA "MyCA\MyInstance" -Hostname "webserver01" -PfxProtectTo @("DOMAIN\User1", "DOMAIN\Group1") -NotifyTo @("admin@example.com") -PfxRootFolder 'C:\CertificateExports'
+    $creationResult = $null
+    New-CertificateCreationRequest -VaultName "MyKeyVault" -CertificateName "MyCertificate" -CertificateTemplateName "WebServer" -CertificateSubject "CN=www.example.com" -CertificateDnsNames @("www.example.com","example.com") -CA "MyCA\MyInstance" -Hostname "webserver01" -PfxProtectTo @("DOMAIN\User1", "DOMAIN\Group1") -NotifyTo @("admin@example.com") -PfxRootFolder 'C:\CertificateExports' -Result ([ref]$creationResult)
 #>
 
 function New-CertificateCreationRequest {
@@ -2376,21 +2372,18 @@ function New-CertificateCreationRequest {
         # returns metadata without forcing callers to capture and suppress those log records.
         # PowerShell variable names are case-insensitive: local variables must never be named
         # $result because that would overwrite this typed $Result parameter after side effects.
-        [Parameter()][ref]$Result,
+        [Parameter(Mandatory = $true)][ValidateNotNull()][ref]$Result,
         # Require the export root explicitly instead of resolving dispatcher scope.
         [Parameter(Mandatory = $true)][string]$PfxRootFolder
     )
 
     # Validate every local export dependency before creating a Key Vault CSR or contacting the
     # CA. This prevents bad paths, ACL rights, or domain principals from causing late failure.
-    $pfxPreparation = Initialize-PfxExportTarget `
+    $null = Initialize-PfxExportTarget `
         -PfxRootFolder $PfxRootFolder `
         -Hostname $Hostname `
         -ProtectTo $PfxProtectTo
-    $PfxTargetFolder = $pfxPreparation.TargetFolder
-    $ProtectionSids = $pfxPreparation.ProtectionSids
 
-    # prepare tags for the certificate
     $tagPfxValue = Convert-PfxProtectToForTag -Value $PfxProtectTo
     $tags = @{
         'PfxProtectTo'            = $tagPfxValue
@@ -2754,21 +2747,6 @@ function New-CertificateCreationRequest {
         $temporaryPfxFile = Join-Path -Path $PfxTargetFolder -ChildPath ".$($CertificateName).$([Guid]::NewGuid().ToString('N')).tmp"
         Write-CertLCLog -Section 'New-CertificateCreationRequest' -Message "PFX: Export path: $pfxFile"
 
-        # Preserve the previous explicit private-key exportability check. Capture and clear the
-        # probe because a PFX byte array contains sensitive private-key material.
-        $privateKeyProbe = $null
-        try {
-            $privateKeyProbe = $exportChain[0].Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Pfx)
-        }
-        catch {
-            throw [System.Exception]::new("New-CertificateCreationRequest: PFX: Private key is not exportable for certificate $CertificateName.", $_.Exception)
-        }
-        finally {
-            if ($null -ne $privateKeyProbe) {
-                [Array]::Clear($privateKeyProbe, 0, $privateKeyProbe.Length)
-            }
-        }
-
         try {
             # Export only certificates physically downloaded from the exact Key Vault secret.
             # The ordered set contains the private-key leaf and intermediates, but not the root.
@@ -2843,14 +2821,8 @@ function New-CertificateCreationRequest {
         }
     }
 
-    # Dispatcher callers use the reference parameter so Write-CertLCLog output remains on the
-    # Automation stream. Direct callers that omit it receive the same object conventionally.
-    if ($PSBoundParameters.ContainsKey('Result')) {
-        $Result.Value = $operationResult
-    }
-    else {
-        $operationResult
-    }
+    # Return metadata separately so structured logs remain on the Automation Output stream.
+    $Result.Value = $operationResult
 }
 
 #endregion
@@ -3068,8 +3040,8 @@ function Get-CertificateByThumbprint {
 
 .DESCRIPTION
     This function revokes the specified version of a certificate stored in Azure Key Vault:
-        1. Uses the supplied version-specific public certificate, or reads it from Key Vault,
-            to extract the X.509 serial number without retrieving private-key material.
+          1. Uses the supplied version-specific public certificate to extract the X.509 serial
+              number without retrieving private-key material.
       2. Submits a revocation request to the Certificate Authority (CA) for that serial.
       3. Disables that Key Vault version (attributes.enabled=false) and tags it with
          Revoked=true, RevokedAt, RevocationReason, RevokedJobId. Existing tags on the
@@ -3104,14 +3076,20 @@ function Get-CertificateByThumbprint {
 
 .PARAMETER Certificate
     The public X.509 certificate from the exact Key Vault version being revoked.
-    If omitted, the function reads that version's public certificate from Key Vault.
     The supplied certificate remains owned by the caller and is not disposed here.
 
+.PARAMETER ExistingTags
+    Required tag snapshot from that same version. Pass null if the version has no tags.
+
 .PARAMETER ExpectedThumbprint
-    When supplied, must match the public certificate before any CA or Key Vault mutation.
+    Must match the public certificate before any CA or Key Vault mutation.
+
+.PARAMETER Result
+    Required reference populated with completed operation metadata; Output contains logs only.
 
 .EXAMPLE
-    New-CertificateRevocationRequest -VaultName 'MyKeyVault' -CertificateName 'MyCertificate' -CertificateVersion 'abc123...' -RevocationReason 1 -JobId $jobId -CA 'MyCA\MyInstance'
+    $revocationResult = $null
+    New-CertificateRevocationRequest -VaultName 'MyKeyVault' -CertificateName 'MyCertificate' -CertificateVersion 'abc123...' -RevocationReason 1 -JobId $jobId -CA 'MyCA\MyInstance' -Certificate $cert.Certificate -ExistingTags $cert.Tags -ExpectedThumbprint $CertificateThumbprint -Result ([ref]$revocationResult)
 
 #>
 function New-CertificateRevocationRequest {
@@ -3133,21 +3111,22 @@ function New-CertificateRevocationRequest {
         [Parameter(Mandatory = $false)]
         [string]$JobId,
 
-        # Optional: pre-fetched tags of the specific version (passed by the dispatcher to avoid a
-        # second Get-AzKeyVaultCertificate round-trip). If not provided, the function fetches them.
-        [Parameter(Mandatory = $false)]
+        # The dispatcher supplies the tag snapshot from the exact version being revoked.
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
         [System.Collections.IDictionary]$ExistingTags,
 
         # As in the creation function, the reference return keeps structured log output visible
         # while delivering notification metadata separately to the dispatcher.
-        [Parameter(Mandatory = $false)]
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNull()]
         [ref]$Result,
 
-        [Parameter(Mandatory = $false)]
+        [Parameter(Mandatory = $true)]
         [ValidateNotNull()]
         [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
 
-        [Parameter(Mandatory = $false)]
+        [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$ExpectedThumbprint,
 
@@ -3156,25 +3135,11 @@ function New-CertificateRevocationRequest {
         [string]$CA
     )
 
-    # Prefer the caller's exact-version public certificate; fetch it only when not supplied.
-    $existingVersion = $null
-    if (-not $PSBoundParameters.ContainsKey('Certificate')) {
-        Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "KeyVault: Reading public certificate $CertificateName version $CertificateVersion from vault $VaultName..."
-        try {
-            $existingVersion = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -Version $CertificateVersion
-        }
-        catch {
-            throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Error getting public certificate $CertificateName version $CertificateVersion from key vault $VaultName", $_.Exception)
-        }
-        if ($null -ne $existingVersion -and $null -ne $existingVersion.Certificate) {
-            $Certificate = $existingVersion.Certificate
-        }
-    }
-    # Refuse to revoke until both the serial and any caller-provided thumbprint are verified.
+    # Refuse to revoke until both the serial and the requested thumbprint are verified.
     if ($null -eq $Certificate -or [string]::IsNullOrWhiteSpace($Certificate.SerialNumber)) {
         throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Public certificate $CertificateName version $CertificateVersion is missing or has no serial number.")
     }
-    if ($PSBoundParameters.ContainsKey('ExpectedThumbprint') -and $Certificate.Thumbprint -ine $ExpectedThumbprint) {
+    if ($Certificate.Thumbprint -ine $ExpectedThumbprint) {
         throw [System.Exception]::new("New-CertificateRevocationRequest: Public certificate thumbprint does not match the requested thumbprint for $CertificateName version $CertificateVersion.")
     }
 
@@ -3213,31 +3178,11 @@ function New-CertificateRevocationRequest {
     # start from the existing tags on this version, merge our revocation keys, and write back.
     Write-CertLCLog -Section 'New-CertificateRevocationRequest' -Message "KeyVault: Disabling certificate $CertificateName version $CertificateVersion in key vault $($VaultName) and tagging it as revoked..."
 
-    # Source the existing tags: prefer the caller-provided snapshot to avoid a second round-trip;
-    # otherwise fetch the version now.
-    $sourceTags = $null
-    if ($PSBoundParameters.ContainsKey('ExistingTags') -and $null -ne $ExistingTags) {
-        $sourceTags = $ExistingTags
-    }
-    elseif ($null -ne $existingVersion) {
-        $sourceTags = $existingVersion.Tags
-    }
-    else {
-        # A missing tag snapshot needs one exact-version read before the replacement PATCH.
-        try {
-            $existingVersion = Get-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -Version $CertificateVersion
-        }
-        catch {
-            throw [System.Exception]::new("New-CertificateRevocationRequest: KeyVault: Error reading certificate $CertificateName version $CertificateVersion from key vault $VaultName for tag merge", $_.Exception)
-        }
-        if ($null -ne $existingVersion) { $sourceTags = $existingVersion.Tags }
-    }
-
     # build merged tag set: start from existing tags (if any), then overlay revocation metadata
     $mergedTags = @{}
-    if ($null -ne $sourceTags) {
-        foreach ($k in $sourceTags.Keys) {
-            $mergedTags[$k] = [string]$sourceTags[$k]
+    if ($null -ne $ExistingTags) {
+        foreach ($k in $ExistingTags.Keys) {
+            $mergedTags[$k] = [string]$ExistingTags[$k]
         }
     }
     # Audit fields override older values, but all unrelated tags remain in the replacement set.
@@ -3276,14 +3221,8 @@ function New-CertificateRevocationRequest {
         RevokedAt          = $revokedAt
         JobId              = $JobId
     }
-    # Preserve normal return behavior for direct callers while allowing the dispatcher to keep
-    # structured log records on the Automation output stream.
-    if ($PSBoundParameters.ContainsKey('Result')) {
-        $Result.Value = $operationResult
-    }
-    else {
-        $operationResult
-    }
+    # Return metadata separately so structured logs remain on the Automation Output stream.
+    $Result.Value = $operationResult
 }
 
 #endregion
@@ -3483,10 +3422,6 @@ function Find-CertLCJobId {
 
 #region ### Dispatcher ###
 
-###############
-# DISPATCHER  #
-###############
-
 # Reject unsupported hosts before Azure authentication. Automation captures runbook streams
 # without Connect-AzAccount; event correlation is not available until request parsing below.
 # Resolve identity through authenticated Automation APIs, independently of event correlation.
@@ -3500,7 +3435,7 @@ elseif ($env:AZUREPS_HOST_ENVIRONMENT -ne 'AzureAutomation/') {
     Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'Runbook running in a local environment. This runbook must be executed by a hybrid worker instead!'
 }
 
-# Keep the supported runtime aligned with the PowerShell 7.6+ Hybrid Worker diagnostic.
+# Require the supported PowerShell runtime before authentication and certificate operations.
 if ($PSVersionTable.PSVersion -lt [version]'7.6') {
     Write-CertLCLogAndThrow -Section 'Dispatcher' -Message 'This runbook requires PowerShell 7.6 or later.'
 }
@@ -3545,23 +3480,13 @@ catch {
     Write-CertLCLogAndThrow -Section 'JobIdentity' -Message 'Cannot determine the Automation job ID using the Output marker.' -InnerException $_.Exception
 }
 $jobIdSource = 'AutomationApiMarker'
-Write-CertLCLog -Section 'JobIdentity' -Message 'Automation job identity resolved.' -Context @{ jobIdSource = $jobIdSource }
-
-# The logger now includes jobId independently; correlation remains absent until event parsing.
-# Delay the positive host message until execution identity is available for all normal
-# startup records. Rejections above still log immediately without inventing an identifier.
-Write-CertLCLog -Section 'Dispatcher' -Message "Hybrid Runbook Worker confirmed: $($env:COMPUTERNAME)."
-
-# Emit a readable ID followed by structured diagnostic details through the existing logger.
-# The source, worker, runtime, and host marker help diagnose future worker behavior changes.
-Write-CertLCLog -Section 'Dispatcher' -Message "Automation Job ID: $jobId"
-Write-CertLCLog -Section 'Dispatcher' -Message ([ordered]@{
-    JobId = $jobId
-    JobIdSource = $jobIdSource
-    Worker = $env:COMPUTERNAME
-    PowerShellVersion = $PSVersionTable.PSVersion.ToString()
-    HostEnvironment = $env:AZUREPS_HOST_ENVIRONMENT
-} | ConvertTo-Json -Compress)
+# The logger adds the verified jobId; event correlation remains absent until request parsing.
+Write-CertLCLog -Section 'JobIdentity' -Message 'Automation job identity resolved.' -Context @{
+    jobIdSource = $jobIdSource
+    worker = $env:COMPUTERNAME
+    powerShellVersion = $PSVersionTable.PSVersion.ToString()
+    hostEnvironment = $env:AZUREPS_HOST_ENVIRONMENT
+}
 
 # Get the runbook variables from the Automation Account
 # Since they are encrypted, we must use the internal cmdlet Get-AutomationVariable to retrieve them, not Get-AzAutomationVariable
