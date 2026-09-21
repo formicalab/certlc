@@ -21,14 +21,20 @@ Before deploying, ensure you have:
 4. **Hybrid Worker VM**: A Windows Azure VM configured as an extension-based Hybrid Runbook Worker and registered in the configured worker group. Azure Arc-enabled and non-Azure machines have not been tested and are not supported by this solution. The VM requires:
     - At least 2 CPU cores and 4 GB of RAM
     - A system-assigned managed identity; enable it before adding the VM to the Hybrid Worker Group
-    - PowerShell 7.6 installed and available to the Hybrid Worker
+    - PowerShell 7.6 installed and available to the Hybrid Worker:
+      - On the VM, open **System Properties > Advanced > Environment Variables** and, under **System variables** (not **User variables**), create `powershell_7_6_path` with the value `C:\Program Files\PowerShell\7\pwsh.exe`.
+      - Verify that `pwsh.exe` exists at that path. If PowerShell is installed elsewhere, use its actual full executable path instead.
+      - If the Hybrid Worker service is already installed, restart **HybridWorkerService** after setting the variable and before testing runbooks so it picks up the change. Restart the VM if the service still does not pick up the updated environment.
     - Az PowerShell 15.1.0 available to PowerShell 7.6. Both runbooks directly import `Az.Accounts` and `Az.KeyVault`; the main runbook no longer directly imports `Az.Storage` or `Az.Resources`. The deployment still provisions the full default Az package
     - Domain membership (or an equivalent trust and identity configuration) with DNS, Kerberos, and LDAP connectivity to Active Directory; the runbooks query certificate templates through LDAP and resolve domain principals used to protect exported PFX files
     - RPC connectivity to the issuing Enterprise CA for certificate enrollment and revocation: TCP 135 for the RPC endpoint mapper and the dynamic RPC port range configured on the CA (TCP 49152-65535 by default on current Windows Server versions)
     - Routed HTTPS access on TCP 443, with working private DNS resolution, to the Key Vault private endpoint and the Automation Account `DSCAndHybridWorker` private endpoint
     - Outbound HTTPS access on TCP 443 to Microsoft Entra ID/Azure Resource Manager for managed-identity authentication and to the Azure Monitor data collection endpoint used by `certlcstats.ps1` (the template currently exposes this endpoint through public network access)
     - Read/write/create-folder and ACL permissions on the configured PFX root path; if it is a UNC path, network and SMB access (TCP 445) to the file server are required
-    - Network access to the configured SMTP server and port when email notifications are enabled
+    - Outbound TCP access to the configured SMTP server and port when email notifications are enabled:
+      - Ensure any hub firewall, network virtual appliance, NSG, and local firewall on the path permit this traffic. For Azure Firewall, configure an **Allow network rule** scoped to the Hybrid Worker VM's source IP (or approved worker subnet), the approved SMTP destination, and the configured TCP port (for example, TCP 25 if using port 25). Do not allow unrestricted outbound SMTP.
+      - Before testing notifications, run `Test-NetConnection -ComputerName <smtp-server> -Port <smtp-port>` from the Hybrid Worker VM and confirm `TcpTestSucceeded` is `True`. A successful TCP test verifies connectivity, not SMTP authentication or email delivery.
+      - If the connection times out, check the hub firewall logs for denies matching the worker's source IP, SMTP destination, port, and test time. A default-deny rule can prevent the notification email even when the certificate operation succeeds.
 5. **Deployment VM**: Prepare a dedicated Windows VM in advance for both the Bicep infrastructure deployment and the subsequent bridge Function App publishing. Install and verify the following tools on this VM:
   - **Azure CLI**: Install Azure CLI with Windows Package Manager by running `winget install -e --id Microsoft.AzureCLI`, or use the [64-bit MSI installer](https://aka.ms/installazurecliwindowsx64). Open a new PowerShell session after installation and verify it with `az version`.
   - **Azure CLI-managed Bicep CLI**: Install Bicep through Azure CLI by running `az bicep install`; a separate standalone Bicep installation is not required. Verify it with `az bicep version`. Use `az bicep upgrade` to update it when required.
@@ -48,6 +54,7 @@ Before deploying, ensure you have:
     ```powershell
     # Register the providers used by the templates and verify each registration completes.
     @(
+      'Microsoft.AlertsManagement'
       'Microsoft.Automation'
       'Microsoft.EventGrid'
       'Microsoft.Insights'
@@ -140,11 +147,12 @@ The deployment requires the following parameters (configured in the sanitized ex
 | `automationAccountVarSmtpPassword` | SMTP password (encrypted in Automation Account) |
 | `scheduleStartTime` | Start time for certlcstats schedule (defaults to 15 minutes after deployment) |
 | `enableAlerts` | Deploy the dedicated CertLC Action Group and proactive alerts (default `true`) |
-| `enableStatsSchedule` | Link the hourly `certlcstats` schedule to the runbook on the Hybrid Worker Group (default `true`) |
 | `actionGroupName` | Name of the dedicated Action Group (defaults to `ag-<logAnalyticsWorkspaceName>`) |
 | `alertEmailReceivers` | Optional Action Group email receiver objects with `name`, `emailAddress`, and `useCommonAlertSchema` properties |
 
-Alerts and scheduled statistics collection are enabled at the template level. Configure the Action Group receivers for each environment:
+Alerts are enabled at the template level. The hourly statistics schedule is created but left
+unlinked: upload and publish the runbook code, then link the schedule in the post-deployment steps.
+Configure the Action Group receivers for each environment:
 
 ```bicep
 param actionGroupName = 'ag-certlc-itn-001'
@@ -158,7 +166,11 @@ param alertEmailReceivers = [
 ```
 
 An empty `alertEmailReceivers` array is valid and leaves alerts visible in Azure Monitor without sending email notifications.
-To disable alerts or scheduled collection for a development environment, set `enableAlerts` or `enableStatsSchedule` to `false` explicitly.
+To disable alerts for a development environment, set `enableAlerts` to `false` explicitly.
+For a new deployment, scheduled collection does not start until you manually link the schedule.
+To stop collection on an existing deployment, disable or unlink the schedule in Azure Automation.
+The former `enableStatsSchedule` parameter has been removed; remove it from existing parameter files.
+Incremental deployments do not remove previously created schedule links.
 
 ### Enabling Alerts on an Existing Deployment
 
@@ -289,8 +301,16 @@ from the four-tab workbook also require that setting; no full application redepl
 for a scoped diagnostic-setting update. The alerts module owns queue-service diagnostics and
 enables `StorageRead`, `StorageWrite` and `StorageDelete` when alerts are enabled. Workbook-only
 upgrades from write-only queue logging need a separate diagnostic-setting update. Logs are not backfilled.
-The workbook module uses `string(loadJsonContent(...))` before token replacement to support the
-larger workbook without Bicep's 128-KB `loadTextContent` limit.
+The workbook module uses `loadJsonContent(...)` and replaces tokens separately in each top-level
+item and in the remaining workbook metadata (including fallback resource IDs). It then reassembles
+and serializes the workbook, preserving item order and duplicates. This avoids passing the whole
+workbook through ARM's 128-KiB string replacement limit while keeping publication fully automated.
+Keep each individual item, including expanded resource IDs, below that limit; split an oversized
+item into smaller top-level items if needed.
+Run `pwsh -NoProfile -File .\Tests\certlc-workbook.tests.ps1` from the repository root to compile
+the module and check token coverage, section sizes, and content preservation (including item
+order, duplicates, and metadata). Rerun Azure what-if after workbook changes; local compilation
+alone does not evaluate ARM string limits.
 
 Deploying Bicep workbook content does not publish Function or runbook source. For an upgrade
 from the former separate `CorrelationId` input, publish the updated bridge first, verify that it
@@ -334,9 +354,9 @@ workbook-only upgrade. Historical telemetry is not rewritten by either deploymen
   - `disableLocalAuth: false` — kept enabled because legacy webhook authentication (key in query string) is still required by external callers that cannot use Entra ID
   - Includes encrypted variables used by the runbooks (CA name, PFX root folder, SMTP settings, Key Vault name, DCR details)
   - Includes non-secret `certlc-automationaccountid` and `certlc-runbookname` variables for API-based job identity lookup; create these before publishing the updated lifecycle runbook to an existing account
-  - Two placeholder runbooks created: the primary runbook named by `runbookName` and `certlcstats` (code must be uploaded post-deployment)
+  - Two placeholder runbooks created: the primary runbook named by `runbookName` and `certlcstats` (code must be uploaded and published post-deployment)
   - Hybrid Worker Group for on-premises CA communication
-  - Hourly schedule linked to the `certlcstats` runbook on the configured Hybrid Worker Group by default
+  - Hourly schedule `schedule-certlcstats-hourly` created without a runbook link; link it manually after publishing `certlcstats` and preparing the Hybrid Worker
   - Diagnostic settings enabled: JobLogs, JobStreams, AllMetrics sent to Log Analytics
 - **Private Endpoints**:
   - Webhook endpoint (for optional direct external callers; the Function starts jobs through the Automation management API)
@@ -386,6 +406,8 @@ workbook-only upgrade. Historical telemetry is not rewritten by either deploymen
 #### Function Queue Retry and Poison Handling
 
 Event Grid delivery retries end once an event reaches the `certlc` queue. From that point, the Function queue trigger owns retry behavior. The deployed [host.json](../Functions/CertLCBridge/host.json) allows five processing attempts (`maxDequeueCount: 5`) with a 30-second delay between unsuccessful Function invocations (`visibilityTimeout: 00:00:30`). Each attempt starts a separate Automation job. After the fifth failure, the Functions host moves the message to the automatically named `certlc-poison` queue and stops retrying it.
+
+The storage template creates both `certlc` and `certlc-poison` up front, so the workbook can show an empty poison queue before any message exhausts its retries instead of displaying `QueueNotFound`. This does not change retry behavior or clear existing messages. For an existing deployment where `certlc-poison` is absent, create that queue in the deployed Storage Account under **Data storage > Queues > + Queue**, or deploy the updated storage template, then refresh the workbook.
 
 Change these defaults in `host.json` before publishing the Function, or override them per environment with Function App settings:
 
@@ -462,9 +484,13 @@ After deploying the infrastructure, complete these additional steps:
   - On the VM's **Extensions + applications** page, confirm that the Azure Automation Windows Hybrid Worker extension completed successfully. In the Automation Account, confirm that the VM appears in the configured group as an extension-based worker before starting any runbook
   - Only Windows Azure VMs are supported by this solution; Azure Arc-enabled and non-Azure workers have not been tested
   - For detailed installation and troubleshooting guidance, see [deploy an extension-based Hybrid Runbook Worker](https://learn.microsoft.com/azure/automation/extension-based-hybrid-runbook-worker-install)
-2. **Upload Runbook Code**: 
-  - Upload the actual `certlc.ps1` PowerShell code to the primary runbook named by `runbookName` (placeholder created during deployment)
-   - Upload the actual PowerShell code for `certlcstats.ps1` runbook (placeholder created during deployment)
+2. **Upload and Publish Both Runbooks**:
+  - Bicep creates placeholders only. In the Azure portal, open the deployed Automation Account and select **Runbooks**
+  - Open the primary runbook named by `runbookName`, select **Edit**, replace the placeholder content with the complete contents of [certlc.ps1](../Runbooks/certlc.ps1), and select **Save**
+  - Select **Publish**, confirm the action, and wait until the runbook state is **Published**; saving alone leaves a draft
+  - Repeat the edit, save, and publish steps for `certlcstats`, using the complete contents of [certlcstats.ps1](../Runbooks/certlcstats.ps1)
+  - Keep both runbooks associated with the runtime named by `runtimeEnvironmentName` (PowerShell 7.6). Confirm both report **Published** before configuring triggers
+  - Copy the code from the local checkout; no externally hosted script URL is required. Publishing does not start a job
 3. **Create the External-Client Webhook**:
   - Publish the primary runbook before creating its webhook
   - In the Automation Account, open the primary runbook named by `runbookName`, select **Webhooks** > **Add Webhook** > **Create new Webhook**, and configure an enabled webhook with an appropriate name and expiration date
@@ -473,10 +499,14 @@ After deploying the infrastructure, complete these additional steps:
   - Distribute the URL only to authorized external clients. Those clients must have routed HTTPS access on TCP 443 and private DNS resolution to the Automation Account webhook private endpoint, and must use TLS 1.2 or later
   - Track the webhook expiration date and rotate it before expiry. Create and distribute a replacement webhook URL before removing the old webhook
   - For webhook behavior and security guidance, see [start a runbook from a webhook](https://learn.microsoft.com/azure/automation/automation-webhooks)
-4. **Verify Certificate Statistics Collection**:
-  - By default, `schedule-certlcstats-hourly` is linked to `certlcstats` on the configured Hybrid Worker Group
-  - Set `enableStatsSchedule` to `false` only when scheduled statistics collection is intentionally disabled
-  - After uploading and publishing `certlcstats.ps1`, confirm the next scheduled job completes successfully
+4. **Test Statistics Collection and Link Its Schedule**:
+  - Infrastructure deployment creates `schedule-certlcstats-hourly` but does not link it to any runbook. Azure rejects links to unpublished runbooks
+  - Confirm the Hybrid Worker is registered and healthy, required modules are installed, and Key Vault and monitoring connectivity/permissions are ready
+  - Open the published `certlcstats` runbook and select **Start**. For **Run on**, choose **Hybrid Worker** and the group named by `hybridWorkerGroupName`, not the Azure sandbox. Confirm the job reaches **Completed** and its output reports a successful statistics snapshot
+  - In `certlcstats`, open **Schedules**, select **Add a schedule**, then **Link a schedule to your runbook**, and choose the existing `schedule-certlcstats-hourly` schedule
+  - Under **Parameters and run settings**, select **Hybrid Worker** and the group named by `hybridWorkerGroupName`. The statistics runbook reads its configuration from Automation variables; no fixed runbook parameters are required
+  - Confirm the hourly schedule is enabled and its next run is in the future, save the link, and verify the runbook lists it only once. If a link already exists, inspect its worker-group settings rather than creating a duplicate
+  - Confirm the next scheduled job completes successfully on that worker group. The statistics-health alert can fire until successful collection starts
 5. **Deploy Function App Code**:
   - After deployment, identify the Function App private endpoint and its private IP address. This information is available only after the endpoint has been created
   - Complete the deployment VM's publishing connectivity by configuring routing and firewall rules so it can reach the private endpoint over HTTPS on TCP 443, either from the same or a peered VNet, or through VPN/ExpressRoute

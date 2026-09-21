@@ -24,7 +24,6 @@ param actionGroupName = 'ag-certlc-contoso'
 
 // Alerting Configuration
 param enableAlerts = true
-param enableStatsSchedule = true
 param alertEmailReceivers = [
   {
     name: 'CertLC operators'

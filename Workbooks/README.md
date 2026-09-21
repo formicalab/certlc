@@ -50,6 +50,10 @@ run independently after supplying the workbook parameters.
 Nine resource parameter queries use Azure Resource Graph; the remaining 26 queries read Log Analytics.
 Native Azure Monitor metrics supply Event Grid and queue-service charts. Read-only ARM queries
 show the current approximate backlog of `certlc` and `certlc-poison` without consuming messages.
+The storage template provisions both queues, including an initially empty poison queue. For older
+deployments, create a missing `certlc-poison` queue as described in the
+[setup guide](../Setup/README.md#function-queue-retry-and-poison-handling); the backlog query
+requires the queue to exist and does not suppress missing-resource or access errors.
 Journey shares the workbook's resource and time controls and uses source plus event
 ID for identity, grouping invocations under queue-message branches when host evidence is available.
 Its search supports event IDs, certificates, queue names, message IDs, jobs, invocations, event types and sources. Event lists are
