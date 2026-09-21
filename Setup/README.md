@@ -289,8 +289,16 @@ from the four-tab workbook also require that setting; no full application redepl
 for a scoped diagnostic-setting update. The alerts module owns queue-service diagnostics and
 enables `StorageRead`, `StorageWrite` and `StorageDelete` when alerts are enabled. Workbook-only
 upgrades from write-only queue logging need a separate diagnostic-setting update. Logs are not backfilled.
-The workbook module uses `string(loadJsonContent(...))` before token replacement to support the
-larger workbook without Bicep's 128-KB `loadTextContent` limit.
+The workbook module uses `loadJsonContent(...)` and replaces tokens separately in each top-level
+item and in the remaining workbook metadata (including fallback resource IDs). It then reassembles
+and serializes the workbook, preserving item order and duplicates. This avoids passing the whole
+workbook through ARM's 128-KiB string replacement limit while keeping publication fully automated.
+Keep each individual item, including expanded resource IDs, below that limit; split an oversized
+item into smaller top-level items if needed.
+Run `pwsh -NoProfile -File .\Tests\certlc-workbook.tests.ps1` from the repository root to compile
+the module and check token coverage, section sizes, and content preservation (including item
+order, duplicates, and metadata). Rerun Azure what-if after workbook changes; local compilation
+alone does not evaluate ARM string limits.
 
 Deploying Bicep workbook content does not publish Function or runbook source. For an upgrade
 from the former separate `CorrelationId` input, publish the updated bridge first, verify that it

@@ -12,16 +12,32 @@ param queueStorageAccountId string
 param tags object
 
 // Keep the tokenized workbook file authoritative instead of duplicating its JSON in Bicep.
-var workbookTemplate = string(loadJsonContent('../../Workbooks/certlcstats.workbook'))
-var workbookWithWorkspace = replace(workbookTemplate, '__LOG_ANALYTICS_WORKSPACE_ID__', logAnalyticsWorkspaceId)
-var workbookWithAutomation = replace(workbookWithWorkspace, '__AUTOMATION_ACCOUNT_ID__', automationAccountId)
-var workbookWithMainRunbook = replace(workbookWithAutomation, '__MAIN_RUNBOOK_ID__', '${automationAccountId}/runbooks/${runbookName}')
-var workbookWithStatsRunbook = replace(workbookWithMainRunbook, '__STATS_RUNBOOK_ID__', '${automationAccountId}/runbooks/certlcstats')
-var workbookWithFunction = replace(workbookWithStatsRunbook, '__FUNCTION_APP_ID__', functionAppId)
-var workbookWithEventGrid = replace(workbookWithFunction, '__EVENT_GRID_TOPIC_ID__', eventGridSystemTopicId)
-var workbookWithEventGridSource = replace(workbookWithEventGrid, '__EVENT_GRID_SOURCE_ID__', eventGridSourceId)
-var workbookWithQueueStorage = replace(workbookWithEventGridSource, '__QUEUE_STORAGE_ACCOUNT_ID__', queueStorageAccountId)
-var workbookContent = replace(workbookWithQueueStorage, '__QUEUE_SERVICE_ID__', '${queueStorageAccountId}/queueServices/default')
+var workbookTemplate = loadJsonContent('../../Workbooks/certlcstats.workbook')
+var workbookReplacements = {
+  __LOG_ANALYTICS_WORKSPACE_ID__: logAnalyticsWorkspaceId
+  __AUTOMATION_ACCOUNT_ID__: automationAccountId
+  __MAIN_RUNBOOK_ID__: '${automationAccountId}/runbooks/${runbookName}'
+  __STATS_RUNBOOK_ID__: '${automationAccountId}/runbooks/certlcstats'
+  __FUNCTION_APP_ID__: functionAppId
+  __EVENT_GRID_TOPIC_ID__: eventGridSystemTopicId
+  __EVENT_GRID_SOURCE_ID__: eventGridSourceId
+  __QUEUE_STORAGE_ACCOUNT_ID__: queueStorageAccountId
+  __QUEUE_SERVICE_ID__: '${queueStorageAccountId}/queueServices/default'
+}
+
+// ARM replace() cannot process the full workbook string once it exceeds 128 KiB.
+var workbookItems = map(workbookTemplate.items, item => json(reduce(
+  items(workbookReplacements),
+  string(item),
+  (content, replacement) => replace(content, replacement.key, replacement.value)
+)))
+var workbookMetadata = json(reduce(
+  items(workbookReplacements),
+  string(shallowMerge([workbookTemplate, { items: [] }])),
+  (content, replacement) => replace(content, replacement.key, replacement.value)
+))
+// A shallow merge preserves item order and duplicates instead of merging/deduplicating arrays.
+var workbookContent = string(shallowMerge([workbookMetadata, { items: workbookItems }]))
 
 // The deterministic name updates the same shared workbook on every deployment.
 resource workbook 'Microsoft.Insights/workbooks@2023-06-01' = {
