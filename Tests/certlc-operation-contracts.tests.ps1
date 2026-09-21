@@ -23,8 +23,10 @@ function Get-Definition([string]$Name) {
 $creation = Get-Definition 'New-CertificateCreationRequest'
 $revocation = Get-Definition 'New-CertificateRevocationRequest'
 $notification = Get-Definition 'Send-SuccessNotification'
+$errorNotification = Get-Definition 'Write-CertLCLogAndThrow'
 . ([scriptblock]::Create($creation.Extent.Text))
 . ([scriptblock]::Create($notification.Extent.Text))
+. ([scriptblock]::Create($errorNotification.Extent.Text))
 # Replace only native COM release so a managed CA double can exercise the actual helper.
 $releaseCall = '[Runtime.InteropServices.Marshal]::ReleaseComObject($CertAdmin)'
 Assert-True ($revocation.Extent.Text.Contains($releaseCall)) 'Native release boundary located'
@@ -42,7 +44,16 @@ Assert-True ((Get-Command Send-SuccessNotification).Parameters['Summary'].Aliase
 Assert-True (-not $creation.Extent.Text.Contains('$privateKeyProbe')) 'Passwordless export probe removed'
 Assert-True (-not $revocation.Extent.Text.Contains('Get-AzKeyVaultCertificate')) 'Revocation has no fallback certificate reads'
 
-function Write-CertLCLog { param($Section, $Message) @{ section = $Section; message = $Message } | ConvertTo-Json -Compress }
+function Write-CertLCLog { param($Section, $Message, $Level, $CorrelationId, $Context) @{ section = $Section; message = $Message } | ConvertTo-Json -Compress }
+function New-CertLCNotificationBody {
+    param($Title, $Summary, $Details, $ErrorDetails, $JobId, $CorrelationId)
+    $script:capturedErrorDetails = $ErrorDetails
+    return 'notification body'
+}
+function Send-NotificationEmail {
+    param($SmtpServer, $FromAddress, $To, $Subject, $Body, $SmtpCredential)
+    $script:capturedErrorSubject = $Subject
+}
 function Get-AzKeyVaultCertificate { throw 'Unexpected fallback read' }
 function New-Object {
     param($ComObject)
@@ -91,6 +102,35 @@ try {
             Assert-True ($tags.Revoked -eq 'false' -and $patch.Tags.NotifyTo -eq $tags.NotifyTo) 'Tag snapshot preserved without caller mutation'
         }
     }
+
+    $script:CertificateNotificationContext = [ordered]@{
+        Operation = 'Revocation'
+        'Certificate name' = 'test-cert'
+    }
+    $script:capturedErrorDetails = $null
+    $script:capturedErrorSubject = $null
+    $accessDenied = [System.UnauthorizedAccessException]::new(
+        'CCertAdmin::RevokeCertificate: Access is denied. 0x80070005 (WIN32: 5 ERROR_ACCESS_DENIED)'
+    )
+    $caFailure = [System.Exception]::new('CA: Error revoking certificate test-cert', $accessDenied)
+    $failure = $null
+    try {
+        Write-CertLCLogAndThrow `
+            -Section 'Dispatcher.Revocation' `
+            -Message 'Error processing certificate revocation request' `
+            -InnerException $caFailure `
+            -NotifyTo 'owner@example.test' `
+            -SmtpServer 'smtp.example.test' `
+            -FromAddress 'certlc@example.test'
+    }
+    catch {
+        $failure = $_.Exception
+    }
+    Assert-True ($null -ne $failure) 'Error notification preserves terminating behavior'
+    Assert-True ($script:capturedErrorDetails -like '*System.Exception*CA: Error revoking certificate test-cert*') 'Error notification includes CA exception'
+    Assert-True ($script:capturedErrorDetails -like '*System.UnauthorizedAccessException*Access is denied*ERROR_ACCESS_DENIED*') 'Error notification includes nested authorization exception'
+    Assert-True ($script:capturedErrorDetails -like '*0x80070005*') 'Error notification includes nested exception HRESULT'
+    Assert-True ($script:capturedErrorSubject -ceq 'Certificate test-cert revocation failed') 'Error notification uses an operation-specific subject'
 
     # Execute the actual post-merge export block; issuance and native SID export stay mocked.
     $exportBlock = @($creation.Body.EndBlock.Statements | Where-Object {
