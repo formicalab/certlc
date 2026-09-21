@@ -9,3 +9,5 @@ Tests/*
 .vscode/
 # Local Azure validation, deployment plans and resource snapshots are not release source.
 .azure/
+# Local environment-specific deployment parameters.
+Setup/parameters.dev.bicepparam

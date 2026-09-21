@@ -2,9 +2,9 @@
 
 CERTLC - Bicep file for deploying the required resources for the CERTLC solution.
 
-Validate with: az deployment group validate --resource-group <existing resource group> -parameters .\parameters.dev.bicepparam
-What-if: az deployment group what-if --resource-group <existing resource group> -parameters .\parameters.dev.bicepparam
-Deploy with: az deployment group create --resource-group <existing resource group> -parameters .\parameters.dev.bicepparam
+Validate with: az deployment group validate --resource-group <existing resource group> --parameters .\parameters.bicepparam
+What-if: az deployment group what-if --resource-group <existing resource group> --parameters .\parameters.bicepparam
+Deploy with: az deployment group create --resource-group <existing resource group> --parameters .\parameters.bicepparam
 
 */
 
