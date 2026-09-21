@@ -160,7 +160,7 @@ CertLC/
 ├── Setup/                       # Infrastructure deployment
 │   ├── certlc.bicep            # Main Bicep template
 │   ├── modules/                 # Service modules, workbook, and optional alerts
-│   ├── parameters.dev.bicepparam
+│   ├── parameters.bicepparam    # Sanitized deployment parameter example
 │   └── README.md               # Deployment instructions
 ├── Functions/                   # Azure Function App code
 │   └── CertLCBridge/           # PowerShell function for queue processing

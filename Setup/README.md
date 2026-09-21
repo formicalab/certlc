@@ -111,7 +111,7 @@ az role assignment create `
 
 ## Parameters
 
-The deployment requires the following parameters (configured in `parameters.dev.bicepparam`):
+The deployment requires the following parameters (configured in the sanitized example file `parameters.bicepparam`):
 
 | Parameter | Description |
 |-----------|-------------|
@@ -176,13 +176,13 @@ Remove the temporary parameter file after verification, especially when it conta
 
 ## Deployment
 
-1. Configure `parameters.dev.bicepparam` using the parameter reference above.
+1. Configure `parameters.bicepparam` using the parameter reference above. Replace every example value before deployment, and do not commit environment-specific or secret values.
 2. Validate the template, parameters, permissions, policies, and referenced resources with an Azure-side preflight. This does not create or modify resources:
 
 ```powershell
 az deployment group validate `
   --resource-group <your-resource-group> `
-  --parameters .\parameters.dev.bicepparam
+  --parameters .\parameters.bicepparam
 ```
 
 3. Preview the deployment changes using what-if:
@@ -190,7 +190,7 @@ az deployment group validate `
 ```powershell
 az deployment group what-if `
   --resource-group <your-resource-group> `
-  --parameters .\parameters.dev.bicepparam
+  --parameters .\parameters.bicepparam
 ```
 
 4. Review the what-if output and confirm that the proposed changes are expected.
@@ -199,7 +199,7 @@ az deployment group what-if `
 ```powershell
 az deployment group create `
   --resource-group <your-resource-group> `
-  --parameters .\parameters.dev.bicepparam
+  --parameters .\parameters.bicepparam
 ```
 
 ## Resources Created
@@ -542,5 +542,5 @@ The solution follows a secure-by-default architecture:
 
 - `certlc.bicep` - Main Bicep orchestration template and public parameter/output contract
 - `modules/` - Bicep modules for storage, core observability, Automation, Function App, Key Vault, integrations, the workbook, and optional alerts; each service module owns its private endpoints
-- `parameters.dev.bicepparam` - Bicep parameter file
+- `parameters.bicepparam` - Sanitized Bicep parameter file with example values
 - `README.md` - This file
