@@ -814,6 +814,34 @@ function Write-CertLCLogAndThrow {
 
     #endregion
 
+    #region ### Convert-ExceptionToText ###
+
+    #######################################
+    # FUNCTIONS - Convert-ExceptionToText #
+    #######################################
+
+    function Convert-ExceptionToText {
+        param([System.Exception]$Exception, [int]$MaxDepth = 2)
+        if (-not $Exception) { return '' }
+
+        $lines = [System.Collections.Generic.List[string]]::new()
+        $current = $Exception
+        $depth = 0
+        while ($current -and $depth -le $MaxDepth) {
+            $hresult = '0x{0:X8}' -f ($current.HResult -band 0xffffffffL)
+            $prefix = if ($depth -eq 0) { 'Exception' } else { "Caused by [$depth]" }
+            $lines.Add("${prefix}: $($current.GetType().FullName) ($hresult): $($current.Message)")
+            $current = $current.InnerException
+            $depth++
+        }
+        if ($current) {
+            $lines.Add('Additional inner exceptions omitted.')
+        }
+        return $lines -join "`n"
+    }
+
+    #endregion
+
     # Copy caller context before attaching diagnostics; never mutate the caller's dictionary.
     $ctx = @{}
     if ($Context) { $ctx = @{} + $Context }
@@ -825,11 +853,22 @@ function Write-CertLCLogAndThrow {
     # Also skip email sending if SMTP is not configured.
 
     if ($NotifyTo -and -not [string]::IsNullOrEmpty($SmtpServer)) {
-        $subject = "Error in CERTLC runbook"
+        $notificationOperation = [string]$script:CertificateNotificationContext['Operation']
+        $notificationCertificateName = [string]$script:CertificateNotificationContext['Certificate name']
+        if (-not [string]::IsNullOrWhiteSpace($notificationCertificateName) -and
+            -not [string]::IsNullOrWhiteSpace($notificationOperation)) {
+            $subject = "Certificate $notificationCertificateName $($notificationOperation.ToLowerInvariant()) failed"
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($notificationOperation)) {
+            $subject = "Certificate $($notificationOperation.ToLowerInvariant()) failed"
+        }
+        else {
+            $subject = 'CERTLC certificate operation failed'
+        }
         $errorDetails = $Message
 
         if ($InnerException) {
-            $errorDetails += "`n`nInner exception: $($InnerException.GetType().FullName): $($InnerException.Message)"
+            $errorDetails += "`n`n$(Convert-ExceptionToText -Exception $InnerException)"
         }
         # Stage identifies the failing function. The dispatcher context adds only values known
         # before the failure; New-CertLCNotificationDetailsHtml omits blank optional fields.
